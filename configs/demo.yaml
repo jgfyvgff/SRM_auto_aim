@@ -38,6 +38,17 @@ min_detect_count: 5
 max_temp_lost_count: 15
 outpost_max_temp_lost_count: 75
 
+# Daedalus vehicle.glb 的四装甲几何先验，单位为 m / m²。
+# 实际前后半径约 0.21177m，左右半径约 0.21117m。
+standard_geometry_constraint: true
+standard_radius: 0.21147
+standard_radius_variance: 1e-4
+standard_radius_delta_variance: 1e-4
+standard_height_delta_variance: 1e-4
+
+# 限制仿真中的 yaw 重投影优化跨越矩形对称分支，单位为 rad。
+max_yaw_optimization_correction: 0.35
+
 #####-----aimer参数-----#####
 yaw_offset: -1 # degree -2.5
 pitch_offset: -1.4 # degree 2

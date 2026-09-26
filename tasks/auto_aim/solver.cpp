@@ -2,6 +2,9 @@
 
 #include <yaml-cpp/yaml.h>
 
+#include <cmath>
+#include <limits>
+#include <stdexcept>
 #include <vector>
 
 #include "tools/logger.hpp"
@@ -45,6 +48,18 @@ Solver::Solver(const std::string & config_path) : R_gimbal2world_(Eigen::Matrix3
   Eigen::Matrix<double, 1, 5> distort_coeffs(distort_coeffs_data.data());
   cv::eigen2cv(camera_matrix, camera_matrix_);//将Eigen矩阵转换为cv::Mat
   cv::eigen2cv(distort_coeffs, distort_coeffs_);//将Eigen矩阵转换为cv::Mat
+
+  max_yaw_optimization_correction_ = yaml["max_yaw_optimization_correction"].IsDefined()
+                                       ? yaml["max_yaw_optimization_correction"].as<double>()
+                                       : std::numeric_limits<double>::infinity();
+  if (
+    !std::isinf(max_yaw_optimization_correction_) &&
+    (!std::isfinite(max_yaw_optimization_correction_) ||
+     max_yaw_optimization_correction_ <= 0.0 ||
+     max_yaw_optimization_correction_ > CV_PI))
+  {
+    throw std::runtime_error("Invalid max_yaw_optimization_correction configuration");
+  }
 }
 
 Eigen::Matrix3d Solver::R_gimbal2world() const { return R_gimbal2world_; }
@@ -241,7 +256,12 @@ void Solver::optimize_yaw(Armor & armor) const
   }
 
   armor.yaw_raw = armor.ypr_in_world[0];//把原始yaw赋值给armor.yaw_raw
-  armor.ypr_in_world[0] = best_yaw;//把优化后的yaw赋值给armor.yaw
+  const auto correction = std::abs(tools::limit_rad(best_yaw - armor.yaw_raw));
+  // 仿真中的矩形对称性可能让重投影优化落入约 ±90° 的错误分支。
+  // 修正量异常时保留原始 PnP yaw，避免车辆中心和装甲板模型 ID 被整体旋错。
+  armor.ypr_in_world[0] = correction <= max_yaw_optimization_correction_
+                            ? best_yaw
+                            : armor.yaw_raw;
 }
 
 double Solver::SJTU_cost(

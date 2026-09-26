@@ -38,6 +38,8 @@ private:
   Eigen::Matrix3d R_camera2gimbal_;
   Eigen::Vector3d t_camera2gimbal_;
   Eigen::Matrix3d R_gimbal2world_;
+  // yaw 优化相对原始 PnP yaw 的最大允许修正，单位为 rad。
+  double max_yaw_optimization_correction_;
 
   void optimize_yaw(Armor & armor) const;
 

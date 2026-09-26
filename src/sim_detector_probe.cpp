@@ -331,8 +331,52 @@ private:
         plot_data["pnp_error"] = pnp_reprojection_error;
         plot_data["current_ekf_error"] = current_reprojection_error;
         plot_data["future_center_shift"] = future_center_shift;
+        // NIS 使用更新前创新计算；失败率是 Tracker 判定收敛质量的直接依据。
+        plot_data["nis"] = target.ekf().last_nis;
+        plot_data["nis_failure_rate"] = target.ekf().data.at("recent_nis_failures");
+        const auto & association = tracker_.association_debug();
+        plot_data["tracker_generation"] = tracker_.target_generation();
+        plot_data["association_candidate_count"] = association.candidate_count;
+        plot_data["association_accepted_count"] = association.accepted_count;
+        auto add_association_candidate = [&plot_data](
+                                           const std::string & prefix,
+                                           const auto_aim::AssociationCandidateDebug & candidate) {
+          if (candidate.model_id < 0) return;
+          plot_data[prefix + "_id"] = candidate.model_id;
+          plot_data[prefix + "_gate_passed"] = candidate.gate_passed ? 1 : 0;
+          plot_data[prefix + "_accepted"] = candidate.accepted ? 1 : 0;
+          plot_data[prefix + "_score"] = candidate.score;
+          plot_data[prefix + "_position_error"] = candidate.position_error;
+          plot_data[prefix + "_distance_error"] = candidate.distance_error;
+          plot_data[prefix + "_observed_x"] = candidate.observed_x;
+          plot_data[prefix + "_observed_y"] = candidate.observed_y;
+          plot_data[prefix + "_observed_z"] = candidate.observed_z;
+          plot_data[prefix + "_predicted_x"] = candidate.predicted_x;
+          plot_data[prefix + "_predicted_y"] = candidate.predicted_y;
+          plot_data[prefix + "_predicted_z"] = candidate.predicted_z;
+          plot_data[prefix + "_observed_distance"] = candidate.observed_distance;
+          plot_data[prefix + "_predicted_distance"] = candidate.predicted_distance;
+          plot_data[prefix + "_orientation_error"] = candidate.orientation_error;
+          plot_data[prefix + "_bearing_error"] = candidate.bearing_error;
+          plot_data[prefix + "_raw_yaw"] = candidate.raw_yaw;
+          plot_data[prefix + "_optimized_yaw"] = candidate.optimized_yaw;
+          plot_data[prefix + "_yaw_correction"] = candidate.yaw_correction;
+          plot_data[prefix + "_image_x"] = candidate.image_x;
+        };
+        add_association_candidate("association_primary", association.candidates[0]);
+        add_association_candidate("association_secondary", association.candidates[1]);
         plot_data["current_armor_id"] = target.last_id;
         plot_data["aim_armor_id"] = aimer_.debug_aim_point.armor_id;
+        // center_* 表示车辆旋转中心；current_* 表示当前关联装甲板的位置。
+        plot_data["center_x"] = state[0];
+        plot_data["center_y"] = state[2];
+        plot_data["center_z"] = state[4];
+        plot_data["center_speed"] = std::hypot(state[1], state[3]);
+        // 四装甲模型交替使用 r 和 r+l，用于判断中心摆动是否来自半径估计。
+        plot_data["radius"] = state[8];
+        plot_data["radius_delta"] = state[9];
+        plot_data["alternate_radius"] = state[8] + state[9];
+        plot_data["height_delta"] = state[10];
         plot_data["current_x"] = current_xyza[0];
         plot_data["current_y"] = current_xyza[1];
         plot_data["current_z"] = current_xyza[2];

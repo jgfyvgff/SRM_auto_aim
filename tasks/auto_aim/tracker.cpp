@@ -2,7 +2,13 @@
 
 #include <yaml-cpp/yaml.h>
 
+#include <algorithm>
+#include <cmath>
+#include <limits>
+#include <set>
+#include <stdexcept>
 #include <tuple>
+#include <vector>
 
 #include "tools/logger.hpp"
 #include "tools/math_tools.hpp"
@@ -24,13 +30,50 @@ Tracker::Tracker(const std::string & config_path, Solver & solver)
   max_temp_lost_count_ = yaml["max_temp_lost_count"].as<int>();//连续丢失目标的最大次数
   outpost_max_temp_lost_count_ = yaml["outpost_max_temp_lost_count"].as<int>();//前哨站连续丢失目标的最大次数
   normal_temp_lost_count_ = max_temp_lost_count_;//普通模式连续丢失目标的最大次数
+
+  standard_geometry_constraint_ = yaml["standard_geometry_constraint"].IsDefined()
+                                    ? yaml["standard_geometry_constraint"].as<bool>()
+                                    : false;
+  standard_radius_ =
+    yaml["standard_radius"].IsDefined() ? yaml["standard_radius"].as<double>() : 0.2;
+  standard_radius_variance_ = yaml["standard_radius_variance"].IsDefined()
+                                ? yaml["standard_radius_variance"].as<double>()
+                                : 1.0;
+  standard_radius_delta_variance_ = yaml["standard_radius_delta_variance"].IsDefined()
+                                      ? yaml["standard_radius_delta_variance"].as<double>()
+                                      : 1.0;
+  standard_height_delta_variance_ = yaml["standard_height_delta_variance"].IsDefined()
+                                      ? yaml["standard_height_delta_variance"].as<double>()
+                                      : 1.0;
+  association_max_angle_error_ = yaml["association_max_angle_error"].IsDefined()
+                                   ? yaml["association_max_angle_error"].as<double>()
+                                   : std::numeric_limits<double>::infinity();
+
+  if (
+    standard_radius_ <= 0.05 || standard_radius_ >= 0.5 ||
+    standard_radius_variance_ <= 0 || standard_radius_delta_variance_ <= 0 ||
+    standard_height_delta_variance_ <= 0)
+  {
+    throw std::runtime_error("Invalid standard armor geometry configuration");
+  }
+  if (
+    !std::isinf(association_max_angle_error_) &&
+    (association_max_angle_error_ <= 0.0 || association_max_angle_error_ > 3.141592653589793))
+  {
+    throw std::runtime_error("Invalid association_max_angle_error configuration");
+  }
 }
 
 std::string Tracker::state() const { return state_; }
 
+const AssociationDebug & Tracker::association_debug() const { return association_debug_; }
+
+std::uint64_t Tracker::target_generation() const { return target_generation_; }
+
 std::list<Target> Tracker::track(
   std::list<Armor> & armors, std::chrono::steady_clock::time_point t, bool use_enemy_color)
 {
+  association_debug_ = AssociationDebug{};
   auto dt = tools::delta_time(t, last_timestamp_);
   last_timestamp_ = t;
 
@@ -99,6 +142,7 @@ std::tuple<omniperception::DetectionResult, std::list<Target>> Tracker::track(
   const std::vector<omniperception::DetectionResult> & detection_queue, std::list<Armor> & armors,
   std::chrono::steady_clock::time_point t, bool use_enemy_color)
 {
+  association_debug_ = AssociationDebug{};
   omniperception::DetectionResult switch_target{std::list<Armor>(), t, 0, 0};
   omniperception::DetectionResult temp_target{std::list<Armor>(), t, 0, 0};
   if (!detection_queue.empty()) {
@@ -239,6 +283,10 @@ bool Tracker::set_target(std::list<Armor> & armors, std::chrono::steady_clock::t
   auto is_balance = (armor.type == ArmorType::big) &&
                     (armor.name == ArmorName::three || armor.name == ArmorName::four ||
                      armor.name == ArmorName::five);
+  const auto is_standard_four_armor =
+    armor.type == ArmorType::small &&
+    (armor.name == ArmorName::two || armor.name == ArmorName::three ||
+     armor.name == ArmorName::four || armor.name == ArmorName::five);
 
   if (is_balance) {
     Eigen::VectorXd P0_dig{{1, 64, 1, 64, 1, 64, 0.4, 100, 1, 1, 1}};
@@ -255,11 +303,28 @@ bool Tracker::set_target(std::list<Armor> & armors, std::chrono::steady_clock::t
     target_ = Target(armor, t, 0.3205, 3, P0_dig);
   }
 
+  else if (is_standard_four_armor) {
+    // 单块静止装甲板无法同时观测车辆中心和半径，因此使用已知机械尺寸
+    // 约束 r、两组半径差和高度差，避免半径向发散下限塌缩。
+    Eigen::VectorXd P0_dig{
+      {1, 64, 1, 64, 1, 64, 0.4, 100, standard_radius_variance_,
+       standard_radius_delta_variance_, standard_height_delta_variance_}};
+    target_ = Target(armor, t, standard_radius_, 4, P0_dig);
+    if (standard_geometry_constraint_) {
+      // 仿真车辆尺寸已知时固定 r 和 l，避免单块装甲观测把半径压到发散下限。
+      target_.set_geometry_constraint(
+        standard_radius_, 0.0, standard_radius_variance_,
+        standard_radius_delta_variance_);
+    }
+  }
+
   else {
+    // 其他车型保持上游原有行为，后续应按实际机械尺寸分别标定。
     Eigen::VectorXd P0_dig{{1, 64, 1, 64, 1, 64, 0.4, 100, 1, 1, 1}};
     target_ = Target(armor, t, 0.2, 4, P0_dig);
   }
 
+  target_generation_++;
   return true;
 }
 
@@ -267,32 +332,98 @@ bool Tracker::update_target(std::list<Armor> & armors, std::chrono::steady_clock
 {
   target_.predict(t);// 预测，更新协方差矩阵和预测量
 
-  int found_count = 0;
-  double min_x = 1e10;  // 画面最左侧
-  for (const auto & armor : armors) {
-    if (armor.name != target_.name || armor.type != target_.armor_type) continue;
-    found_count++;//找到的装甲板数量
-    min_x = armor.center.x < min_x ? armor.center.x : min_x;//找到最左侧的装甲板
-  }
+  struct Candidate
+  {
+    Armor * armor;
+    int id;
+    double angle_error;
+    double position_error;
+    double distance_error;
+    double orientation_error;
+    double bearing_error;
+    bool gate_passed;
+  };
 
-  if (found_count == 0) return false;
-
-  // 临时诊断：同一帧只使用最左侧的同名装甲板更新 EKF。
-  // 若这样能消除跳变，说明多装甲板连续 update 的关联链路存在问题；
-  // 该筛选仅用于 A/B 验证，不是最终的多装甲板处理方案。
+  const auto predicted_armors = target_.armor_xyza_list();
+  std::vector<Candidate> candidates;
   for (auto & armor : armors) {
-    if (
-      armor.name != target_.name || armor.type != target_.armor_type
-      || armor.center.x != min_x
-    )
-      continue;
+    if (armor.name != target_.name || armor.type != target_.armor_type) continue;
 
+    // 关联依赖 PnP 解算出的世界坐标和姿态，因此必须先完成 solve。
     solver_.solve(armor);
+    const auto [id, angle_error] = target_.match_armor(armor);
+    if (id < 0 || static_cast<std::size_t>(id) >= predicted_armors.size()) continue;
 
-    target_.update(armor);//得到最优估计量
+    const auto & predicted_armor = predicted_armors[id];
+    const auto predicted_ypd = tools::xyz2ypd(predicted_armor.head(3));
+    const auto position_error = (armor.xyz_in_world - predicted_armor.head(3)).norm();
+    const auto distance_error = std::abs(armor.ypd_in_world[2] - predicted_ypd[2]);
+    const auto orientation_error =
+      std::abs(tools::limit_rad(armor.ypr_in_world[0] - predicted_armor[3]));
+    const auto bearing_error =
+      std::abs(tools::limit_rad(armor.ypd_in_world[0] - predicted_ypd[0]));
+    candidates.push_back(
+      {&armor, id, angle_error, position_error, distance_error,
+       orientation_error, bearing_error,
+       angle_error <= association_max_angle_error_});
   }
 
-  return true;
+  if (candidates.empty()) return false;
+
+  // 所有关联都基于本帧同一个预测状态计算，再按误差从小到大更新。
+  // 同一个模型 ID 每帧只接收一个观测，避免重复框或顺序变化把 EKF 拉向不同装甲板。
+  std::stable_sort(
+    candidates.begin(), candidates.end(),
+    [](const Candidate & a, const Candidate & b) { return a.angle_error < b.angle_error; });
+
+  association_debug_.candidate_count = static_cast<int>(candidates.size());
+  const auto debug_count = std::min(candidates.size(), association_debug_.candidates.size());
+  for (std::size_t index = 0; index < debug_count; ++index) {
+    const auto & candidate = candidates[index];
+    const auto & predicted_armor = predicted_armors[candidate.id];
+    const auto predicted_ypd = tools::xyz2ypd(predicted_armor.head(3));
+    auto & debug = association_debug_.candidates[index];
+    // 使用逐字段赋值，便于诊断结构扩展时避免聚合初始化顺序错位。
+    debug.model_id = candidate.id;
+    debug.gate_passed = candidate.gate_passed;
+    debug.accepted = false;
+    debug.score = candidate.angle_error;
+    debug.position_error = candidate.position_error;
+    debug.distance_error = candidate.distance_error;
+    debug.observed_x = candidate.armor->xyz_in_world[0];
+    debug.observed_y = candidate.armor->xyz_in_world[1];
+    debug.observed_z = candidate.armor->xyz_in_world[2];
+    debug.predicted_x = predicted_armor[0];
+    debug.predicted_y = predicted_armor[1];
+    debug.predicted_z = predicted_armor[2];
+    debug.observed_distance = candidate.armor->ypd_in_world[2];
+    debug.predicted_distance = predicted_ypd[2];
+    debug.orientation_error = candidate.orientation_error;
+    debug.bearing_error = candidate.bearing_error;
+    debug.raw_yaw = candidate.armor->yaw_raw;
+    debug.optimized_yaw = candidate.armor->ypr_in_world[0];
+    debug.yaw_correction =
+      tools::limit_rad(candidate.armor->ypr_in_world[0] - candidate.armor->yaw_raw);
+    debug.image_x = candidate.armor->center.x;
+  }
+
+  std::set<int> used_ids;
+  for (std::size_t index = 0; index < candidates.size(); ++index) {
+    const auto & candidate = candidates[index];
+    // 单帧偶发误匹配不能污染 EKF；保留预测状态比强行吸收一帧坏观测更安全。
+    const bool accepted = candidate.gate_passed && used_ids.insert(candidate.id).second;
+    if (index < association_debug_.candidates.size()) {
+      association_debug_.candidates[index].accepted = accepted;
+    }
+    if (!accepted) continue;
+
+    association_debug_.accepted_count++;
+    target_.update(*candidate.armor, candidate.id);//得到最优估计量
+  }
+
+  // 候选全部被门限拒绝时视为本帧未找到目标，使状态机进入 temp_lost。
+  // 持续异常最终会触发重新捕获，避免无观测预测无限漂移。
+  return association_debug_.accepted_count > 0;
 }
 
 }  // namespace auto_aim

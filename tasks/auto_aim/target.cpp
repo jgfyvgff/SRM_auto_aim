@@ -1,6 +1,9 @@
 #include "target.hpp"
 
+#include <algorithm>
+#include <limits>
 #include <numeric>
+#include <stdexcept>
 
 #include "tools/logger.hpp"
 #include "tools/math_tools.hpp"
@@ -160,11 +163,11 @@ void Target::predict(double dt)
   ekf_.predict(F, Q, f);//计算预测量和预测协方差矩阵
 }//
 
-void Target::update(const Armor & armor)
+std::pair<int, double> Target::match_armor(const Armor & armor) const
 {
   // 装甲板匹配
-  int id;
-  auto min_angle_error = 1e10;
+  int id = -1;
+  auto min_angle_error = std::numeric_limits<double>::max();
   const std::vector<Eigen::Vector4d> & xyza_list = armor_xyza_list();
 
   std::vector<std::pair<Eigen::Vector4d, int>> xyza_i_list;
@@ -180,8 +183,9 @@ void Target::update(const Armor & armor)
       return ypd1[2] < ypd2[2];
     });//按distance升序排序，distance越小，优先级越高
 
-  // 取前3个distance最小的装甲板
-  for (int i = 0; i < 3; i++) {
+  // 取最多 3 个距离最近的模型装甲板，保持原有的前后装甲板筛选约束。
+  const auto candidate_count = std::min<std::size_t>(3, xyza_i_list.size());
+  for (std::size_t i = 0; i < candidate_count; i++) {
     const auto & xyza = xyza_i_list[i].first;
     Eigen::Vector3d ypd = tools::xyz2ypd(xyza.head(3));
     auto angle_error = std::abs(tools::limit_rad(armor.ypr_in_world[0] - xyza[3])) +
@@ -192,6 +196,20 @@ void Target::update(const Armor & armor)
       min_angle_error = angle_error;
     }
   }
+
+  return {id, min_angle_error};
+}
+
+void Target::update(const Armor & armor)
+{
+  const auto [id, angle_error] = match_armor(armor);
+  (void)angle_error;
+  update(armor, id);
+}
+
+void Target::update(const Armor & armor, int id)
+{
+  if (id < 0 || id >= armor_num_) return;
 
   if (id != 0) jumped = true;//如果id不为0，说明跳过了
 
@@ -207,6 +225,36 @@ void Target::update(const Armor & armor)
   update_count_++;//更新计数器加1
 
   update_ypda(armor, id);//
+}
+
+void Target::set_geometry_constraint(
+  double radius, double radius_delta, double radius_variance,
+  double radius_delta_variance)
+{
+  if (radius <= 0.0 || radius_variance <= 0.0 || radius_delta_variance <= 0.0) {
+    throw std::invalid_argument("Invalid target geometry constraint");
+  }
+
+  geometry_constraint_ =
+    GeometryConstraint{radius, radius_delta, radius_variance, radius_delta_variance};
+  apply_geometry_constraint();
+}
+
+void Target::apply_geometry_constraint()
+{
+  if (!geometry_constraint_.has_value()) return;
+
+  const auto & constraint = geometry_constraint_.value();
+  auto constrain_state = [&](Eigen::Index index, double value, double variance) {
+    ekf_.x[index] = value;
+    // 已知机械尺寸不应继续与中心、速度和角速度共同漂移，因此同时清除互协方差。
+    ekf_.P.row(index).setZero();
+    ekf_.P.col(index).setZero();
+    ekf_.P(index, index) = variance;
+  };
+
+  constrain_state(8, constraint.radius, constraint.radius_variance);
+  constrain_state(9, constraint.radius_delta, constraint.radius_delta_variance);
 }
 
 void Target::update_ypda(const Armor & armor, int id)
@@ -245,6 +293,8 @@ void Target::update_ypda(const Armor & armor, int id)
   Eigen::VectorXd z{{ypd[0], ypd[1], ypd[2], ypr[0]}};  //获得观测量
 
   ekf_.update(z, H, R, h, z_subtract);
+  // 观测更新可能再次把不可观测半径拉向发散下限，更新后恢复已知机械尺寸。
+  apply_geometry_constraint();
 }
 
 Eigen::VectorXd Target::ekf_x() const { return ekf_.x; }

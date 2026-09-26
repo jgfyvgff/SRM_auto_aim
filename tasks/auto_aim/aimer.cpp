@@ -38,8 +38,10 @@ io::Command Aimer::aim(
   auto target = targets.front();
 
   auto ekf = target.ekf();
+  // 高低速判断只与角速度大小有关，正反转应使用相同的预测延时。
+  const auto angular_speed = std::abs(target.ekf_x()[7]);
   double delay_time =
-    target.ekf_x()[7] > decision_speed_ ? high_speed_delay_time_ : low_speed_delay_time_;
+    angular_speed > decision_speed_ ? high_speed_delay_time_ : low_speed_delay_time_;
 
   if (bullet_speed < 14) bullet_speed = 23;
 
@@ -165,7 +167,8 @@ AimPoint Aimer::choose_aim_point(const Target & target)
   }
 
   // 不考虑小陀螺
-  if (std::abs(target.ekf_x()[8]) <= 2 && target.name != ArmorName::outpost) {
+  // x[7] 是角速度，x[8] 是旋转半径；低速时使用普通装甲板选择策略。
+  if (std::abs(ekf_x[7]) <= decision_speed_ && target.name != ArmorName::outpost) {
     // 选择在可射击范围内的装甲板
     std::vector<int> id_list;
     for (int i = 0; i < armor_num; i++) {
