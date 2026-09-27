@@ -243,6 +243,7 @@ private:
     double current_reprojection_error = -1.0;
     double accepted_pnp_error = -1.0;
     double accepted_model_error = -1.0;
+    std::vector<cv::Point2f> accepted_armor_points;
     double post_update_position_error = -1.0;
     double post_update_bearing_error = -1.0;
     double post_update_distance_error = -1.0;
@@ -284,6 +285,8 @@ private:
             tracker_armors, target.name, target.armor_type, accepted_center);
         }
         if (current_armor != nullptr) {
+          // 只记录本帧实际进入 EKF 的角点，避免拿其他检测框分析 PnP。
+          accepted_armor_points = current_armor->points;
           // 两条基线都使用本帧真正进入 EKF 的同一个检测框。
           accepted_pnp_error = mean_reprojection_error(
             *current_armor, solver_.reproject_pnp(*current_armor));
@@ -441,6 +444,13 @@ private:
         plot_data["current_ekf_error"] = current_reprojection_error;
         plot_data["accepted_pnp_error"] = accepted_pnp_error;
         plot_data["accepted_model_error"] = accepted_model_error;
+        if (accepted_armor_points.size() == 4) {
+          for (std::size_t i = 0; i < accepted_armor_points.size(); ++i) {
+            const auto prefix = "accepted_corner_" + std::to_string(i);
+            plot_data[prefix + "_x"] = accepted_armor_points[i].x;
+            plot_data[prefix + "_y"] = accepted_armor_points[i].y;
+          }
+        }
         plot_data["post_update_position_error"] = post_update_position_error;
         plot_data["post_update_bearing_error"] = post_update_bearing_error;
         plot_data["post_update_distance_error"] = post_update_distance_error;
@@ -490,6 +500,7 @@ private:
           plot_data[prefix + "_optimized_yaw"] = candidate.optimized_yaw;
           plot_data[prefix + "_yaw_correction"] = candidate.yaw_correction;
           plot_data[prefix + "_image_x"] = candidate.image_x;
+          plot_data[prefix + "_image_y"] = candidate.image_y;
         };
         add_association_candidate("association_primary", association.candidates[0]);
         add_association_candidate("association_secondary", association.candidates[1]);

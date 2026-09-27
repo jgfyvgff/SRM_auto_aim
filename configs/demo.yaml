@@ -91,9 +91,8 @@ camera_matrix: [
 ]
 distort_coeffs: [0, 0, 0, 0, 0]
 
-# Daedalus 模拟器相机外参，来自 /tf：
-# gimbal_link -> camera_link 平移为
-# [0.060025096, 0.002016783, 0.196342170]。
+# Daedalus 渲染相机相对 gimbal_link 的平移，单位 m。
+# 原平移按模型中约 25° 的相对旋转换到 gimbal_link 坐标轴。
 # camera_optical_frame -> gimbal_link 的旋转为：
 # [ 0,  0,  1]
 # [-1,  0,  0]
@@ -103,7 +102,7 @@ R_camera2gimbal: [
   -1, 0, 0,
   0, -1, 0
 ]
-t_camera2gimbal: [0.060025096, 0.002016783, 0.196342170]
+t_camera2gimbal: [0.137378988, 0.002016783, 0.152578746]
 
 # 当前探针还没有把 odom -> gimbal_link 的动态姿态送入 Solver，
 # 因此先使用单位旋转，world 坐标暂按云台局部坐标解释。
