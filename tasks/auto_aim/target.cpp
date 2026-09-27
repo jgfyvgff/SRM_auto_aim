@@ -248,6 +248,14 @@ void Target::set_geometry_constraint(
   apply_geometry_constraint();
 }
 
+void Target::set_measurement_bearing_variance(double variance)
+{
+  if (!std::isfinite(variance) || variance <= 0.0) {
+    throw std::invalid_argument("Invalid measurement bearing variance");
+  }
+  measurement_bearing_variance_ = variance;
+}
+
 void Target::apply_geometry_constraint()
 {
   if (!geometry_constraint_.has_value()) return;
@@ -303,7 +311,7 @@ Eigen::Matrix4d Target::measurement_noise(const Armor & armor) const
   const auto center_yaw = std::atan2(armor.xyz_in_world[1], armor.xyz_in_world[0]);
   const auto delta_angle = tools::limit_rad(armor.ypr_in_world[0] - center_yaw);
   Eigen::Matrix4d R = Eigen::Matrix4d::Zero();
-  R.diagonal() << 4e-3, 4e-3,
+  R.diagonal() << measurement_bearing_variance_, 4e-3,
     std::log(std::abs(delta_angle) + 1) + 1,
     std::log(std::abs(armor.ypd_in_world[2]) + 1) / 200 + 9e-2;
   return R;

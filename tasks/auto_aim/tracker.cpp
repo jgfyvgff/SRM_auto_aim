@@ -61,6 +61,10 @@ Tracker::Tracker(const std::string & config_path, Solver & solver)
     yaml["association_max_mahalanobis_distance"].IsDefined()
       ? yaml["association_max_mahalanobis_distance"].as<double>()
       : 3.2;
+  measurement_bearing_variance_ =
+    yaml["measurement_bearing_variance"].IsDefined()
+      ? yaml["measurement_bearing_variance"].as<double>()
+      : 4e-3;
 
   if (
     standard_radius_ <= 0.05 || standard_radius_ >= 0.5 ||
@@ -86,6 +90,10 @@ Tracker::Tracker(const std::string & config_path, Solver & solver)
     association_max_mahalanobis_distance_ <= 0.0)
   {
     throw std::runtime_error("Invalid association_max_mahalanobis_distance configuration");
+  }
+  if (!std::isfinite(measurement_bearing_variance_) ||
+      measurement_bearing_variance_ <= 0.0) {
+    throw std::runtime_error("Invalid measurement_bearing_variance configuration");
   }
 }
 
@@ -349,6 +357,7 @@ bool Tracker::set_target(std::list<Armor> & armors, std::chrono::steady_clock::t
     target_ = Target(armor, t, 0.2, 4, P0_dig);
   }
 
+  target_.set_measurement_bearing_variance(measurement_bearing_variance_);
   target_generation_++;
   return true;
 }

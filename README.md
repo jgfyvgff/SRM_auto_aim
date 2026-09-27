@@ -68,6 +68,13 @@ Tracker 还会计算 4 维观测创新的马氏距离：`S = HPHᵀ + R`，关�
 分析器统计均值和分位数时会排除这些无效的 `-1` 值。
 现有 `pnp_error` 按 Aimer 未来投影选择装甲板，不保证与 `current_ekf_error` 使用
 同一个检测框，因此两者不能直接作为同框的前后验对比。
+`accepted_pnp_error` 是已接收框的原始 PnP 回投影误差；
+`accepted_model_error` 是该框的 PnP 位置加当前固定俯仰角模型的回投影误差。
+两者与 `current_ekf_error` 使用同一个框，仅用于区分 PnP、姿态模型和滤波误差。
+
+`measurement_bearing_variance` 是方位观测噪声方差（rad²），同时用于关联创新
+协方差和 EKF 更新。仅仿真 `demo.yaml` 暂用 `4e-5` 做对照实验；未配置时保持
+原值 `4e-3`。是否保留该值取决于同场景下的误差、拒绝率和重初始化次数。
 
 分析器对已接收观测检查 `current_ekf_error / armor_pixel_long_side`。
 默认超过 `1.0` 时报警，可用 `--ekf-reprojection-armor-ratio` 调整；

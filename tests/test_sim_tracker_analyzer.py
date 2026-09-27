@@ -99,6 +99,8 @@ class SimTrackerAnalyzerTest(unittest.TestCase):
                 "post_update_bearing_error": 0.03,
                 "post_update_distance_error": 0.04,
                 "post_update_orientation_error": 0.05,
+                "accepted_pnp_error": 0.2,
+                "accepted_model_error": 0.4,
                 "prediction_dt": 0.12,
                 "aim_current_x": 1.0,
                 "future_x": 1.1,
@@ -122,6 +124,8 @@ class SimTrackerAnalyzerTest(unittest.TestCase):
         self.assertAlmostEqual(sample["post_update_bearing_error"], 0.03)
         self.assertAlmostEqual(sample["post_update_distance_error"], 0.04)
         self.assertAlmostEqual(sample["post_update_orientation_error"], 0.05)
+        self.assertAlmostEqual(sample["accepted_pnp_error"], 0.2)
+        self.assertAlmostEqual(sample["accepted_model_error"], 0.4)
         self.assertAlmostEqual(sample["prediction_dt"], 0.12)
         self.assertAlmostEqual(sample["aim_current_x"], 1.0)
         self.assertAlmostEqual(sample["future_x"], 1.1)
@@ -136,18 +140,24 @@ class SimTrackerAnalyzerTest(unittest.TestCase):
                     "post_update_position_error": -1.0,
                     "current_ekf_error": -1.0,
                     "armor_pixel_long_side": -1.0,
+                    "accepted_pnp_error": -1.0,
+                    "accepted_model_error": -1.0,
                 }
             )
         for sample in samples[-5:]:
             sample["post_update_position_error"] = 0.12
             sample["current_ekf_error"] = 4.0
             sample["armor_pixel_long_side"] = 40.0
+            sample["accepted_pnp_error"] = 0.2
+            sample["accepted_model_error"] = 0.4
 
         stats = analyzer.analyze_samples(samples)["phases"]["spin"]["stats"]
         self.assertEqual(stats["post_update_position_error"]["count"], 5)
         self.assertAlmostEqual(stats["post_update_position_error"]["mean"], 0.12)
         self.assertAlmostEqual(stats["current_ekf_error"]["mean"], 4.0)
         self.assertAlmostEqual(stats["armor_pixel_long_side"]["mean"], 40.0)
+        self.assertEqual(stats["accepted_pnp_error"]["count"], 5)
+        self.assertAlmostEqual(stats["accepted_model_error"]["mean"], 0.4)
 
     def test_observed_yaw_rate_unwraps_angle_and_requires_same_model(self):
         samples = []

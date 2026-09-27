@@ -104,6 +104,8 @@ private:
   double association_max_distance_error_;
   // 创新协方差归一化残差门限，无量纲；用于关联主排序和统计门控。
   double association_max_mahalanobis_distance_;
+  // 配置值仅改变方位观测噪声；未配置时保持原实现。
+  double measurement_bearing_variance_;
   std::string state_, pre_state_;
   Target target_;
   std::chrono::steady_clock::time_point last_timestamp_;

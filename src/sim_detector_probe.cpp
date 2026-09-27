@@ -241,6 +241,8 @@ private:
 
     std::vector<cv::Point2f> current_reprojected_points;
     double current_reprojection_error = -1.0;
+    double accepted_pnp_error = -1.0;
+    double accepted_model_error = -1.0;
     double post_update_position_error = -1.0;
     double post_update_bearing_error = -1.0;
     double post_update_distance_error = -1.0;
@@ -282,6 +284,14 @@ private:
             tracker_armors, target.name, target.armor_type, accepted_center);
         }
         if (current_armor != nullptr) {
+          // 两条基线都使用本帧真正进入 EKF 的同一个检测框。
+          accepted_pnp_error = mean_reprojection_error(
+            *current_armor, solver_.reproject_pnp(*current_armor));
+          accepted_model_error = mean_reprojection_error(
+            *current_armor,
+            solver_.reproject_armor(
+              current_armor->xyz_in_world, current_armor->ypr_in_world[0],
+              current_armor->type, current_armor->name));
           current_reprojection_error =
             mean_reprojection_error(*current_armor, current_reprojected_points);
           // 与 current_ekf_error 使用同一个已接受观测，量出 EKF 更新后的状态残差。
@@ -429,6 +439,8 @@ private:
         plot_data["capture_to_aimer_ms"] = duration_ms(frame_timestamp, aimer_start);
         plot_data["pnp_error"] = pnp_reprojection_error;
         plot_data["current_ekf_error"] = current_reprojection_error;
+        plot_data["accepted_pnp_error"] = accepted_pnp_error;
+        plot_data["accepted_model_error"] = accepted_model_error;
         plot_data["post_update_position_error"] = post_update_position_error;
         plot_data["post_update_bearing_error"] = post_update_bearing_error;
         plot_data["post_update_distance_error"] = post_update_distance_error;
