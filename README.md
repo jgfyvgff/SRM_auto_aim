@@ -37,13 +37,48 @@ python3 tools/sim_tracker_analyzer.py --duration 30
 对该样本产生了正收益。默认允许的时间对齐误差为 `0.03 s`，可通过
 `--prediction-match-tolerance` 调整。
 
+Tracker 在同一帧只使用一个综合关联分数最低的同名装甲板更新 EKF。这样做是为了
+避免两个机器人同时进入画面时，把同名装甲板分别当成同一车辆的不同模型 ID；其余
+候选仍会发布到 `/sim_aim/debug` 供诊断。`configs/demo.yaml` 中的
+`association_max_score` 以等效弧度为单位，综合装甲板角度误差、按目标距离归一化的
+位置误差和距离误差，超限时保留预测状态而不吸收坏观测。为避免远距离下角度归一化
+掩盖较大的米制误差，`association_max_position_error` 和
+`association_max_distance_error` 还分别限制三维位置、距离残差，单位为 m。
+`association_max_angle_error` 单独限制装甲板姿态与视线方位的综合误差，单位为 rad，
+用于拒绝位置误差尚未超限但朝向明显错误的观测。
+
+Tracker 还会计算 4 维观测创新的马氏距离：`S = HPHᵀ + R`，关联优先选择马氏距离
+最小的模型装甲板。`association_max_mahalanobis_distance` 是无量纲统计门限；原有
+角度、位置和距离绝对误差门限仍保留，作为安全门和诊断项。它不是固定处理延迟，
+也不替代基于真实时间戳的延迟测量与预测时间对齐。
+
 该指标使用仿真视觉观测作为近似真值，适合比较预测前后的相对效果；它仍包含 PnP
 噪声、时间戳误差和装甲板短时不可见造成的影响，不能替代真实弹丸落点测试。
 
-报告还会显示 Aimer 实际进入高速模式的比例，以及发射延迟、基础预测时间和弹丸
+报告还会显示 Aimer 实际进入高速模式的比例，以及观测到 Aimer 的实测处理延迟、基础预测时间和弹丸
 飞行时间。小陀螺分类阈值与 Aimer 的 `decision_speed` 不是同一个概念；只有
 `Aimer高速模式帧` 才表示进入了高速选板分支。带符号 yaw 残差为“预测角度减去
 未来实测角度”，等效 `dt` 修正用于判断当前时间补偿是偏超前还是偏滞后。
+
+`/sim_aim/debug` 中的 `command_yaw`、`command_pitch` 使用弧度，带 `_deg` 后缀的
+字段使用角度；它们只是 Aimer 输出诊断，不会自动向模拟器发布云台控制命令。
+
+`association_primary_*_error` 是 EKF 更新前的关联残差；`post_update_*_error`
+使用同一帧实际接受的装甲板计算 EKF 更新后的残差。未接受或无法配对时值为 `-1`。
+分析器统计均值和分位数时会排除这些无效的 `-1` 值。
+现有 `pnp_error` 按 Aimer 未来投影选择装甲板，不保证与 `current_ekf_error` 使用
+同一个检测框，因此两者不能直接作为同框的前后验对比。
+
+分析器对已接收观测检查 `current_ekf_error / armor_pixel_long_side`。
+默认超过 `1.0` 时报警，可用 `--ekf-reprojection-armor-ratio` 调整；
+缺少有效装甲板像素尺寸的帧不参与此项判断。报警只说明后验投影
+偏离检测框，不能单凭它判定是关联、PnP 还是 EKF 更新造成的。
+
+报告中的 `[距离分段]` 默认按 `1 m` 对 `target_distance` 分桶，分别统计装甲板
+像素尺寸、PnP/EKF 回投影误差、关联位置/距离误差、中心速度和 Tracker 世代数。
+这样可以区分近距离和远距离的误差放大，而不是把它们混在同一个 P95 中。需要调整
+分桶宽度时可使用 `--range-bin-size 0.5`；距离分段只做诊断，不改变 Tracker 或
+Aimer 的参数。
 
 `configs/demo.yaml` 默认对 Daedalus 标准四装甲车辆启用已知半径约束。该约束只固定 `r` 和两组半径差 `l`，用于避免单块装甲观测下中心与半径不可同时观测造成的退化；其他配置默认不启用。
 

@@ -28,7 +28,8 @@ public:
   double debug_prediction_dt = -1.0;
   // 记录本帧是否进入小陀螺/高速选板分支，避免将分析器的 spin 分类与 Aimer 模式混淆。
   bool debug_high_speed_mode = false;
-  // Aimer 选择的发射延迟、基础预测时间和弹丸飞行时间，单位：秒。
+  // 从观测时间到 Aimer 开始计算的实测延迟，单位：秒。
+  // 该值不再来自高低速固定配置。
   double debug_delay_time = 0.0;
   double debug_base_prediction_dt = -1.0;
   double debug_fly_time = -1.0;
@@ -49,8 +50,6 @@ private:
   double comming_angle_;
   double leaving_angle_;
   double lock_id_ = -1;
-  double high_speed_delay_time_;
-  double low_speed_delay_time_;
   double decision_speed_;
 
   AimPoint choose_aim_point(const Target & target);

@@ -12,9 +12,21 @@ from pathlib import Path
 
 ANALYZED_FIELDS = (
     "prediction_dt",
+    "target_distance",
+    "armor_pixel_long_side",
+    "armor_pixel_short_side",
+    "command_yaw",
+    "command_pitch",
+    "command_yaw_deg",
+    "command_pitch_deg",
     "delay_time",
     "base_prediction_dt",
     "fly_time",
+    "capture_to_detector_ms",
+    "detector_ms",
+    "tracker_ms",
+    "aimer_ms",
+    "capture_to_aimer_ms",
     "aim_current_x",
     "aim_current_y",
     "aim_current_z",
@@ -31,11 +43,16 @@ ANALYZED_FIELDS = (
     "vy",
     "vz",
     "angular_velocity",
+    "observed_yaw_rate",
     "radius",
     "radius_delta",
     "alternate_radius",
     "height_delta",
     "current_ekf_error",
+    "post_update_position_error",
+    "post_update_bearing_error",
+    "post_update_distance_error",
+    "post_update_orientation_error",
     "pnp_error",
     "nis",
     "nis_failure_rate",
@@ -50,6 +67,11 @@ ANALYZED_FIELDS = (
     "association_primary_gate_passed",
     "association_primary_position_error",
     "association_primary_distance_error",
+    "association_primary_mahalanobis_distance",
+    "association_primary_position_angle_error",
+    "association_primary_distance_angle_error",
+    "association_primary_position_angle_error",
+    "association_primary_distance_angle_error",
     "association_primary_observed_x",
     "association_primary_observed_y",
     "association_primary_observed_z",
@@ -69,6 +91,11 @@ ANALYZED_FIELDS = (
     "association_secondary_gate_passed",
     "association_secondary_position_error",
     "association_secondary_distance_error",
+    "association_secondary_mahalanobis_distance",
+    "association_secondary_position_angle_error",
+    "association_secondary_distance_angle_error",
+    "association_secondary_position_angle_error",
+    "association_secondary_distance_angle_error",
     "association_secondary_observed_x",
     "association_secondary_observed_y",
     "association_secondary_observed_z",
@@ -89,6 +116,10 @@ OUTLIER_CONTEXT_FIELDS = (
     "center_z",
     "angular_velocity",
     "current_ekf_error",
+    "post_update_position_error",
+    "post_update_bearing_error",
+    "post_update_distance_error",
+    "post_update_orientation_error",
     "pnp_error",
     "association_candidate_count",
     "association_accepted_count",
@@ -97,6 +128,7 @@ OUTLIER_CONTEXT_FIELDS = (
     "association_primary_gate_passed",
     "association_primary_position_error",
     "association_primary_distance_error",
+    "association_primary_mahalanobis_distance",
     "association_primary_observed_x",
     "association_primary_observed_y",
     "association_primary_observed_z",
@@ -116,6 +148,7 @@ OUTLIER_CONTEXT_FIELDS = (
     "association_secondary_gate_passed",
     "association_secondary_position_error",
     "association_secondary_distance_error",
+    "association_secondary_mahalanobis_distance",
     "association_secondary_observed_x",
     "association_secondary_observed_y",
     "association_secondary_observed_z",
@@ -139,9 +172,43 @@ DEFAULT_THRESHOLDS = {
     "center_speed": 0.20,
     "radius_span": 0.05,
     "id_jump": 0.05,
+    "ekf_reprojection_armor_ratio": 1.0,
     "prediction_match_tolerance": 0.03,
+    "range_bin_size": 1.0,
     "minimum_samples": 20,
 }
+
+RANGE_STATS_FIELDS = (
+    "pnp_error",
+    "current_ekf_error",
+    "post_update_position_error",
+    "post_update_bearing_error",
+    "post_update_distance_error",
+    "post_update_orientation_error",
+    "association_primary_position_error",
+    "association_primary_distance_error",
+    "association_primary_mahalanobis_distance",
+    "center_speed",
+    "armor_pixel_long_side",
+    "armor_pixel_short_side",
+)
+
+INVALID_NEGATIVE_FIELDS = frozenset(
+    (
+        "prediction_dt",
+        "target_distance",
+        "armor_pixel_long_side",
+        "armor_pixel_short_side",
+        "base_prediction_dt",
+        "fly_time",
+        "current_ekf_error",
+        "post_update_position_error",
+        "post_update_bearing_error",
+        "post_update_distance_error",
+        "post_update_orientation_error",
+        "pnp_error",
+    )
+)
 
 
 def _finite_number(value):
@@ -184,6 +251,54 @@ def _summarize(values):
         "p95": p95,
         "robust_span": p95 - p05,
     }
+
+
+def _analyze_range_buckets(samples, bin_size):
+    """按目标距离分桶，避免近距离和远距离误差混在同一统计量中。"""
+    buckets = {}
+    for sample in samples:
+        distance = sample.get("target_distance")
+        if distance is None or distance < 0.0:
+            continue
+        bucket_index = math.floor(distance / bin_size)
+        buckets.setdefault(bucket_index, []).append(sample)
+
+    result = []
+    for bucket_index in sorted(buckets):
+        bucket_samples = buckets[bucket_index]
+        stats = {}
+        for field in RANGE_STATS_FIELDS:
+            summary = _summarize(
+                [
+                    sample[field]
+                    for sample in bucket_samples
+                    if field in sample and sample[field] >= 0.0
+                ]
+            )
+            if summary is not None:
+                stats[field] = summary
+
+        generations = {
+            sample["tracker_generation"]
+            for sample in bucket_samples
+            if "tracker_generation" in sample
+        }
+        id_switch_count = sum(
+            previous.get("current_armor_id") != current.get("current_armor_id")
+            for previous, current in zip(bucket_samples, bucket_samples[1:])
+            if "current_armor_id" in previous and "current_armor_id" in current
+        )
+        result.append(
+            {
+                "minimum_distance": bucket_index * bin_size,
+                "maximum_distance": (bucket_index + 1) * bin_size,
+                "sample_count": len(bucket_samples),
+                "tracker_generation_count": len(generations),
+                "id_switch_count": id_switch_count,
+                "stats": stats,
+            }
+        )
+    return result
 
 
 def _outlier_snapshot(sample):
@@ -252,10 +367,22 @@ def normalize_sample(payload, timestamp):
         "association_primary_id",
         "association_primary_accepted",
         "association_primary_gate_passed",
+        "association_primary_angle_gate_passed",
+        "association_primary_score_gate_passed",
+        "association_primary_position_gate_passed",
+        "association_primary_distance_gate_passed",
+        "association_primary_mahalanobis_gate_passed",
         "association_secondary_id",
         "association_secondary_accepted",
         "association_secondary_gate_passed",
+        "association_secondary_angle_gate_passed",
+        "association_secondary_score_gate_passed",
+        "association_secondary_position_gate_passed",
+        "association_secondary_distance_gate_passed",
+        "association_secondary_mahalanobis_gate_passed",
         "high_speed_mode",
+        "command_control",
+        "command_shoot",
     ):
         value = payload.get(field)
         if _finite_number(value):
@@ -290,6 +417,40 @@ def _signed_angle_error(lhs, rhs):
     return (lhs - rhs + math.pi) % (2.0 * math.pi) - math.pi
 
 
+def _add_observed_yaw_rate(samples):
+    """从连续主关联观测估计 yaw 速率，仅用于区分观测和 EKF 的问题。"""
+    augmented_samples = [dict(sample) for sample in samples]
+    previous = None
+    for sample in augmented_samples:
+        sample.pop("observed_yaw_rate", None)
+        generation = sample.get("tracker_generation")
+        model_id = sample.get("association_primary_id")
+        timestamp = sample.get("timestamp")
+        observed_yaw = sample.get("association_primary_optimized_yaw")
+        current = (generation, model_id, timestamp, observed_yaw)
+        if (
+            previous is not None
+            and generation is not None
+            and model_id is not None
+            and timestamp is not None
+            and observed_yaw is not None
+            and previous[0] == generation
+            and previous[1] == model_id
+            and previous[2] is not None
+            and previous[3] is not None
+        ):
+            dt = timestamp - previous[2]
+            if 1e-4 < dt <= 0.1:
+                sample["observed_yaw_rate"] = _signed_angle_error(
+                    observed_yaw, previous[3]
+                ) / dt
+        if all(value is not None for value in current):
+            previous = current
+        else:
+            previous = None
+    return augmented_samples
+
+
 def _prediction_bucket(records, eligible_count):
     stats = {}
     for field in (
@@ -304,6 +465,15 @@ def _prediction_bucket(records, eligible_count):
         "delay_time",
         "base_prediction_dt",
         "fly_time",
+        "command_yaw",
+        "command_pitch",
+        "command_yaw_deg",
+        "command_pitch_deg",
+        "capture_to_detector_ms",
+        "detector_ms",
+        "tracker_ms",
+        "aimer_ms",
+        "capture_to_aimer_ms",
     ):
         summary = _summarize([record[field] for record in records if field in record])
         if summary is not None:
@@ -412,6 +582,23 @@ def _analyze_aimer_predictions(samples, limits):
         for field in ("delay_time", "base_prediction_dt", "fly_time"):
             if field in source:
                 record[field] = source[field]
+        for field in (
+            "command_yaw",
+            "command_pitch",
+            "command_yaw_deg",
+            "command_pitch_deg",
+        ):
+            if field in source:
+                record[field] = source[field]
+        for field in (
+            "capture_to_detector_ms",
+            "detector_ms",
+            "tracker_ms",
+            "aimer_ms",
+            "capture_to_aimer_ms",
+        ):
+            if field in source:
+                record[field] = source[field]
         observed_yaw = best_match["yaw"]
         if (
             observed_yaw is not None
@@ -447,7 +634,12 @@ def _analyze_aimer_predictions(samples, limits):
 def _analyze_phase(samples):
     stats = {}
     for field in ANALYZED_FIELDS:
-        values = [sample[field] for sample in samples if field in sample]
+        values = [
+            sample[field]
+            for sample in samples
+            if field in sample
+            and (field not in INVALID_NEGATIVE_FIELDS or sample[field] >= 0.0)
+        ]
         summary = _summarize(values)
         if summary is not None:
             stats[field] = summary
@@ -504,6 +696,15 @@ def _analyze_phase(samples):
     duplicate_model_id_count = 0
     rejected_candidate_frame_count = 0
     gate_rejected_frame_count = 0
+    gate_rejection_counts = {
+        "angle": 0,
+        "score": 0,
+        "position": 0,
+        "distance": 0,
+        "mahalanobis": 0,
+    }
+    gate_evaluated_candidate_count = 0
+    gate_rejected_candidate_count = 0
     for sample in samples:
         candidate_count = sample.get("association_candidate_count")
         accepted_count = sample.get("association_accepted_count")
@@ -519,6 +720,23 @@ def _analyze_phase(samples):
             gate_passed.append(sample["association_secondary_gate_passed"])
         if gate_passed and not all(gate_passed):
             gate_rejected_frame_count += 1
+        for prefix in ("association_primary", "association_secondary"):
+            candidate_gate = sample.get(f"{prefix}_gate_passed")
+            if candidate_gate is None:
+                continue
+            gate_evaluated_candidate_count += 1
+            if candidate_gate:
+                continue
+            gate_rejected_candidate_count += 1
+            for reason, suffix in (
+                ("angle", "angle_gate_passed"),
+                ("score", "score_gate_passed"),
+                ("position", "position_gate_passed"),
+                ("distance", "distance_gate_passed"),
+                ("mahalanobis", "mahalanobis_gate_passed"),
+            ):
+                if sample.get(f"{prefix}_{suffix}") == 0:
+                    gate_rejection_counts[reason] += 1
         if candidate_count < 2:
             continue
         primary_id = sample.get("association_primary_id")
@@ -558,6 +776,10 @@ def _analyze_phase(samples):
             if association_frame_count
             else None
         ),
+        # 这里只统计 ROS 调试消息保留的主、次两个候选，不冒充全部候选。
+        "gate_evaluated_candidate_count": gate_evaluated_candidate_count,
+        "gate_rejected_candidate_count": gate_rejected_candidate_count,
+        "gate_rejection_counts": gate_rejection_counts,
     }
 
 
@@ -567,6 +789,7 @@ def _append_diagnosis(diagnoses, level, code, message):
 
 def analyze_samples(samples, thresholds=None):
     """对采集样本做纯计算分析，供 ROS 入口和单元测试共同使用。"""
+    samples = _add_observed_yaw_rate(samples)
     limits = dict(DEFAULT_THRESHOLDS)
     if thresholds is not None:
         limits.update(thresholds)
@@ -592,7 +815,11 @@ def analyze_samples(samples, thresholds=None):
     }
     diagnoses = []
 
-    for phase_name, phase in phases.items():
+    for phase_name, phase_samples in (
+        ("static", static_samples),
+        ("spin", spin_samples),
+    ):
+        phase = phases[phase_name]
         if phase["sample_count"] < limits["minimum_samples"]:
             _append_diagnosis(
                 diagnoses,
@@ -603,6 +830,29 @@ def analyze_samples(samples, thresholds=None):
             continue
 
         stats = phase["stats"]
+        # 以同帧装甲板尺寸归一化，只检查真正进入 EKF 的有效观测。
+        ekf_error_ratios = [
+            sample["current_ekf_error"] / sample["armor_pixel_long_side"]
+            for sample in phase_samples
+            if sample.get("association_accepted_count") == 1
+            and sample.get("current_ekf_error", -1.0) >= 0.0
+            and sample.get("armor_pixel_long_side", 0.0) > 0.0
+        ]
+        excessive_ratios = [
+            ratio
+            for ratio in ekf_error_ratios
+            if ratio > limits["ekf_reprojection_armor_ratio"]
+        ]
+        if excessive_ratios:
+            _append_diagnosis(
+                diagnoses,
+                "WARN",
+                f"{phase_name}_ekf_reprojection",
+                f"{phase_name} 阶段有 {len(excessive_ratios)} 帧已接收观测的 "
+                f"EKF 回投影误差超过装甲板长边的 "
+                f"{limits['ekf_reprojection_armor_ratio']:.2f} 倍；"
+                f"最大为 {max(excessive_ratios):.2f} 倍。",
+            )
         center_spans = [
             stats[field]["robust_span"]
             for field in ("center_x", "center_y")
@@ -661,6 +911,11 @@ def analyze_samples(samples, thresholds=None):
             conclusion = "半径相对稳定，但 ID 切换伴随中心跳变，优先检查关联和 PnP 朝向。"
         else:
             conclusion = "小陀螺中心摆动未直接对应半径或 ID 跳变，继续检查坐标系和 PnP。"
+    elif "spin_ekf_reprojection" in warning_codes:
+        conclusion = (
+            "小陀螺车辆中心虽未超过阈值，但部分已接收观测的 EKF "
+            "回投影偏差超过装甲板尺度，应检查关联、PnP 和滤波更新。"
+        )
     elif phases["spin"]["sample_count"] >= limits["minimum_samples"]:
         conclusion = "小陀螺阶段车辆中心未超过当前阈值。"
     else:
@@ -671,6 +926,9 @@ def analyze_samples(samples, thresholds=None):
         "transition_sample_count": transition_count,
         "thresholds": limits,
         "phases": phases,
+        "range_buckets": _analyze_range_buckets(
+            samples, limits["range_bin_size"]
+        ),
         "aimer_prediction": _analyze_aimer_predictions(samples, limits),
         "outliers": _extract_outlier_events(samples),
         "diagnoses": diagnoses,
@@ -737,21 +995,32 @@ def print_report(report):
         "vx": "m/s",
         "vy": "m/s",
         "angular_velocity": "rad/s",
+        "observed_yaw_rate": "rad/s",
         "radius": "m",
         "alternate_radius": "m",
         "current_ekf_error": "px",
+        "post_update_position_error": "m",
+        "post_update_bearing_error": "rad",
+        "post_update_distance_error": "m",
+        "post_update_orientation_error": "rad",
         "pnp_error": "px",
         "nis": "",
         "nis_failure_rate": "",
         "association_primary_score": "rad",
         "association_primary_position_error": "m",
         "association_primary_distance_error": "m",
+        "association_primary_mahalanobis_distance": "",
+        "association_primary_position_angle_error": "rad",
+        "association_primary_distance_angle_error": "rad",
         "association_primary_orientation_error": "rad",
         "association_primary_bearing_error": "rad",
         "association_primary_yaw_correction_abs": "rad",
         "association_secondary_score": "rad",
         "association_secondary_position_error": "m",
         "association_secondary_distance_error": "m",
+        "association_secondary_mahalanobis_distance": "",
+        "association_secondary_position_angle_error": "rad",
+        "association_secondary_distance_angle_error": "rad",
         "association_secondary_yaw_correction_abs": "rad",
     }
     for phase_name, title in (("static", "静止阶段"), ("spin", "小陀螺阶段")):
@@ -830,7 +1099,7 @@ def print_report(report):
                 f"比例={prediction['high_speed_mode_rate']:.3f}"
             )
         for field, label in (
-            ("delay_time", "发射延迟"),
+            ("delay_time", "观测到Aimer实测处理延迟"),
             ("base_prediction_dt", "基础预测时间"),
             ("fly_time", "弹丸飞行时间"),
         ):
@@ -839,6 +1108,29 @@ def print_report(report):
                 print(
                     f"    {label} mean={summary['mean'] * 1000.0:.2f}ms "
                     f"P95={summary['p95'] * 1000.0:.2f}ms"
+                )
+        for field, label in (
+            ("capture_to_detector_ms", "图像回调到检测"),
+            ("detector_ms", "检测耗时"),
+            ("tracker_ms", "Tracker耗时"),
+            ("aimer_ms", "Aimer耗时"),
+            ("capture_to_aimer_ms", "图像回调到Aimer"),
+        ):
+            summary = stats.get(field)
+            if summary is not None:
+                print(
+                    f"    {label} mean={summary['mean']:.3f}ms "
+                    f"P95={summary['p95']:.3f}ms"
+                )
+        for field, label, unit in (
+            ("command_yaw_deg", "命令yaw", "deg"),
+            ("command_pitch_deg", "命令pitch", "deg"),
+        ):
+            summary = stats.get(field)
+            if summary is not None:
+                print(
+                    f"    {label} mean={summary['mean']:.2f}{unit} "
+                    f"P05-P95={summary['p05']:.2f}..{summary['p95']:.2f}{unit}"
                 )
         baseline_yaw = stats.get("baseline_yaw_error")
         predicted_yaw = stats.get("prediction_yaw_error")
@@ -856,6 +1148,35 @@ def print_report(report):
                 f"等效dt修正 mean={dt_correction['mean'] * 1000.0:.2f}ms "
                 f"median={dt_correction['median'] * 1000.0:.2f}ms"
             )
+
+    print("\n[距离分段]")
+    for bucket in report["range_buckets"]:
+        stats = bucket["stats"]
+        print(
+            f"  {bucket['minimum_distance']:.1f}~{bucket['maximum_distance']:.1f}m "
+            f"样本数={bucket['sample_count']} "
+            f"Tracker世代数={bucket['tracker_generation_count']} "
+            f"ID切换={bucket['id_switch_count']}"
+        )
+        for field, label, unit in (
+            ("armor_pixel_long_side", "像素长边", "px"),
+            ("armor_pixel_short_side", "像素短边", "px"),
+            ("pnp_error", "PnP误差", "px"),
+            ("current_ekf_error", "EKF回投影误差", "px"),
+            ("post_update_position_error", "EKF后验位置残差", "m"),
+            ("post_update_bearing_error", "EKF后验方位残差", "rad"),
+            ("post_update_distance_error", "EKF后验距离残差", "m"),
+            ("post_update_orientation_error", "EKF后验装甲板角残差", "rad"),
+            ("association_primary_position_error", "关联位置误差", "m"),
+            ("association_primary_distance_error", "关联距离误差", "m"),
+            ("center_speed", "中心速度", "m/s"),
+        ):
+            summary = stats.get(field)
+            if summary is not None:
+                print(
+                    f"    {label} P95={summary['p95']:.4f}{unit} "
+                    f"P05-P95={summary['p05']:.4f}..{summary['p95']:.4f}{unit}"
+                )
 
     print("\n[异常帧 Top 3]")
     for event in report["outliers"]["center_jump"][:3]:
@@ -942,10 +1263,22 @@ def parse_args():
     parser.add_argument("--radius-span-threshold", type=float, default=0.05)
     parser.add_argument("--id-jump-threshold", type=float, default=0.05)
     parser.add_argument(
+        "--ekf-reprojection-armor-ratio",
+        type=_positive_float,
+        default=1.0,
+        help="已接收观测的 EKF 回投影误差相对装甲板像素长边的报警倍数",
+    )
+    parser.add_argument(
         "--prediction-match-tolerance",
         type=_positive_float,
         default=0.03,
         help="未来预测与实测样本的最大时间差，单位为秒",
+    )
+    parser.add_argument(
+        "--range-bin-size",
+        type=_positive_float,
+        default=1.0,
+        help="目标距离分桶大小，单位为米",
     )
     parser.add_argument("--minimum-samples", type=int, default=20)
     parser.add_argument("--output", help="可选的 JSON 报告输出路径")
@@ -961,7 +1294,9 @@ def main():
         "center_speed": args.center_speed_threshold,
         "radius_span": args.radius_span_threshold,
         "id_jump": args.id_jump_threshold,
+        "ekf_reprojection_armor_ratio": args.ekf_reprojection_armor_ratio,
         "prediction_match_tolerance": args.prediction_match_tolerance,
+        "range_bin_size": args.range_bin_size,
         "minimum_samples": args.minimum_samples,
     }
     samples = collect_ros_samples(args)

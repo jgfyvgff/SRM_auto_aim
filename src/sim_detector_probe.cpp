@@ -4,6 +4,7 @@
 #include <sensor_msgs/msg/image.hpp>
 #include <std_msgs/msg/string.hpp>
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <functional>
@@ -17,6 +18,7 @@
 #include "tasks/auto_aim/solver.hpp"
 #include "tasks/auto_aim/tracker.hpp"
 #include "tasks/auto_aim/aimer.hpp"
+#include "tools/math_tools.hpp"
 
 class SimDetectorProbe final : public rclcpp::Node
 {
@@ -106,6 +108,28 @@ private:
     return matched_armor;
   }
 
+  // 按 Tracker 记录的检测中心回查同一个框，避免多机器人同屏时最近邻配错。
+  static const auto_aim::Armor * find_associated_armor(
+    const std::list<auto_aim::Armor> & armors,
+    auto_aim::ArmorName name,
+    auto_aim::ArmorType type,
+    const cv::Point2f & center)
+  {
+    const auto * matched = static_cast<const auto_aim::Armor *>(nullptr);
+    auto min_center_error = std::numeric_limits<double>::max();
+    for (const auto & armor : armors) {
+      if (armor.name != name || armor.type != type || armor.points.size() != 4) {
+        continue;
+      }
+      const auto error = cv::norm(armor.center - center);
+      if (error < min_center_error) {
+        min_center_error = error;
+        matched = &armor;
+      }
+    }
+    return min_center_error <= 0.01 ? matched : nullptr;
+  }
+
   // 计算四个角点的平均像素误差。
   static double mean_reprojection_error(
     const auto_aim::Armor & armor, const std::vector<cv::Point2f> & projected_points)
@@ -119,6 +143,13 @@ private:
       total_error += cv::norm(armor.points[i] - projected_points[i]);
     }
     return total_error / 4.0;
+  }
+
+  static double duration_ms(
+    const std::chrono::steady_clock::time_point & begin,
+    const std::chrono::steady_clock::time_point & end)
+  {
+    return std::chrono::duration<double, std::milli>(end - begin).count();
   }
 
   // 计算未来瞄准点相对当前检测装甲板中心的像素位移。
@@ -145,6 +176,8 @@ private:
   // 只保留最新帧，旧帧被覆盖，优先保证检测延迟而不是处理完整历史帧。
   void on_image(const sensor_msgs::msg::Image::SharedPtr msg)
   {
+    const auto frame_received_at = std::chrono::steady_clock::now();
+
     if (msg->encoding != "rgb8" || msg->step < msg->width * 3) {
       RCLCPP_WARN_THROTTLE(
         get_logger(), *get_clock(), 2000,
@@ -161,20 +194,25 @@ private:
 
     std::lock_guard<std::mutex> lock(frame_mutex_);
     latest_frame_ = bgr.clone();
+    latest_frame_timestamp_ = frame_received_at;
   }
 
   void run_inference()
   {
     cv::Mat frame;
+    std::chrono::steady_clock::time_point frame_timestamp;
     {
       std::lock_guard<std::mutex> lock(frame_mutex_);
       if (latest_frame_.empty()) {
         return;
       }
       frame = std::move(latest_frame_);
+      frame_timestamp = latest_frame_timestamp_;
     }
 
+    const auto detector_start = std::chrono::steady_clock::now();
     const auto armors = detector_.detect(frame, frame_count_++);
+    const auto detector_end = std::chrono::steady_clock::now();
     // 使用副本交给 Tracker，保留原始检测结果用于窗口显示和类别核对。
     auto tracker_armors = armors;
     set_probe_priority(tracker_armors);
@@ -192,20 +230,36 @@ private:
     }
 
     // 当前假设底盘不动，Target 坐标直接作为云台局部坐标交给 Aimer。
-    const auto timestamp = std::chrono::steady_clock::now();
+    const auto tracker_start = std::chrono::steady_clock::now();
+    const auto timestamp = frame_timestamp;
     const auto targets = tracker_.track(tracker_armors, timestamp);
+    const auto tracker_end = std::chrono::steady_clock::now();
     constexpr double sim_bullet_speed_mps = 23.0;
+    const auto aimer_start = std::chrono::steady_clock::now();
     const auto command = aimer_.aim(targets, timestamp, sim_bullet_speed_mps);
+    const auto aimer_end = std::chrono::steady_clock::now();
 
     std::vector<cv::Point2f> current_reprojected_points;
     double current_reprojection_error = -1.0;
+    double post_update_position_error = -1.0;
+    double post_update_bearing_error = -1.0;
+    double post_update_distance_error = -1.0;
+    double post_update_orientation_error = -1.0;
     std::vector<cv::Point2f> reprojected_points;
     double future_center_shift = -1.0;
     std::vector<cv::Point2f> pnp_reprojected_points;
     double pnp_reprojection_error = -1.0;
+    double target_distance = -1.0;
+    double armor_pixel_long_side = -1.0;
+    double armor_pixel_short_side = -1.0;
 
     if (!targets.empty()) {
       const auto & target = targets.front();
+      const auto target_state = target.ekf_x();
+      if (target_state.size() >= 3) {
+        // state[0] 和 state[2] 是水平面坐标，距离单位为 m。
+        target_distance = std::hypot(target_state[0], target_state[2]);
+      }
 
       // 当前 EKF 状态不包含弹道提前量，用来检查 Tracker 是否贴合当前帧。
       const auto current_armor_xyza_list = target.armor_xyza_list();
@@ -217,11 +271,33 @@ private:
         current_reprojected_points = solver_.reproject_armor(
           current_xyza.head<3>(), current_xyza[3], target.armor_type, target.name);
 
-        const auto * current_armor = find_nearest_armor(
-          armors, target.name, current_reprojected_points);
+        const auto & accepted = tracker_.association_debug().candidates[0];
+        const auto * current_armor = static_cast<const auto_aim::Armor *>(nullptr);
+        if (accepted.accepted && accepted.model_id == target.last_id) {
+          const cv::Point2f accepted_center(
+            static_cast<float>(accepted.image_x),
+            static_cast<float>(accepted.image_y));
+          // Tracker 在副本上完成 PnP，后验残差必须读取该副本的解算位姿。
+          current_armor = find_associated_armor(
+            tracker_armors, target.name, target.armor_type, accepted_center);
+        }
         if (current_armor != nullptr) {
           current_reprojection_error =
             mean_reprojection_error(*current_armor, current_reprojected_points);
+          // 与 current_ekf_error 使用同一个已接受观测，量出 EKF 更新后的状态残差。
+          // 这些字段只用于诊断，不参与关联、滤波或控制决策。
+          const auto post_update_ypd = tools::xyz2ypd(current_xyza.head<3>());
+          post_update_position_error =
+            (current_armor->xyz_in_world - current_xyza.head<3>()).norm();
+          post_update_bearing_error = std::abs(tools::limit_rad(
+            current_armor->ypd_in_world[0] - post_update_ypd[0]));
+          post_update_distance_error =
+            std::abs(current_armor->ypd_in_world[2] - post_update_ypd[2]);
+          post_update_orientation_error = std::abs(tools::limit_rad(
+            current_armor->ypr_in_world[0] - current_xyza[3]));
+          const auto rect_size = cv::minAreaRect(current_armor->points).size;
+          armor_pixel_long_side = std::max(rect_size.width, rect_size.height);
+          armor_pixel_short_side = std::min(rect_size.width, rect_size.height);
         }
       }
 
@@ -332,12 +408,31 @@ private:
         plot_data["vz"] = state[5];
         plot_data["angular_velocity"] = state[7];
         plot_data["prediction_dt"] = aimer_.debug_prediction_dt;
+        // Command 内部使用弧度；同时发布角度值，便于与模拟器云台消息核对单位。
+        plot_data["command_control"] = command.control ? 1 : 0;
+        plot_data["command_shoot"] = command.shoot ? 1 : 0;
+        plot_data["command_yaw"] = command.yaw;
+        plot_data["command_pitch"] = command.pitch;
+        plot_data["command_yaw_deg"] = command.yaw * 180.0 / CV_PI;
+        plot_data["command_pitch_deg"] = command.pitch * 180.0 / CV_PI;
+        plot_data["target_distance"] = target_distance;
+        plot_data["armor_pixel_long_side"] = armor_pixel_long_side;
+        plot_data["armor_pixel_short_side"] = armor_pixel_short_side;
         plot_data["high_speed_mode"] = aimer_.debug_high_speed_mode ? 1 : 0;
         plot_data["delay_time"] = aimer_.debug_delay_time;
         plot_data["base_prediction_dt"] = aimer_.debug_base_prediction_dt;
         plot_data["fly_time"] = aimer_.debug_fly_time;
+        plot_data["capture_to_detector_ms"] = duration_ms(frame_timestamp, detector_start);
+        plot_data["detector_ms"] = duration_ms(detector_start, detector_end);
+        plot_data["tracker_ms"] = duration_ms(tracker_start, tracker_end);
+        plot_data["aimer_ms"] = duration_ms(aimer_start, aimer_end);
+        plot_data["capture_to_aimer_ms"] = duration_ms(frame_timestamp, aimer_start);
         plot_data["pnp_error"] = pnp_reprojection_error;
         plot_data["current_ekf_error"] = current_reprojection_error;
+        plot_data["post_update_position_error"] = post_update_position_error;
+        plot_data["post_update_bearing_error"] = post_update_bearing_error;
+        plot_data["post_update_distance_error"] = post_update_distance_error;
+        plot_data["post_update_orientation_error"] = post_update_orientation_error;
         plot_data["future_center_shift"] = future_center_shift;
         // NIS 使用更新前创新计算；失败率是 Tracker 判定收敛质量的直接依据。
         plot_data["nis"] = target.ekf().last_nis;
@@ -353,9 +448,22 @@ private:
           plot_data[prefix + "_id"] = candidate.model_id;
           plot_data[prefix + "_gate_passed"] = candidate.gate_passed ? 1 : 0;
           plot_data[prefix + "_accepted"] = candidate.accepted ? 1 : 0;
+          plot_data[prefix + "_angle_gate_passed"] =
+            candidate.angle_gate_passed ? 1 : 0;
+          plot_data[prefix + "_score_gate_passed"] =
+            candidate.score_gate_passed ? 1 : 0;
+          plot_data[prefix + "_position_gate_passed"] =
+            candidate.position_gate_passed ? 1 : 0;
+          plot_data[prefix + "_distance_gate_passed"] =
+            candidate.distance_gate_passed ? 1 : 0;
+          plot_data[prefix + "_mahalanobis_gate_passed"] =
+            candidate.mahalanobis_gate_passed ? 1 : 0;
           plot_data[prefix + "_score"] = candidate.score;
           plot_data[prefix + "_position_error"] = candidate.position_error;
           plot_data[prefix + "_distance_error"] = candidate.distance_error;
+          plot_data[prefix + "_mahalanobis_distance"] = candidate.mahalanobis_distance;
+          plot_data[prefix + "_position_angle_error"] = candidate.position_angle_error;
+          plot_data[prefix + "_distance_angle_error"] = candidate.distance_angle_error;
           plot_data[prefix + "_observed_x"] = candidate.observed_x;
           plot_data[prefix + "_observed_y"] = candidate.observed_y;
           plot_data[prefix + "_observed_z"] = candidate.observed_z;
@@ -570,6 +678,7 @@ private:
   rclcpp::TimerBase::SharedPtr inference_timer_;
   std::mutex frame_mutex_;
   cv::Mat latest_frame_;
+  std::chrono::steady_clock::time_point latest_frame_timestamp_;
   int frame_count_;
 };
 

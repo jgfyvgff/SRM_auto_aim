@@ -5,7 +5,7 @@
 #include <algorithm>
 #include <cmath>
 #include <limits>
-#include <set>
+#include <optional>
 #include <stdexcept>
 #include <tuple>
 #include <vector>
@@ -48,6 +48,19 @@ Tracker::Tracker(const std::string & config_path, Solver & solver)
   association_max_angle_error_ = yaml["association_max_angle_error"].IsDefined()
                                    ? yaml["association_max_angle_error"].as<double>()
                                    : std::numeric_limits<double>::infinity();
+  association_max_score_ = yaml["association_max_score"].IsDefined()
+                             ? yaml["association_max_score"].as<double>()
+                             : 0.8;
+  association_max_position_error_ = yaml["association_max_position_error"].IsDefined()
+                                      ? yaml["association_max_position_error"].as<double>()
+                                      : 0.45;
+  association_max_distance_error_ = yaml["association_max_distance_error"].IsDefined()
+                                      ? yaml["association_max_distance_error"].as<double>()
+                                      : 0.45;
+  association_max_mahalanobis_distance_ =
+    yaml["association_max_mahalanobis_distance"].IsDefined()
+      ? yaml["association_max_mahalanobis_distance"].as<double>()
+      : 3.2;
 
   if (
     standard_radius_ <= 0.05 || standard_radius_ >= 0.5 ||
@@ -61,6 +74,18 @@ Tracker::Tracker(const std::string & config_path, Solver & solver)
     (association_max_angle_error_ <= 0.0 || association_max_angle_error_ > 3.141592653589793))
   {
     throw std::runtime_error("Invalid association_max_angle_error configuration");
+  }
+  if (association_max_score_ <= 0.0 || association_max_score_ > 3.141592653589793 * 3.0) {
+    throw std::runtime_error("Invalid association_max_score configuration");
+  }
+  if (association_max_position_error_ <= 0.0 || association_max_distance_error_ <= 0.0) {
+    throw std::runtime_error("Invalid association absolute error configuration");
+  }
+  if (
+    !std::isfinite(association_max_mahalanobis_distance_) ||
+    association_max_mahalanobis_distance_ <= 0.0)
+  {
+    throw std::runtime_error("Invalid association_max_mahalanobis_distance configuration");
   }
 }
 
@@ -337,10 +362,19 @@ bool Tracker::update_target(std::list<Armor> & armors, std::chrono::steady_clock
     Armor * armor;
     int id;
     double angle_error;
+    double mahalanobis_distance;
     double position_error;
     double distance_error;
+    double position_angle_error;
+    double distance_angle_error;
+    double association_score;
     double orientation_error;
     double bearing_error;
+    bool angle_gate_passed;
+    bool score_gate_passed;
+    bool position_gate_passed;
+    bool distance_gate_passed;
+    bool mahalanobis_gate_passed;
     bool gate_passed;
   };
 
@@ -351,21 +385,58 @@ bool Tracker::update_target(std::list<Armor> & armors, std::chrono::steady_clock
 
     // 关联依赖 PnP 解算出的世界坐标和姿态，因此必须先完成 solve。
     solver_.solve(armor);
-    const auto [id, angle_error] = target_.match_armor(armor);
-    if (id < 0 || static_cast<std::size_t>(id) >= predicted_armors.size()) continue;
+    std::optional<Candidate> best_gated_match;
+    std::optional<Candidate> best_rejected_match;
+    for (const auto & match : target_.match_armors(armor)) {
+      if (match.id < 0 || static_cast<std::size_t>(match.id) >= predicted_armors.size()) {
+        continue;
+      }
 
-    const auto & predicted_armor = predicted_armors[id];
-    const auto predicted_ypd = tools::xyz2ypd(predicted_armor.head(3));
-    const auto position_error = (armor.xyz_in_world - predicted_armor.head(3)).norm();
-    const auto distance_error = std::abs(armor.ypd_in_world[2] - predicted_ypd[2]);
-    const auto orientation_error =
-      std::abs(tools::limit_rad(armor.ypr_in_world[0] - predicted_armor[3]));
-    const auto bearing_error =
-      std::abs(tools::limit_rad(armor.ypd_in_world[0] - predicted_ypd[0]));
-    candidates.push_back(
-      {&armor, id, angle_error, position_error, distance_error,
-       orientation_error, bearing_error,
-       angle_error <= association_max_angle_error_});
+      const auto & predicted_armor = predicted_armors[match.id];
+      const auto predicted_ypd = tools::xyz2ypd(predicted_armor.head(3));
+      const auto position_error = (armor.xyz_in_world - predicted_armor.head(3)).norm();
+      const auto distance_error = std::abs(armor.ypd_in_world[2] - predicted_ypd[2]);
+      const auto orientation_error =
+        std::abs(tools::limit_rad(armor.ypr_in_world[0] - predicted_armor[3]));
+      const auto bearing_error =
+        std::abs(tools::limit_rad(armor.ypd_in_world[0] - predicted_ypd[0]));
+      // 位置误差和距离误差会随目标距离改变量纲影响，先折算为视线角度，
+      // 再与装甲板姿态/方位角误差相加，才能在近距离和远距离使用同一门限。
+      const auto reference_distance = std::max(
+        {std::abs(armor.ypd_in_world[2]), std::abs(predicted_ypd[2]), 0.1});
+      const auto position_angle_error = std::atan2(position_error, reference_distance);
+      const auto distance_angle_error = std::atan2(distance_error, reference_distance);
+      const auto association_score =
+        match.angle_error + position_angle_error + distance_angle_error;
+      const auto angle_gate_passed =
+        match.angle_error <= association_max_angle_error_;
+      const auto score_gate_passed = association_score <= association_max_score_;
+      const auto position_gate_passed = position_error <= association_max_position_error_;
+      const auto distance_gate_passed = distance_error <= association_max_distance_error_;
+      const auto mahalanobis_gate_passed =
+        match.mahalanobis_distance <= association_max_mahalanobis_distance_;
+      const auto gate_passed =
+        angle_gate_passed && score_gate_passed && position_gate_passed &&
+        distance_gate_passed && mahalanobis_gate_passed;
+
+      Candidate candidate{
+        &armor, match.id, match.angle_error, match.mahalanobis_distance,
+        position_error, distance_error, position_angle_error, distance_angle_error,
+        association_score, orientation_error, bearing_error, angle_gate_passed,
+        score_gate_passed, position_gate_passed, distance_gate_passed,
+        mahalanobis_gate_passed, gate_passed};
+      auto & best = gate_passed ? best_gated_match : best_rejected_match;
+      if (!best || candidate.mahalanobis_distance < best->mahalanobis_distance) {
+        best = candidate;
+      }
+    }
+
+    // 每个检测先在所有模型中寻找通过门限的最优匹配；失败时保留最佳拒绝项供诊断。
+    if (best_gated_match) {
+      candidates.push_back(*best_gated_match);
+    } else if (best_rejected_match) {
+      candidates.push_back(*best_rejected_match);
+    }
   }
 
   if (candidates.empty()) return false;
@@ -374,7 +445,17 @@ bool Tracker::update_target(std::list<Armor> & armors, std::chrono::steady_clock
   // 同一个模型 ID 每帧只接收一个观测，避免重复框或顺序变化把 EKF 拉向不同装甲板。
   std::stable_sort(
     candidates.begin(), candidates.end(),
-    [](const Candidate & a, const Candidate & b) { return a.angle_error < b.angle_error; });
+    [](const Candidate & a, const Candidate & b) {
+      // 先保证候选通过全部安全门限，再在可接受候选中比较统计距离。
+      // 否则最小马氏距离的坏观测会挡住后面本可吸收的有效观测。
+      if (a.gate_passed != b.gate_passed) {
+        return a.gate_passed > b.gate_passed;
+      }
+      if (a.mahalanobis_distance != b.mahalanobis_distance) {
+        return a.mahalanobis_distance < b.mahalanobis_distance;
+      }
+      return a.association_score < b.association_score;
+    });
 
   association_debug_.candidate_count = static_cast<int>(candidates.size());
   const auto debug_count = std::min(candidates.size(), association_debug_.candidates.size());
@@ -387,9 +468,17 @@ bool Tracker::update_target(std::list<Armor> & armors, std::chrono::steady_clock
     debug.model_id = candidate.id;
     debug.gate_passed = candidate.gate_passed;
     debug.accepted = false;
-    debug.score = candidate.angle_error;
+    debug.angle_gate_passed = candidate.angle_gate_passed;
+    debug.score_gate_passed = candidate.score_gate_passed;
+    debug.position_gate_passed = candidate.position_gate_passed;
+    debug.distance_gate_passed = candidate.distance_gate_passed;
+    debug.mahalanobis_gate_passed = candidate.mahalanobis_gate_passed;
+    debug.score = candidate.association_score;
     debug.position_error = candidate.position_error;
     debug.distance_error = candidate.distance_error;
+    debug.mahalanobis_distance = candidate.mahalanobis_distance;
+    debug.position_angle_error = candidate.position_angle_error;
+    debug.distance_angle_error = candidate.distance_angle_error;
     debug.observed_x = candidate.armor->xyz_in_world[0];
     debug.observed_y = candidate.armor->xyz_in_world[1];
     debug.observed_z = candidate.armor->xyz_in_world[2];
@@ -405,25 +494,21 @@ bool Tracker::update_target(std::list<Armor> & armors, std::chrono::steady_clock
     debug.yaw_correction =
       tools::limit_rad(candidate.armor->ypr_in_world[0] - candidate.armor->yaw_raw);
     debug.image_x = candidate.armor->center.x;
+    debug.image_y = candidate.armor->center.y;
   }
 
-  std::set<int> used_ids;
-  for (std::size_t index = 0; index < candidates.size(); ++index) {
-    const auto & candidate = candidates[index];
-    // 单帧偶发误匹配不能污染 EKF；保留预测状态比强行吸收一帧坏观测更安全。
-    const bool accepted = candidate.gate_passed && used_ids.insert(candidate.id).second;
-    if (index < association_debug_.candidates.size()) {
-      association_debug_.candidates[index].accepted = accepted;
-    }
-    if (!accepted) continue;
-
-    association_debug_.accepted_count++;
-    target_.update(*candidate.armor, candidate.id);//得到最优估计量
+  // 同一帧的同名装甲板可能来自不同机器人，不能把它们分别写入同一个 EKF。
+  // 只吸收综合分数最低的一个候选；其余候选仍保留在 debug 中供判断遮挡和多机器人场景。
+  const auto & best_candidate = candidates.front();
+  const bool accepted = best_candidate.gate_passed;
+  association_debug_.candidates[0].accepted = accepted;
+  if (accepted) {
+    association_debug_.accepted_count = 1;
+    target_.update(*best_candidate.armor, best_candidate.id);//得到最优估计量
   }
 
-  // 候选全部被门限拒绝时视为本帧未找到目标，使状态机进入 temp_lost。
-  // 持续异常最终会触发重新捕获，避免无观测预测无限漂移。
-  return association_debug_.accepted_count > 0;
+    // 门限拒绝时进入 temp_lost；短暂误拒仍保留预测，持续拒绝则由原状态机触发重捕获。
+    return accepted;
 }
 
 }  // namespace auto_aim

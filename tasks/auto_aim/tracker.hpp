@@ -22,11 +22,22 @@ struct AssociationCandidateDebug
   int model_id = -1;
   bool gate_passed = false;
   bool accepted = false;
+  // 分别记录各安全门限，便于判断拒绝原因；不参与控制决策。
+  bool angle_gate_passed = false;
+  bool score_gate_passed = false;
+  bool position_gate_passed = false;
+  bool distance_gate_passed = false;
+  bool mahalanobis_gate_passed = false;
   double score = 0.0;
   // 关联候选与预测装甲板的三维位置残差，单位为 m，仅用于诊断。
   double position_error = 0.0;
   // 关联候选与预测装甲板的距离残差，单位为 m，仅用于诊断。
   double distance_error = 0.0;
+  // 创新协方差归一化残差，无量纲；值越小表示与该模型的统计一致性越高。
+  double mahalanobis_distance = 0.0;
+  // 将三维残差按目标距离折算成近似角度后的分量，单位为 rad。
+  double position_angle_error = 0.0;
+  double distance_angle_error = 0.0;
   double observed_x = 0.0;
   double observed_y = 0.0;
   double observed_z = 0.0;
@@ -41,9 +52,10 @@ struct AssociationCandidateDebug
   double optimized_yaw = 0.0;
   double yaw_correction = 0.0;
   double image_x = 0.0;
+  double image_y = 0.0;
 };
 
-// 每帧最多保留两个最优候选，足以覆盖仿真中同时可见的两块装甲板。
+// 每帧最多保留两个最优候选用于诊断，但实际只允许一个候选更新 EKF。
 struct AssociationDebug
 {
   int candidate_count = 0;
@@ -85,6 +97,13 @@ private:
   double standard_height_delta_variance_;
   // 关联误差门限，单位为 rad；超限观测只保留为诊断候选，不进入 EKF。
   double association_max_angle_error_;
+  // 综合关联分数门限，单位为等效 rad；用于拒绝其他机器人同名装甲板。
+  double association_max_score_;
+  // 远距离下角度归一化可能掩盖较大的三维误差，单位为 m。
+  double association_max_position_error_;
+  double association_max_distance_error_;
+  // 创新协方差归一化残差门限，无量纲；用于关联主排序和统计门控。
+  double association_max_mahalanobis_distance_;
   std::string state_, pre_state_;
   Target target_;
   std::chrono::steady_clock::time_point last_timestamp_;

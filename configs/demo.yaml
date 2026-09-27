@@ -38,6 +38,17 @@ min_detect_count: 5
 max_temp_lost_count: 15
 outpost_max_temp_lost_count: 75
 
+# 同一帧只允许综合关联分数最低的一个同名装甲板更新 EKF，单位为等效 rad。
+# 分数 = 装甲板角度误差 + 位置误差视线角 + 距离误差视线角。
+# 装甲板姿态与视线方位综合误差门限，单位为 rad，约束明显错误的朝向匹配。
+association_max_angle_error: 0.35
+association_max_score: 0.8
+# 远距离下角度归一化可能掩盖较大的空间误差，绝对误差单位为 m。
+association_max_position_error: 0.45
+association_max_distance_error: 0.45
+# 创新协方差归一化残差门限，无量纲；约对应 4 维观测的约 95% 门控范围。
+association_max_mahalanobis_distance: 3.2
+
 # Daedalus vehicle.glb 的四装甲几何先验，单位为 m / m²。
 # 实际前后半径约 0.21177m，左右半径约 0.21117m。
 standard_geometry_constraint: true
@@ -55,8 +66,7 @@ pitch_offset: -1.4 # degree 2
 comming_angle: 60 # degree
 leaving_angle: 20 # degree
 decision_speed: 6.5 # 临时实验：确保仿真小陀螺进入高速选板分支，单位 rad/s
-high_speed_delay_time: 0.023 # 根据等效 dt 修正测试高速分支，单位 s
-low_speed_delay_time: 0.015 # s
+# 旧版固定高低速延迟配置已废弃，当前实现不再读取。
 
 #####-----shooter参数-----#####
 first_tolerance: 3 # 近距离射击容差，degree

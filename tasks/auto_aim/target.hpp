@@ -15,6 +15,15 @@
 namespace auto_aim
 {
 
+// 单个观测与当前 EKF 预测模型的关联结果；valid=false 表示协方差计算失败。
+struct ArmorMatch
+{
+  int id = -1;
+  double angle_error = 0.0;
+  double mahalanobis_distance = 0.0;
+  bool valid = false;
+};
+
 class Target
 {
 public:
@@ -34,8 +43,10 @@ public:
   void predict(double dt);
 
   // 在当前 EKF 预测状态下寻找最匹配的车辆装甲板 ID。
-  // 返回值为 {模型 ID, 角度匹配误差}，该过程只做关联，不修改滤波状态。
-  std::pair<int, double> match_armor(const Armor & armor) const;
+  // 使用创新协方差归一化残差，只做关联，不修改滤波状态。
+  std::vector<ArmorMatch> match_armors(const Armor & armor) const;
+  // 兼容单匹配调用，返回马氏距离最小的模型。
+  ArmorMatch match_armor(const Armor & armor) const;
 
   void update(const Armor & armor);
   // 使用已经完成关联的 ID 更新 EKF，避免同一帧内重复计算关联关系。
@@ -80,6 +91,7 @@ private:
 
   void update_ypda(const Armor & armor, int id);  // yaw pitch distance angle
   void apply_geometry_constraint();
+  Eigen::Matrix4d measurement_noise(const Armor & armor) const;
 
   Eigen::Vector3d h_armor_xyz(const Eigen::VectorXd & x, int id) const;
   Eigen::MatrixXd h_jacobian(const Eigen::VectorXd & x, int id) const;

@@ -1,6 +1,7 @@
 #include "target.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <limits>
 #include <numeric>
 #include <stdexcept>
@@ -163,48 +164,55 @@ void Target::predict(double dt)
   ekf_.predict(F, Q, f);//计算预测量和预测协方差矩阵
 }//
 
-std::pair<int, double> Target::match_armor(const Armor & armor) const
+std::vector<ArmorMatch> Target::match_armors(const Armor & armor) const
 {
-  // 装甲板匹配
-  int id = -1;
-  auto min_angle_error = std::numeric_limits<double>::max();
+  std::vector<ArmorMatch> matches;
   const std::vector<Eigen::Vector4d> & xyza_list = armor_xyza_list();
+  const Eigen::Matrix4d R = measurement_noise(armor);
 
-  std::vector<std::pair<Eigen::Vector4d, int>> xyza_i_list;
   for (int i = 0; i < armor_num_; i++) {
-    xyza_i_list.push_back({xyza_list[i], i});
-  }
-
-  std::sort(
-    xyza_i_list.begin(), xyza_i_list.end(),
-    [](const std::pair<Eigen::Vector4d, int> & a, const std::pair<Eigen::Vector4d, int> & b) {
-      Eigen::Vector3d ypd1 = tools::xyz2ypd(a.first.head(3));
-      Eigen::Vector3d ypd2 = tools::xyz2ypd(b.first.head(3));
-      return ypd1[2] < ypd2[2];
-    });//按distance升序排序，distance越小，优先级越高
-
-  // 取最多 3 个距离最近的模型装甲板，保持原有的前后装甲板筛选约束。
-  const auto candidate_count = std::min<std::size_t>(3, xyza_i_list.size());
-  for (std::size_t i = 0; i < candidate_count; i++) {
-    const auto & xyza = xyza_i_list[i].first;
+    const auto & xyza = xyza_list[i];
     Eigen::Vector3d ypd = tools::xyz2ypd(xyza.head(3));
     auto angle_error = std::abs(tools::limit_rad(armor.ypr_in_world[0] - xyza[3])) +
                        std::abs(tools::limit_rad(armor.ypd_in_world[0] - ypd[0]));
 
-    if (std::abs(angle_error) < std::abs(min_angle_error)) {
-      id = xyza_i_list[i].second;
-      min_angle_error = angle_error;
-    }
+    Eigen::Vector4d innovation{
+      tools::limit_rad(armor.ypd_in_world[0] - ypd[0]),
+    armor.ypd_in_world[1] - ypd[1],
+    armor.ypd_in_world[2] - ypd[2],
+    tools::limit_rad(armor.ypr_in_world[0] - xyza[3])};
+    const auto H = h_jacobian(ekf_.x, i);
+    const Eigen::Matrix4d S = H * ekf_.P * H.transpose() + R;
+    Eigen::LDLT<Eigen::Matrix4d> ldlt(S);
+    if (ldlt.info() != Eigen::Success) continue;
+
+    const auto squared_distance = innovation.dot(ldlt.solve(innovation));
+    if (!std::isfinite(squared_distance) || squared_distance < 0.0) continue;
+    const auto mahalanobis_distance = std::sqrt(squared_distance);
+
+    matches.push_back({i, angle_error, mahalanobis_distance, true});
   }
 
-  return {id, min_angle_error};
+  return matches;
+}
+
+ArmorMatch Target::match_armor(const Armor & armor) const
+{
+  const auto matches = match_armors(armor);
+  if (matches.empty()) return {};
+  return *std::min_element(
+    matches.begin(), matches.end(),
+    [](const ArmorMatch & a, const ArmorMatch & b) {
+      if (a.mahalanobis_distance != b.mahalanobis_distance) {
+        return a.mahalanobis_distance < b.mahalanobis_distance;
+      }
+      return std::abs(a.angle_error) < std::abs(b.angle_error);
+    });
 }
 
 void Target::update(const Armor & armor)
 {
-  const auto [id, angle_error] = match_armor(armor);
-  (void)angle_error;
-  update(armor, id);
+  update(armor, match_armor(armor).id);
 }
 
 void Target::update(const Armor & armor, int id)
@@ -261,15 +269,8 @@ void Target::update_ypda(const Armor & armor, int id)
 {
   //观测jacobi
   Eigen::MatrixXd H = h_jacobian(ekf_.x, id);
-  // Eigen::VectorXd R_dig{{4e-3, 4e-3, 1, 9e-2}};
-  auto center_yaw = std::atan2(armor.xyz_in_world[1], armor.xyz_in_world[0]);
-  auto delta_angle = tools::limit_rad(armor.ypr_in_world[0] - center_yaw);
-  Eigen::VectorXd R_dig{
-    {4e-3, 4e-3, log(std::abs(delta_angle) + 1) + 1,
-     log(std::abs(armor.ypd_in_world[2]) + 1) / 200 + 9e-2}};
-
-  //测量过程噪声偏差的方差
-  Eigen::MatrixXd R = R_dig.asDiagonal();
+  // 关联和 EKF 更新必须使用同一套观测噪声，否则马氏距离会与实际更新不一致。
+  const Eigen::Matrix4d R = measurement_noise(armor);
 
   // 定义非线性转换函数h: x -> z
   auto h = [&](const Eigen::VectorXd & x) -> Eigen::Vector4d {
@@ -295,6 +296,17 @@ void Target::update_ypda(const Armor & armor, int id)
   ekf_.update(z, H, R, h, z_subtract);
   // 观测更新可能再次把不可观测半径拉向发散下限，更新后恢复已知机械尺寸。
   apply_geometry_constraint();
+}
+
+Eigen::Matrix4d Target::measurement_noise(const Armor & armor) const
+{
+  const auto center_yaw = std::atan2(armor.xyz_in_world[1], armor.xyz_in_world[0]);
+  const auto delta_angle = tools::limit_rad(armor.ypr_in_world[0] - center_yaw);
+  Eigen::Matrix4d R = Eigen::Matrix4d::Zero();
+  R.diagonal() << 4e-3, 4e-3,
+    std::log(std::abs(delta_angle) + 1) + 1,
+    std::log(std::abs(armor.ypd_in_world[2]) + 1) / 200 + 9e-2;
+  return R;
 }
 
 Eigen::VectorXd Target::ekf_x() const { return ekf_.x; }

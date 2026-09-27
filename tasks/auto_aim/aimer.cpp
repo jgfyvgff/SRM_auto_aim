@@ -19,8 +19,6 @@ Aimer::Aimer(const std::string & config_path)
   pitch_offset_ = yaml["pitch_offset"].as<double>() / 57.3;    // degree to rad
   comming_angle_ = yaml["comming_angle"].as<double>() / 57.3;  // degree to rad
   leaving_angle_ = yaml["leaving_angle"].as<double>() / 57.3;  // degree to rad
-  high_speed_delay_time_ = yaml["high_speed_delay_time"].as<double>();
-  low_speed_delay_time_ = yaml["low_speed_delay_time"].as<double>();
   decision_speed_ = yaml["decision_speed"].as<double>();
   if (yaml["left_yaw_offset"].IsDefined() && yaml["right_yaw_offset"].IsDefined()) {
     left_yaw_offset_ = yaml["left_yaw_offset"].as<double>() / 57.3;    // degree to rad
@@ -41,29 +39,23 @@ io::Command Aimer::aim(
   if (targets.empty()) return {false, false, 0, 0};
   auto target = targets.front();
 
-  auto ekf = target.ekf();
-  // 高低速判断只与角速度大小有关，正反转应使用相同的预测延时。
+  // 高速标记只服务于选板策略；它不再决定一个人为指定的预测延迟。
   const auto angular_speed = std::abs(target.ekf_x()[7]);
-  double delay_time =
-    angular_speed > decision_speed_ ? high_speed_delay_time_ : low_speed_delay_time_;
   debug_high_speed_mode = angular_speed > decision_speed_;
-  debug_delay_time = delay_time;
+  const auto aim_start = std::chrono::steady_clock::now();
+  debug_delay_time = to_now ? tools::delta_time(aim_start, timestamp) : 0.0;
 
   if (bullet_speed < 14) bullet_speed = 23;
 
-  // 考虑detecor和tracker所消耗的时间，此外假设aimer的用时可忽略不计
+  // timestamp 是观测时间；to_now 模式直接预测到当前实际计算时刻。
+  // 不再叠加高低速固定延迟，也不在离线模式中伪造 5ms 算法耗时。
   auto future = timestamp;
   if (to_now) {
-    double dt;
-    dt = tools::delta_time(std::chrono::steady_clock::now(), timestamp) + delay_time;
-    future += std::chrono::microseconds(int(dt * 1e6));
+    future = aim_start;
     target.predict(future);
   }
-
   else {
-    auto dt = 0.005 + delay_time;  //detector-aimer耗时0.005+发弹延时0.1
-    // tools::logger()->info("dt is {:.4f} second", dt);
-    future += std::chrono::microseconds(int(dt * 1e6));
+    // 离线测试由调用方决定 timestamp 的语义，不擅自增加固定耗时。
     target.predict(future);
   }
 
