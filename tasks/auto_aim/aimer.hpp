@@ -26,6 +26,12 @@ public:
   AimPoint debug_aim_point;
   // Aimer 最终瞄准点相对于当前检测时刻的预测时间，单位：秒。
   double debug_prediction_dt = -1.0;
+  // 记录本帧是否进入小陀螺/高速选板分支，避免将分析器的 spin 分类与 Aimer 模式混淆。
+  bool debug_high_speed_mode = false;
+  // Aimer 选择的发射延迟、基础预测时间和弹丸飞行时间，单位：秒。
+  double debug_delay_time = 0.0;
+  double debug_base_prediction_dt = -1.0;
+  double debug_fly_time = -1.0;
 
   explicit Aimer(const std::string & config_path);
   io::Command aim(

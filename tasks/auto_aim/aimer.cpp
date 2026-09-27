@@ -34,6 +34,10 @@ io::Command Aimer::aim(
   bool to_now)
 {
   debug_prediction_dt = -1.0;
+  debug_high_speed_mode = false;
+  debug_delay_time = 0.0;
+  debug_base_prediction_dt = -1.0;
+  debug_fly_time = -1.0;
   if (targets.empty()) return {false, false, 0, 0};
   auto target = targets.front();
 
@@ -42,6 +46,8 @@ io::Command Aimer::aim(
   const auto angular_speed = std::abs(target.ekf_x()[7]);
   double delay_time =
     angular_speed > decision_speed_ ? high_speed_delay_time_ : low_speed_delay_time_;
+  debug_high_speed_mode = angular_speed > decision_speed_;
+  debug_delay_time = delay_time;
 
   if (bullet_speed < 14) bullet_speed = 23;
 
@@ -60,6 +66,9 @@ io::Command Aimer::aim(
     future += std::chrono::microseconds(int(dt * 1e6));
     target.predict(future);
   }
+
+  debug_base_prediction_dt =
+    std::chrono::duration<double>(future - timestamp).count();
 
   auto aim_point0 = choose_aim_point(target);
   debug_aim_point = aim_point0;
@@ -126,6 +135,7 @@ io::Command Aimer::aim(
   double yaw = std::atan2(final_xyz.y(), final_xyz.x()) + yaw_offset_;
   double pitch = -(current_traj.pitch + pitch_offset_);  //世界坐标系下pitch向上为负
   debug_prediction_dt = final_prediction_dt;
+  debug_fly_time = current_traj.fly_time;
   return {true, false, yaw, pitch};
 }
 

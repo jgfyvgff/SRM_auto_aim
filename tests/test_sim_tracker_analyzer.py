@@ -35,18 +35,130 @@ def warning_codes(report):
     }
 
 
+def make_prediction_source(armor_id=2, generation=1):
+    sample = make_sample(0, 4.0, 1.4, -0.3, armor_id)
+    sample.update(
+        {
+            "tracker_generation": generation,
+            "high_speed_mode": 1,
+            "delay_time": 0.03,
+            "base_prediction_dt": 0.03,
+            "fly_time": 0.04,
+            "aim_armor_id": armor_id,
+            "prediction_dt": 0.1,
+            "aim_current_x": 1.0,
+            "aim_current_y": 0.0,
+            "aim_current_z": 0.2,
+            "aim_current_yaw": 0.0,
+            "future_x": 1.1,
+            "future_y": 0.0,
+            "future_z": 0.2,
+            "future_yaw": 0.1,
+        }
+    )
+    return sample
+
+
+def make_future_observation(prefix="association_primary", armor_id=2, generation=1):
+    sample = make_sample(10, 4.0, 1.4, -0.3, armor_id)
+    sample.update(
+        {
+            "tracker_generation": generation,
+            f"{prefix}_id": armor_id,
+            f"{prefix}_accepted": 1,
+            f"{prefix}_observed_x": 1.1,
+            f"{prefix}_observed_y": 0.0,
+            f"{prefix}_observed_z": 0.2,
+            f"{prefix}_optimized_yaw": 0.1,
+        }
+    )
+    return sample
+
+
 class SimTrackerAnalyzerTest(unittest.TestCase):
     def test_position_residual_keeps_fractional_precision(self):
         sample = analyzer.normalize_sample(
             {
                 "association_primary_position_error": 0.2325,
                 "association_primary_distance_error": 0.0095,
+                "prediction_dt": 0.12,
+                "aim_current_x": 1.0,
+                "future_x": 1.1,
+                "delay_time": 0.03,
+                "base_prediction_dt": 0.03,
+                "fly_time": 0.04,
             },
             1.0,
         )
 
         self.assertAlmostEqual(sample["association_primary_position_error"], 0.2325)
         self.assertAlmostEqual(sample["association_primary_distance_error"], 0.0095)
+        self.assertAlmostEqual(sample["prediction_dt"], 0.12)
+        self.assertAlmostEqual(sample["aim_current_x"], 1.0)
+        self.assertAlmostEqual(sample["future_x"], 1.1)
+
+    def test_prediction_reports_mode_and_signed_time_correction(self):
+        source = make_prediction_source()
+        source["future_yaw"] = 0.2
+        report = analyzer.analyze_samples(
+            [source, make_future_observation()]
+        )
+        prediction = report["aimer_prediction"]["spin"]
+        stats = prediction["stats"]
+
+        self.assertAlmostEqual(prediction["high_speed_mode_rate"], 1.0)
+        self.assertAlmostEqual(
+            stats["signed_prediction_yaw_error"]["mean"], 0.1
+        )
+        self.assertAlmostEqual(
+            stats["equivalent_dt_correction"]["mean"], -0.025
+        )
+
+    def test_constant_velocity_prediction_reduces_error(self):
+        report = analyzer.analyze_samples(
+            [make_prediction_source(), make_future_observation()]
+        )
+        prediction = report["aimer_prediction"]["spin"]
+
+        self.assertEqual(prediction["eligible_count"], 1)
+        self.assertEqual(prediction["matched_count"], 1)
+        self.assertAlmostEqual(prediction["match_rate"], 1.0)
+        self.assertAlmostEqual(
+            prediction["stats"]["baseline_position_error"]["mean"], 0.1
+        )
+        self.assertAlmostEqual(
+            prediction["stats"]["prediction_position_error"]["mean"], 0.0
+        )
+        self.assertAlmostEqual(prediction["prediction_better_rate"], 1.0)
+
+    def test_prediction_rejects_different_generation(self):
+        report = analyzer.analyze_samples(
+            [make_prediction_source(generation=1), make_future_observation(generation=2)]
+        )
+        prediction = report["aimer_prediction"]["overall"]
+
+        self.assertEqual(prediction["eligible_count"], 1)
+        self.assertEqual(prediction["matched_count"], 0)
+
+    def test_prediction_requires_matching_armor_id(self):
+        report = analyzer.analyze_samples(
+            [make_prediction_source(armor_id=2), make_future_observation(armor_id=1)]
+        )
+        prediction = report["aimer_prediction"]["overall"]
+
+        self.assertEqual(prediction["eligible_count"], 1)
+        self.assertEqual(prediction["matched_count"], 0)
+
+    def test_secondary_accepted_candidate_can_be_ground_truth(self):
+        report = analyzer.analyze_samples(
+            [
+                make_prediction_source(),
+                make_future_observation(prefix="association_secondary"),
+            ]
+        )
+        prediction = report["aimer_prediction"]["overall"]
+
+        self.assertEqual(prediction["matched_count"], 1)
 
     def test_stable_static_and_spin_do_not_trigger_center_warning(self):
         samples = []

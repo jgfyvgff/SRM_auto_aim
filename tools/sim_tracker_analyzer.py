@@ -2,6 +2,7 @@
 """订阅仿真自瞄调试 Topic，并自动分析 Tracker 的静止与小陀螺表现。"""
 
 import argparse
+import bisect
 import json
 import math
 import statistics
@@ -10,6 +11,18 @@ from pathlib import Path
 
 
 ANALYZED_FIELDS = (
+    "prediction_dt",
+    "delay_time",
+    "base_prediction_dt",
+    "fly_time",
+    "aim_current_x",
+    "aim_current_y",
+    "aim_current_z",
+    "aim_current_yaw",
+    "future_x",
+    "future_y",
+    "future_z",
+    "future_yaw",
     "center_x",
     "center_y",
     "center_z",
@@ -126,6 +139,7 @@ DEFAULT_THRESHOLDS = {
     "center_speed": 0.20,
     "radius_span": 0.05,
     "id_jump": 0.05,
+    "prediction_match_tolerance": 0.03,
     "minimum_samples": 20,
 }
 
@@ -241,11 +255,193 @@ def normalize_sample(payload, timestamp):
         "association_secondary_id",
         "association_secondary_accepted",
         "association_secondary_gate_passed",
+        "high_speed_mode",
     ):
         value = payload.get(field)
         if _finite_number(value):
             sample[field] = int(value)
     return sample
+
+
+def _accepted_armor_observation(sample, armor_id):
+    """返回指定模型 ID 的已接收观测；同一帧可能位于主候选或次候选。"""
+    for prefix in ("association_primary", "association_secondary"):
+        if sample.get(f"{prefix}_accepted") != 1:
+            continue
+        if sample.get(f"{prefix}_id") != armor_id:
+            continue
+        coordinate_fields = tuple(f"{prefix}_observed_{axis}" for axis in "xyz")
+        if not all(field in sample for field in coordinate_fields):
+            continue
+        return {
+            "xyz": tuple(sample[field] for field in coordinate_fields),
+            "yaw": sample.get(f"{prefix}_optimized_yaw"),
+        }
+    return None
+
+
+def _wrapped_angle_error(lhs, rhs):
+    """计算两个弧度角之间的最小绝对差，结果范围为 [0, pi]。"""
+    return abs((lhs - rhs + math.pi) % (2.0 * math.pi) - math.pi)
+
+
+def _signed_angle_error(lhs, rhs):
+    """返回带方向的最小角度差 lhs-rhs，范围为 [-pi, pi]。"""
+    return (lhs - rhs + math.pi) % (2.0 * math.pi) - math.pi
+
+
+def _prediction_bucket(records, eligible_count):
+    stats = {}
+    for field in (
+        "time_alignment_error",
+        "baseline_position_error",
+        "prediction_position_error",
+        "position_improvement",
+        "baseline_yaw_error",
+        "prediction_yaw_error",
+        "signed_prediction_yaw_error",
+        "equivalent_dt_correction",
+        "delay_time",
+        "base_prediction_dt",
+        "fly_time",
+    ):
+        summary = _summarize([record[field] for record in records if field in record])
+        if summary is not None:
+            stats[field] = summary
+
+    return {
+        "eligible_count": eligible_count,
+        "matched_count": len(records),
+        "match_rate": len(records) / eligible_count if eligible_count else None,
+        "high_speed_mode_count": sum(
+            record.get("high_speed_mode") == 1 for record in records
+        ),
+        "high_speed_mode_rate": (
+            sum(record.get("high_speed_mode") == 1 for record in records) / len(records)
+            if records and any("high_speed_mode" in record for record in records)
+            else None
+        ),
+        "prediction_better_rate": (
+            sum(
+                record["prediction_position_error"] < record["baseline_position_error"]
+                for record in records
+            ) / len(records)
+            if records
+            else None
+        ),
+        "stats": stats,
+    }
+
+
+def _analyze_aimer_predictions(samples, limits):
+    """将当前预测与 t + prediction_dt 附近的同 ID 实测装甲板对齐。"""
+    ordered = sorted(samples, key=lambda sample: sample["timestamp"])
+    timestamps = [sample["timestamp"] for sample in ordered]
+    tolerance = limits["prediction_match_tolerance"]
+    records = {"overall": [], "static": [], "spin": []}
+    eligible_counts = {"overall": 0, "static": 0, "spin": 0}
+
+    for source in ordered:
+        required = (
+            "prediction_dt",
+            "aim_armor_id",
+            "tracker_generation",
+            "aim_current_x",
+            "aim_current_y",
+            "aim_current_z",
+            "future_x",
+            "future_y",
+            "future_z",
+        )
+        if not all(field in source for field in required):
+            continue
+        if source["prediction_dt"] <= 0.0:
+            continue
+
+        target_timestamp = source["timestamp"] + source["prediction_dt"]
+        # 采集尾部没有对应的未来观测，不应计入匹配率分母。
+        if not timestamps or target_timestamp > timestamps[-1]:
+            continue
+
+        phase_name = None
+        angular_velocity = source.get("angular_velocity")
+        if angular_velocity is not None:
+            angular_speed = abs(angular_velocity)
+            if angular_speed <= limits["static_angular"]:
+                phase_name = "static"
+            elif angular_speed >= limits["spin_angular"]:
+                phase_name = "spin"
+
+        eligible_counts["overall"] += 1
+        if phase_name is not None:
+            eligible_counts[phase_name] += 1
+
+        begin = bisect.bisect_left(timestamps, target_timestamp - tolerance)
+        best_match = None
+        best_time_error = math.inf
+        for candidate in ordered[begin:]:
+            time_error = abs(candidate["timestamp"] - target_timestamp)
+            if candidate["timestamp"] > target_timestamp + tolerance:
+                break
+            if candidate["timestamp"] <= source["timestamp"]:
+                continue
+            if candidate.get("tracker_generation") != source["tracker_generation"]:
+                continue
+            observation = _accepted_armor_observation(candidate, source["aim_armor_id"])
+            if observation is None or time_error >= best_time_error:
+                continue
+            best_match = observation
+            best_time_error = time_error
+
+        if best_match is None:
+            continue
+
+        baseline_xyz = tuple(source[f"aim_current_{axis}"] for axis in "xyz")
+        prediction_xyz = tuple(source[f"future_{axis}"] for axis in "xyz")
+        observed_xyz = best_match["xyz"]
+        baseline_error = math.dist(baseline_xyz, observed_xyz)
+        prediction_error = math.dist(prediction_xyz, observed_xyz)
+        record = {
+            "time_alignment_error": best_time_error,
+            "baseline_position_error": baseline_error,
+            "prediction_position_error": prediction_error,
+            "position_improvement": baseline_error - prediction_error,
+        }
+        if "high_speed_mode" in source:
+            record["high_speed_mode"] = source["high_speed_mode"]
+        for field in ("delay_time", "base_prediction_dt", "fly_time"):
+            if field in source:
+                record[field] = source[field]
+        observed_yaw = best_match["yaw"]
+        if (
+            observed_yaw is not None
+            and "aim_current_yaw" in source
+            and "future_yaw" in source
+        ):
+            record["baseline_yaw_error"] = _wrapped_angle_error(
+                source["aim_current_yaw"], observed_yaw
+            )
+            record["prediction_yaw_error"] = _wrapped_angle_error(
+                source["future_yaw"], observed_yaw
+            )
+            record["signed_prediction_yaw_error"] = _signed_angle_error(
+                source["future_yaw"], observed_yaw
+            )
+            angular_velocity = source.get("angular_velocity")
+            if angular_velocity is not None and abs(angular_velocity) >= limits["spin_angular"]:
+                # 预测角度 - 实测角度为正，表示模型相位偏超前；修正量应反向调整 dt。
+                record["equivalent_dt_correction"] = (
+                    -record["signed_prediction_yaw_error"] / angular_velocity
+                )
+
+        records["overall"].append(record)
+        if phase_name is not None:
+            records[phase_name].append(record)
+
+    return {
+        name: _prediction_bucket(records[name], eligible_counts[name])
+        for name in ("overall", "static", "spin")
+    }
 
 
 def _analyze_phase(samples):
@@ -475,6 +671,7 @@ def analyze_samples(samples, thresholds=None):
         "transition_sample_count": transition_count,
         "thresholds": limits,
         "phases": phases,
+        "aimer_prediction": _analyze_aimer_predictions(samples, limits),
         "outliers": _extract_outlier_events(samples),
         "diagnoses": diagnoses,
         "conclusion": conclusion,
@@ -595,6 +792,71 @@ def print_report(report):
             if phase["gate_rejected_frame_rate"] is not None:
                 print(f"  关联门限拒绝帧比例={phase['gate_rejected_frame_rate']:.3f}")
 
+    print("\n[Aimer 时间对齐预测]")
+    for phase_name, title in (
+        ("overall", "全部"),
+        ("static", "静止"),
+        ("spin", "小陀螺"),
+    ):
+        prediction = report["aimer_prediction"][phase_name]
+        eligible_count = prediction["eligible_count"]
+        matched_count = prediction["matched_count"]
+        if not eligible_count:
+            print(f"  {title}: 无有效预测样本")
+            continue
+        print(
+            f"  {title}: 有效预测={eligible_count} 成功匹配={matched_count} "
+            f"匹配率={prediction['match_rate']:.3f}"
+        )
+        if not matched_count:
+            continue
+        stats = prediction["stats"]
+        alignment = stats["time_alignment_error"]
+        baseline = stats["baseline_position_error"]
+        predicted = stats["prediction_position_error"]
+        improvement = stats["position_improvement"]
+        print(
+            f"    时间对齐误差P95={alignment['p95'] * 1000.0:.2f}ms "
+            f"不预测位置误差P95={baseline['p95']:.4f}m "
+            f"预测后位置误差P95={predicted['p95']:.4f}m"
+        )
+        print(
+            f"    平均位置改善={improvement['mean']:.4f}m "
+            f"预测优于不预测比例={prediction['prediction_better_rate']:.3f}"
+        )
+        if prediction["high_speed_mode_rate"] is not None:
+            print(
+                f"    Aimer高速模式帧={prediction['high_speed_mode_count']} "
+                f"比例={prediction['high_speed_mode_rate']:.3f}"
+            )
+        for field, label in (
+            ("delay_time", "发射延迟"),
+            ("base_prediction_dt", "基础预测时间"),
+            ("fly_time", "弹丸飞行时间"),
+        ):
+            summary = stats.get(field)
+            if summary is not None:
+                print(
+                    f"    {label} mean={summary['mean'] * 1000.0:.2f}ms "
+                    f"P95={summary['p95'] * 1000.0:.2f}ms"
+                )
+        baseline_yaw = stats.get("baseline_yaw_error")
+        predicted_yaw = stats.get("prediction_yaw_error")
+        if baseline_yaw is not None and predicted_yaw is not None:
+            print(
+                f"    不预测yaw误差P95={baseline_yaw['p95']:.4f}rad "
+                f"预测后yaw误差P95={predicted_yaw['p95']:.4f}rad"
+            )
+        signed_yaw = stats.get("signed_prediction_yaw_error")
+        dt_correction = stats.get("equivalent_dt_correction")
+        if signed_yaw is not None and dt_correction is not None:
+            print(
+                f"    带符号预测yaw残差 mean={signed_yaw['mean']:.4f}rad "
+                f"median={signed_yaw['median']:.4f}rad "
+                f"等效dt修正 mean={dt_correction['mean'] * 1000.0:.2f}ms "
+                f"median={dt_correction['median'] * 1000.0:.2f}ms"
+            )
+
     print("\n[异常帧 Top 3]")
     for event in report["outliers"]["center_jump"][:3]:
         print(f"  中心跳变 {_format_outlier_event(event, 'center_step', 'm')}")
@@ -660,8 +922,17 @@ def collect_ros_samples(args):
     return samples
 
 
+def _positive_float(value):
+    parsed = float(value)
+    if not math.isfinite(parsed) or parsed <= 0.0:
+        raise argparse.ArgumentTypeError("必须是有限正数")
+    return parsed
+
+
 def parse_args():
-    parser = argparse.ArgumentParser(description="自动分析 /sim_aim/debug 中的 Tracker 数据")
+    parser = argparse.ArgumentParser(
+        description="自动分析 /sim_aim/debug 中的 Tracker 与 Aimer 数据"
+    )
     parser.add_argument("--topic", default="/sim_aim/debug")
     parser.add_argument("--duration", type=float, default=30.0, help="采集秒数，0 表示直到 Ctrl-C")
     parser.add_argument("--static-angular-threshold", type=float, default=0.3)
@@ -670,6 +941,12 @@ def parse_args():
     parser.add_argument("--center-speed-threshold", type=float, default=0.20)
     parser.add_argument("--radius-span-threshold", type=float, default=0.05)
     parser.add_argument("--id-jump-threshold", type=float, default=0.05)
+    parser.add_argument(
+        "--prediction-match-tolerance",
+        type=_positive_float,
+        default=0.03,
+        help="未来预测与实测样本的最大时间差，单位为秒",
+    )
     parser.add_argument("--minimum-samples", type=int, default=20)
     parser.add_argument("--output", help="可选的 JSON 报告输出路径")
     return parser.parse_args()
@@ -684,6 +961,7 @@ def main():
         "center_speed": args.center_speed_threshold,
         "radius_span": args.radius_span_threshold,
         "id_jump": args.id_jump_threshold,
+        "prediction_match_tolerance": args.prediction_match_tolerance,
         "minimum_samples": args.minimum_samples,
     }
     samples = collect_ros_samples(args)

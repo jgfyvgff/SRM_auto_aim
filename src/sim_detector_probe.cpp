@@ -292,9 +292,13 @@ private:
       if (
         aimer_.debug_aim_point.valid &&
         target.last_id >= 0 &&
-        static_cast<std::size_t>(target.last_id) < current_armor_xyza_list.size())
+        static_cast<std::size_t>(target.last_id) < current_armor_xyza_list.size() &&
+        aimer_.debug_aim_point.armor_id >= 0 &&
+        static_cast<std::size_t>(aimer_.debug_aim_point.armor_id) < current_armor_xyza_list.size())
       {
         const auto & current_xyza = current_armor_xyza_list[target.last_id];
+        const auto & aim_current_xyza =
+          current_armor_xyza_list[aimer_.debug_aim_point.armor_id];
         const auto & future_xyza = aimer_.debug_aim_point.xyza;
 
         RCLCPP_INFO_THROTTLE(
@@ -328,6 +332,10 @@ private:
         plot_data["vz"] = state[5];
         plot_data["angular_velocity"] = state[7];
         plot_data["prediction_dt"] = aimer_.debug_prediction_dt;
+        plot_data["high_speed_mode"] = aimer_.debug_high_speed_mode ? 1 : 0;
+        plot_data["delay_time"] = aimer_.debug_delay_time;
+        plot_data["base_prediction_dt"] = aimer_.debug_base_prediction_dt;
+        plot_data["fly_time"] = aimer_.debug_fly_time;
         plot_data["pnp_error"] = pnp_reprojection_error;
         plot_data["current_ekf_error"] = current_reprojection_error;
         plot_data["future_center_shift"] = future_center_shift;
@@ -381,6 +389,11 @@ private:
         plot_data["current_y"] = current_xyza[1];
         plot_data["current_z"] = current_xyza[2];
         plot_data["current_yaw"] = current_xyza[3];
+        // aim_current_* 与 future_* 使用同一个模型 ID，避免装甲板切换时错误比较不同板。
+        plot_data["aim_current_x"] = aim_current_xyza[0];
+        plot_data["aim_current_y"] = aim_current_xyza[1];
+        plot_data["aim_current_z"] = aim_current_xyza[2];
+        plot_data["aim_current_yaw"] = aim_current_xyza[3];
         plot_data["future_x"] = future_xyza[0];
         plot_data["future_y"] = future_xyza[1];
         plot_data["future_z"] = future_xyza[2];
