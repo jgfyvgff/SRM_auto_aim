@@ -22,6 +22,7 @@ ANALYZED_FIELDS = (
     "delay_time",
     "base_prediction_dt",
     "fly_time",
+    "image_header_age_ms",
     "capture_to_detector_ms",
     "detector_ms",
     "tracker_ms",
@@ -130,6 +131,11 @@ OUTLIER_CONTEXT_FIELDS = (
     "association_primary_id",
     "association_primary_accepted",
     "association_primary_gate_passed",
+    "association_primary_angle_gate_passed",
+    "association_primary_score_gate_passed",
+    "association_primary_position_gate_passed",
+    "association_primary_distance_gate_passed",
+    "association_primary_mahalanobis_gate_passed",
     "association_primary_position_error",
     "association_primary_distance_error",
     "association_primary_mahalanobis_distance",
@@ -150,6 +156,11 @@ OUTLIER_CONTEXT_FIELDS = (
     "association_secondary_id",
     "association_secondary_accepted",
     "association_secondary_gate_passed",
+    "association_secondary_angle_gate_passed",
+    "association_secondary_score_gate_passed",
+    "association_secondary_position_gate_passed",
+    "association_secondary_distance_gate_passed",
+    "association_secondary_mahalanobis_gate_passed",
     "association_secondary_position_error",
     "association_secondary_distance_error",
     "association_secondary_mahalanobis_distance",
@@ -167,6 +178,27 @@ OUTLIER_CONTEXT_FIELDS = (
     "association_secondary_raw_yaw",
     "association_secondary_optimized_yaw",
     "association_secondary_yaw_correction",
+)
+
+EKF_CHANNEL_DIAGNOSTIC_FIELDS = tuple(
+    f"ekf_{name}_{index}"
+    for name in (
+        "innovation",
+        "R_diagonal",
+        "S_diagonal",
+        "center_x_correction",
+        "center_y_correction",
+    )
+    for index in range(4)
+)
+EKF_CENTER_CORRECTION_NORM_FIELDS = tuple(
+    f"ekf_center_correction_norm_{index}" for index in range(4)
+)
+ANALYZED_FIELDS += (
+    EKF_CHANNEL_DIAGNOSTIC_FIELDS + EKF_CENTER_CORRECTION_NORM_FIELDS
+)
+OUTLIER_CONTEXT_FIELDS += (
+    EKF_CHANNEL_DIAGNOSTIC_FIELDS + EKF_CENTER_CORRECTION_NORM_FIELDS
 )
 
 DEFAULT_THRESHOLDS = {
@@ -365,6 +397,15 @@ def normalize_sample(payload, timestamp):
         correction = sample.get(f"{prefix}_yaw_correction")
         if correction is not None:
             sample[f"{prefix}_yaw_correction_abs"] = abs(correction)
+
+    # 将每个观测通道对中心 x/y 的修正合成为二维距离，便于横向比较影响大小。
+    for index in range(4):
+        correction_x = sample.get(f"ekf_center_x_correction_{index}")
+        correction_y = sample.get(f"ekf_center_y_correction_{index}")
+        if correction_x is not None and correction_y is not None:
+            sample[f"ekf_center_correction_norm_{index}"] = math.hypot(
+                correction_x, correction_y
+            )
 
     for field in (
         "current_armor_id",
@@ -1033,6 +1074,9 @@ def print_report(report):
         "association_secondary_distance_angle_error": "rad",
         "association_secondary_yaw_correction_abs": "rad",
     }
+    for index in range(4):
+        units[f"ekf_center_correction_norm_{index}"] = "m"
+
     for phase_name, title in (("static", "静止阶段"), ("spin", "小陀螺阶段")):
         phase = report["phases"][phase_name]
         print(f"\n[{title}] 样本数={phase['sample_count']} ID切换={phase['id_switch_count']}")
@@ -1109,7 +1153,7 @@ def print_report(report):
                 f"比例={prediction['high_speed_mode_rate']:.3f}"
             )
         for field, label in (
-            ("delay_time", "观测到Aimer实测处理延迟"),
+            ("delay_time", "图像采集到Aimer实测延迟"),
             ("base_prediction_dt", "基础预测时间"),
             ("fly_time", "弹丸飞行时间"),
         ):
@@ -1120,11 +1164,11 @@ def print_report(report):
                     f"P95={summary['p95'] * 1000.0:.2f}ms"
                 )
         for field, label in (
-            ("capture_to_detector_ms", "图像回调到检测"),
+            ("capture_to_detector_ms", "图像采集到检测"),
             ("detector_ms", "检测耗时"),
             ("tracker_ms", "Tracker耗时"),
             ("aimer_ms", "Aimer耗时"),
-            ("capture_to_aimer_ms", "图像回调到Aimer"),
+            ("capture_to_aimer_ms", "图像采集到Aimer"),
         ):
             summary = stats.get(field)
             if summary is not None:

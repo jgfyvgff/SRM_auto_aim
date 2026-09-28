@@ -22,6 +22,12 @@
 
 ## Tracker 自动分析
 
+模拟器 `/image_raw` 的 Header 使用系统时钟记录采集时刻。探针将它映射为
+单调时钟后交给 Tracker/Aimer；无效、未来、超过一秒的时间戳和乱序旧帧会被丢弃。
+`image_header_age_ms` 是图像到达回调时的年龄；
+`capture_to_detector_ms`、`capture_to_aimer_ms` 从采集时刻起算。
+一秒仅是过期帧拒绝上限，不是预测延迟补偿。
+
 启动 `sim_detector_probe` 后，可使用独立脚本订阅 `/sim_aim/debug`，自动比较静止与小陀螺阶段的车辆中心、速度、半径和装甲板 ID 切换情况：
 
 ```bash
@@ -76,6 +82,15 @@ Tracker 还会计算 4 维观测创新的马氏距离：`S = HPHᵀ + R`，关�
 `association_primary_*_error` 是 EKF 更新前的关联残差；`post_update_*_error`
 使用同一帧实际接受的装甲板计算 EKF 更新后的残差。未接受或无法配对时值为 `-1`。
 分析器统计均值和分位数时会排除这些无效的 `-1` 值。
+仅在该帧确实接受装甲板并完成 EKF 更新时，`/sim_aim/debug` 才会发布
+`ekf_innovation_0..3`、对应的 `ekf_R_diagonal_0..3`、`ekf_S_diagonal_0..3`，以及
+`ekf_center_x_correction_0..3`、`ekf_center_y_correction_0..3`。观测下标依次为方位角、
+俯仰角、距离和装甲板 yaw；修正量是 `K(row, i) * innovation[i]`，单位为 m，可用于检查
+某个观测分量是否主导了车辆中心的跳变。这些字段只增加诊断，不改变滤波行为。
+分析器会分别统计四个观测通道的创新、R/S 对角项，以及
+`ekf_center_correction_norm_0..3`（对应 x/y 中心修正量的二维模长，单位 m）；
+中心跳变和 EKF 误差异常帧也会保留这些通道数据，便于追查单帧异常来源。
+异常帧还会保留主、次候选各项关联门限的通过状态，以区分候选被拒绝的具体原因。
 现有 `pnp_error` 按 Aimer 未来投影选择装甲板，不保证与 `current_ekf_error` 使用
 同一个检测框，因此两者不能直接作为同框的前后验对比。
 `accepted_pnp_error` 是已接收框的原始 PnP 回投影误差；

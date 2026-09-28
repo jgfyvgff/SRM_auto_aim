@@ -43,6 +43,12 @@ public:
   size_t window_size = 100;
   double last_nis = 0.0;
 
+  // 最近一次更新的中间量，仅用于追踪各观测分量对 EKF 状态修正的贡献。
+  Eigen::VectorXd last_innovation;
+  Eigen::MatrixXd last_measurement_noise;
+  Eigen::MatrixXd last_innovation_covariance;
+  Eigen::MatrixXd last_kalman_gain;
+
 private:
   Eigen::MatrixXd I;
   std::function<Eigen::VectorXd(const Eigen::VectorXd &, const Eigen::VectorXd &)> x_add;

@@ -19,6 +19,7 @@
 #include "tasks/auto_aim/tracker.hpp"
 #include "tasks/auto_aim/aimer.hpp"
 #include "tools/math_tools.hpp"
+#include "src/sim_capture_time.hpp"
 
 class SimDetectorProbe final : public rclcpp::Node
 {
@@ -177,12 +178,23 @@ private:
   void on_image(const sensor_msgs::msg::Image::SharedPtr msg)
   {
     const auto frame_received_at = std::chrono::steady_clock::now();
+    const auto wall_received_at = std::chrono::system_clock::now();
 
     if (msg->encoding != "rgb8" || msg->step < msg->width * 3) {
       RCLCPP_WARN_THROTTLE(
         get_logger(), *get_clock(), 2000,
         "Unsupported image: encoding=%s width=%u height=%u step=%u",
         msg->encoding.c_str(), msg->width, msg->height, msg->step);
+      return;
+    }
+
+    const auto capture = sim_capture_time::convert_system_stamp(
+      msg->header.stamp.sec, msg->header.stamp.nanosec,
+      wall_received_at, frame_received_at);
+    if (!capture) {
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), 2000,
+        "Ignoring image with invalid, future or stale capture stamp");
       return;
     }
 
@@ -193,14 +205,23 @@ private:
     cv::cvtColor(rgb, bgr, cv::COLOR_RGB2BGR);
 
     std::lock_guard<std::mutex> lock(frame_mutex_);
+    // GPU 异步回读可能乱序；不让旧图像把 Tracker 时间倒拨。
+    if (
+      latest_frame_timestamp_ != std::chrono::steady_clock::time_point{} &&
+      capture->timestamp <= latest_frame_timestamp_)
+    {
+      return;
+    }
     latest_frame_ = bgr.clone();
-    latest_frame_timestamp_ = frame_received_at;
+    latest_frame_timestamp_ = capture->timestamp;
+    latest_header_age_ms_ = capture->header_age_ms;
   }
 
   void run_inference()
   {
     cv::Mat frame;
     std::chrono::steady_clock::time_point frame_timestamp;
+    double frame_header_age_ms;
     {
       std::lock_guard<std::mutex> lock(frame_mutex_);
       if (latest_frame_.empty()) {
@@ -208,6 +229,7 @@ private:
       }
       frame = std::move(latest_frame_);
       frame_timestamp = latest_frame_timestamp_;
+      frame_header_age_ms = latest_header_age_ms_;
     }
 
     const auto detector_start = std::chrono::steady_clock::now();
@@ -444,6 +466,7 @@ private:
         plot_data["delay_time"] = aimer_.debug_delay_time;
         plot_data["base_prediction_dt"] = aimer_.debug_base_prediction_dt;
         plot_data["fly_time"] = aimer_.debug_fly_time;
+        plot_data["image_header_age_ms"] = frame_header_age_ms;
         plot_data["capture_to_detector_ms"] = duration_ms(frame_timestamp, detector_start);
         plot_data["detector_ms"] = duration_ms(detector_start, detector_end);
         plot_data["tracker_ms"] = duration_ms(tracker_start, tracker_end);
@@ -480,6 +503,27 @@ private:
         plot_data["nis"] = target.ekf().last_nis;
         plot_data["nis_failure_rate"] = target.ekf().data.at("recent_nis_failures");
         const auto & association = tracker_.association_debug();
+        const auto & update_debug = target.ekf();
+        if (
+          association.candidates[0].accepted && update_debug.last_innovation.size() == 4 &&
+          update_debug.last_measurement_noise.rows() == 4 &&
+          update_debug.last_innovation_covariance.rows() == 4 &&
+          update_debug.last_kalman_gain.rows() >= 3 &&
+          update_debug.last_kalman_gain.cols() == 4)
+        {
+          // 只记录本帧确实进入 EKF 的四维观测，定位各分量对车辆中心修正的贡献。
+          for (Eigen::Index i = 0; i < 4; ++i) {
+            const auto suffix = std::to_string(i);
+            plot_data["ekf_innovation_" + suffix] = update_debug.last_innovation[i];
+            plot_data["ekf_R_diagonal_" + suffix] = update_debug.last_measurement_noise(i, i);
+            plot_data["ekf_S_diagonal_" + suffix] =
+              update_debug.last_innovation_covariance(i, i);
+            plot_data["ekf_center_x_correction_" + suffix] =
+              update_debug.last_kalman_gain(0, i) * update_debug.last_innovation[i];
+            plot_data["ekf_center_y_correction_" + suffix] =
+              update_debug.last_kalman_gain(2, i) * update_debug.last_innovation[i];
+          }
+        }
         // temp_lost 只表示本帧关联未通过；记录各门限，避免盲目放宽全部阈值。
         if (tracker_.state() == "temp_lost") {
           const auto & primary = association.candidates[0];
@@ -775,6 +819,7 @@ private:
   std::mutex frame_mutex_;
   cv::Mat latest_frame_;
   std::chrono::steady_clock::time_point latest_frame_timestamp_;
+  double latest_header_age_ms_ = 0.0;
   int frame_count_;
 };
 

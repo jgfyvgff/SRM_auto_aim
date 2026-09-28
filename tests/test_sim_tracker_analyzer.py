@@ -407,6 +407,29 @@ class SimTrackerAnalyzerTest(unittest.TestCase):
         missing_size = analyzer.analyze_samples(samples)
         self.assertNotIn("spin_ekf_reprojection", warning_codes(missing_size))
 
+    def test_ekf_channel_corrections_are_summarized(self):
+        samples = []
+        for index in range(30):
+            payload = make_sample(index, 4.0, 1.4, -0.3)
+            payload.update(
+                {
+                    "ekf_innovation_2": -0.08,
+                    "ekf_R_diagonal_2": 1.3,
+                    "ekf_S_diagonal_2": 2.4,
+                    "ekf_center_x_correction_2": -0.003,
+                    "ekf_center_y_correction_2": 0.004,
+                }
+            )
+            samples.append(analyzer.normalize_sample(payload, index * 0.01))
+
+        stats = analyzer.analyze_samples(samples)["phases"]["spin"]["stats"]
+
+        self.assertAlmostEqual(stats["ekf_innovation_2"]["mean"], -0.08)
+        self.assertAlmostEqual(stats["ekf_R_diagonal_2"]["mean"], 1.3)
+        self.assertAlmostEqual(
+            stats["ekf_center_correction_norm_2"]["mean"], 0.005
+        )
+
     def test_outlier_snapshot_keeps_association_context(self):
         samples = [make_sample(index, 0.05, 1.4, -0.3) for index in range(20)]
         samples[10].update(
@@ -415,6 +438,13 @@ class SimTrackerAnalyzerTest(unittest.TestCase):
                 "current_ekf_error": 180.0,
                 "tracker_generation": 3,
                 "association_primary_id": 2,
+                "association_primary_accepted": 0,
+                "association_primary_gate_passed": 0,
+                "association_primary_angle_gate_passed": 0,
+                "association_primary_score_gate_passed": 1,
+                "association_primary_position_gate_passed": 1,
+                "association_primary_distance_gate_passed": 1,
+                "association_primary_mahalanobis_gate_passed": 1,
                 "association_primary_score": 0.8,
                 "association_primary_position_error": 0.24,
                 "association_primary_distance_error": 0.21,
@@ -428,6 +458,10 @@ class SimTrackerAnalyzerTest(unittest.TestCase):
                 "association_primary_predicted_distance": 1.18,
                 "association_primary_raw_yaw": 0.2,
                 "association_primary_optimized_yaw": 1.0,
+                "ekf_innovation_3": 0.27,
+                "ekf_center_x_correction_3": 0.011,
+                "ekf_center_y_correction_3": 0.012,
+                "ekf_center_correction_norm_3": math.hypot(0.011, 0.012),
             }
         )
 
@@ -435,6 +469,9 @@ class SimTrackerAnalyzerTest(unittest.TestCase):
 
         self.assertAlmostEqual(outliers["center_jump"][0]["center_step"], 0.3)
         self.assertEqual(outliers["center_jump"][0]["association_primary_id"], 2)
+        self.assertEqual(
+            outliers["center_jump"][0]["association_primary_angle_gate_passed"], 0
+        )
         self.assertAlmostEqual(
             outliers["center_jump"][0]["association_primary_position_error"],
             0.24,
@@ -445,6 +482,13 @@ class SimTrackerAnalyzerTest(unittest.TestCase):
         )
         self.assertEqual(outliers["ekf_error"][0]["current_ekf_error"], 180.0)
         self.assertEqual(outliers["ekf_error"][0]["tracker_generation"], 3)
+        self.assertAlmostEqual(
+            outliers["center_jump"][0]["ekf_innovation_3"], 0.27
+        )
+        self.assertAlmostEqual(
+            outliers["center_jump"][0]["ekf_center_correction_norm_3"],
+            math.hypot(0.011, 0.012),
+        )
 
     def test_association_gate_rejection_is_reported_separately(self):
         samples = []

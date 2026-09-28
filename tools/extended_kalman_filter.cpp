@@ -81,6 +81,11 @@ Eigen::VectorXd ExtendedKalmanFilter::update(
   const Eigen::MatrixXd S = H * P_prior * H.transpose() + R;
   const Eigen::MatrixXd K = P_prior * H.transpose() * S.inverse();
 
+  last_innovation = residual;
+  last_measurement_noise = R;
+  last_innovation_covariance = S;
+  last_kalman_gain = K;
+
   // Stable Compution of the Posterior Covariance
   // https://github.com/rlabbe/Kalman-and-Bayesian-Filters-in-Python/blob/master/07-Kalman-Filter-Math.ipynb
   P =

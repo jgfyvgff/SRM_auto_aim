@@ -11,6 +11,8 @@ add_library(io STATIC
     usbcamera/usbcamera.cpp  
     camera.cpp
     cboard.cpp
+    srm_auto_aim_protocol.cpp
+    srm_auto_aim_transport.cpp
     dm_imu/dm_imu.cpp
     gimbal/gimbal.cpp
 )

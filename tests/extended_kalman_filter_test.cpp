@@ -29,11 +29,17 @@ int main()
   Eigen::VectorXd normal_measurement = Eigen::VectorXd::Zero(4);
   normal_measurement[0] = 1.5;
   normal_filter.update(normal_measurement, H4, R4);
+  const Eigen::MatrixXd expected_innovation_covariance = 2.0 * Eigen::MatrixXd::Identity(4, 4);
+  const Eigen::MatrixXd expected_kalman_gain = 0.5 * Eigen::MatrixXd::Identity(4, 4);
   if (
     !nearly_equal(normal_filter.last_nis, 1.125) ||
-    normal_filter.recent_nis_failures.back() != 0)
+    normal_filter.recent_nis_failures.back() != 0 ||
+    (normal_filter.last_innovation - normal_measurement).norm() > 1e-9 ||
+    (normal_filter.last_measurement_noise - R4).norm() > 1e-9 ||
+    (normal_filter.last_innovation_covariance - expected_innovation_covariance).norm() > 1e-9 ||
+    (normal_filter.last_kalman_gain - expected_kalman_gain).norm() > 1e-9)
   {
-    std::cerr << "正常创新被错误判定为 NIS 失败\n";
+    std::cerr << "正常创新判定或 EKF 更新诊断量错误\n";
     return 1;
   }
 
