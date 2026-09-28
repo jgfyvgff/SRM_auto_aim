@@ -269,7 +269,10 @@ void Tracker::state_machine(bool found)
       if (detect_count_ >= min_detect_count_) state_ = "tracking";
     } else {
       detect_count_ = 0;
-      state_ = "lost";
+      // 初始 Target 刚建立时，单帧关联失败不应立即销毁；
+      // 先进入临时丢失，保留预测状态，给后续帧重新关联的机会。
+      temp_lost_count_ = 1;
+      state_ = "temp_lost";
     }
   }
 
@@ -369,6 +372,8 @@ bool Tracker::update_target(std::list<Armor> & armors, std::chrono::steady_clock
   struct Candidate
   {
     Armor * armor;
+    // 不同模型 ID 可能选择不同的 IPPE 分支，候选必须保留各自的解算结果。
+    Armor solved_armor;
     int id;
     double angle_error;
     double mahalanobis_distance;
@@ -388,31 +393,75 @@ bool Tracker::update_target(std::list<Armor> & armors, std::chrono::steady_clock
   };
 
   const auto predicted_armors = target_.armor_xyza_list();
+  // 所有模型假设和最终候选共用一份诊断字段转换，保证比较的是同一预测时刻。
+  const auto make_candidate_debug = [&predicted_armors](const Candidate & candidate) {
+    const auto & predicted_armor = predicted_armors[candidate.id];
+    const auto predicted_ypd = tools::xyz2ypd(predicted_armor.head(3));
+    AssociationCandidateDebug debug;
+    debug.model_id = candidate.id;
+    debug.gate_passed = candidate.gate_passed;
+    debug.angle_gate_passed = candidate.angle_gate_passed;
+    debug.score_gate_passed = candidate.score_gate_passed;
+    debug.position_gate_passed = candidate.position_gate_passed;
+    debug.distance_gate_passed = candidate.distance_gate_passed;
+    debug.mahalanobis_gate_passed = candidate.mahalanobis_gate_passed;
+    debug.score = candidate.association_score;
+    debug.position_error = candidate.position_error;
+    debug.distance_error = candidate.distance_error;
+    debug.mahalanobis_distance = candidate.mahalanobis_distance;
+    debug.position_angle_error = candidate.position_angle_error;
+    debug.distance_angle_error = candidate.distance_angle_error;
+    debug.observed_x = candidate.solved_armor.xyz_in_world[0];
+    debug.observed_y = candidate.solved_armor.xyz_in_world[1];
+    debug.observed_z = candidate.solved_armor.xyz_in_world[2];
+    debug.predicted_x = predicted_armor[0];
+    debug.predicted_y = predicted_armor[1];
+    debug.predicted_z = predicted_armor[2];
+    debug.observed_distance = candidate.solved_armor.ypd_in_world[2];
+    debug.predicted_distance = predicted_ypd[2];
+    debug.orientation_error = candidate.orientation_error;
+    debug.bearing_error = candidate.bearing_error;
+    debug.raw_yaw = candidate.solved_armor.yaw_raw;
+    debug.optimized_yaw = candidate.solved_armor.ypr_in_world[0];
+    debug.yaw_correction = tools::limit_rad(
+      candidate.solved_armor.ypr_in_world[0] - candidate.solved_armor.yaw_raw);
+    debug.image_x = candidate.solved_armor.center.x;
+    debug.image_y = candidate.solved_armor.center.y;
+    return debug;
+  };
   std::vector<Candidate> candidates;
   for (auto & armor : armors) {
     if (armor.name != target_.name || armor.type != target_.armor_type) continue;
 
-    // 关联依赖 PnP 解算出的世界坐标和姿态，因此必须先完成 solve。
-    solver_.solve(armor);
     std::optional<Candidate> best_gated_match;
     std::optional<Candidate> best_rejected_match;
-    for (const auto & match : target_.match_armors(armor)) {
-      if (match.id < 0 || static_cast<std::size_t>(match.id) >= predicted_armors.size()) {
-        continue;
-      }
+    // 不能仅靠位置提前锁定模型 ID；旋转时相邻装甲的位置可能很近，
+    // 每个 ID 都要先选择与自身预测 yaw 连续的 IPPE 分支，再独立计算关联残差。
+    for (std::size_t reference_id = 0; reference_id < predicted_armors.size(); ++reference_id) {
+      Armor solved_armor = armor;
+      solver_.solve(solved_armor, predicted_armors[reference_id]);
+      const auto matches = target_.match_armors(solved_armor);
+      const auto match_it = std::find_if(
+        matches.begin(), matches.end(), [reference_id](const auto & match) {
+          return match.id == static_cast<int>(reference_id);
+        });
+      if (match_it == matches.end()) continue;
+      const auto & match = *match_it;
 
       const auto & predicted_armor = predicted_armors[match.id];
       const auto predicted_ypd = tools::xyz2ypd(predicted_armor.head(3));
-      const auto position_error = (armor.xyz_in_world - predicted_armor.head(3)).norm();
-      const auto distance_error = std::abs(armor.ypd_in_world[2] - predicted_ypd[2]);
+      const auto position_error =
+        (solved_armor.xyz_in_world - predicted_armor.head(3)).norm();
+      const auto distance_error =
+        std::abs(solved_armor.ypd_in_world[2] - predicted_ypd[2]);
       const auto orientation_error =
-        std::abs(tools::limit_rad(armor.ypr_in_world[0] - predicted_armor[3]));
+        std::abs(tools::limit_rad(solved_armor.ypr_in_world[0] - predicted_armor[3]));
       const auto bearing_error =
-        std::abs(tools::limit_rad(armor.ypd_in_world[0] - predicted_ypd[0]));
+        std::abs(tools::limit_rad(solved_armor.ypd_in_world[0] - predicted_ypd[0]));
       // 位置误差和距离误差会随目标距离改变量纲影响，先折算为视线角度，
       // 再与装甲板姿态/方位角误差相加，才能在近距离和远距离使用同一门限。
       const auto reference_distance = std::max(
-        {std::abs(armor.ypd_in_world[2]), std::abs(predicted_ypd[2]), 0.1});
+        {std::abs(solved_armor.ypd_in_world[2]), std::abs(predicted_ypd[2]), 0.1});
       const auto position_angle_error = std::atan2(position_error, reference_distance);
       const auto distance_angle_error = std::atan2(distance_error, reference_distance);
       const auto association_score =
@@ -429,18 +478,25 @@ bool Tracker::update_target(std::list<Armor> & armors, std::chrono::steady_clock
         distance_gate_passed && mahalanobis_gate_passed;
 
       Candidate candidate{
-        &armor, match.id, match.angle_error, match.mahalanobis_distance,
+        &armor, solved_armor, match.id, match.angle_error, match.mahalanobis_distance,
         position_error, distance_error, position_angle_error, distance_angle_error,
         association_score, orientation_error, bearing_error, angle_gate_passed,
         score_gate_passed, position_gate_passed, distance_gate_passed,
         mahalanobis_gate_passed, gate_passed};
+      if (
+        association_debug_.model_candidate_count <
+        static_cast<int>(association_debug_.model_candidates.size()))
+      {
+        association_debug_.model_candidates[association_debug_.model_candidate_count++] =
+          make_candidate_debug(candidate);
+      }
       auto & best = gate_passed ? best_gated_match : best_rejected_match;
       if (!best || candidate.mahalanobis_distance < best->mahalanobis_distance) {
         best = candidate;
       }
     }
 
-    // 每个检测先在所有模型中寻找通过门限的最优匹配；失败时保留最佳拒绝项供诊断。
+    // 每个检测只保留一个最优的“分支 × 模型 ID”组合，避免重复框多次更新 EKF。
     if (best_gated_match) {
       candidates.push_back(*best_gated_match);
     } else if (best_rejected_match) {
@@ -469,55 +525,24 @@ bool Tracker::update_target(std::list<Armor> & armors, std::chrono::steady_clock
   association_debug_.candidate_count = static_cast<int>(candidates.size());
   const auto debug_count = std::min(candidates.size(), association_debug_.candidates.size());
   for (std::size_t index = 0; index < debug_count; ++index) {
-    const auto & candidate = candidates[index];
-    const auto & predicted_armor = predicted_armors[candidate.id];
-    const auto predicted_ypd = tools::xyz2ypd(predicted_armor.head(3));
-    auto & debug = association_debug_.candidates[index];
-    // 使用逐字段赋值，便于诊断结构扩展时避免聚合初始化顺序错位。
-    debug.model_id = candidate.id;
-    debug.gate_passed = candidate.gate_passed;
-    debug.accepted = false;
-    debug.angle_gate_passed = candidate.angle_gate_passed;
-    debug.score_gate_passed = candidate.score_gate_passed;
-    debug.position_gate_passed = candidate.position_gate_passed;
-    debug.distance_gate_passed = candidate.distance_gate_passed;
-    debug.mahalanobis_gate_passed = candidate.mahalanobis_gate_passed;
-    debug.score = candidate.association_score;
-    debug.position_error = candidate.position_error;
-    debug.distance_error = candidate.distance_error;
-    debug.mahalanobis_distance = candidate.mahalanobis_distance;
-    debug.position_angle_error = candidate.position_angle_error;
-    debug.distance_angle_error = candidate.distance_angle_error;
-    debug.observed_x = candidate.armor->xyz_in_world[0];
-    debug.observed_y = candidate.armor->xyz_in_world[1];
-    debug.observed_z = candidate.armor->xyz_in_world[2];
-    debug.predicted_x = predicted_armor[0];
-    debug.predicted_y = predicted_armor[1];
-    debug.predicted_z = predicted_armor[2];
-    debug.observed_distance = candidate.armor->ypd_in_world[2];
-    debug.predicted_distance = predicted_ypd[2];
-    debug.orientation_error = candidate.orientation_error;
-    debug.bearing_error = candidate.bearing_error;
-    debug.raw_yaw = candidate.armor->yaw_raw;
-    debug.optimized_yaw = candidate.armor->ypr_in_world[0];
-    debug.yaw_correction =
-      tools::limit_rad(candidate.armor->ypr_in_world[0] - candidate.armor->yaw_raw);
-    debug.image_x = candidate.armor->center.x;
-    debug.image_y = candidate.armor->center.y;
+    association_debug_.candidates[index] = make_candidate_debug(candidates[index]);
   }
 
   // 同一帧的同名装甲板可能来自不同机器人，不能把它们分别写入同一个 EKF。
-  // 只吸收综合分数最低的一个候选；其余候选仍保留在 debug 中供判断遮挡和多机器人场景。
+  // 只吸收通过门限且马氏距离最小的一个候选；其余候选仍保留在 debug 中供诊断。
   const auto & best_candidate = candidates.front();
-  const bool accepted = best_candidate.gate_passed;
+  // 通过关联门限后仍需检查 EKF 后验；拒绝时保持预测状态和诊断候选。
+  const bool accepted =
+    best_candidate.gate_passed && target_.update(best_candidate.solved_armor, best_candidate.id);
   association_debug_.candidates[0].accepted = accepted;
   if (accepted) {
     association_debug_.accepted_count = 1;
-    target_.update(*best_candidate.armor, best_candidate.id);//得到最优估计量
+    // 探针会从原始检测列表读取已接收的位姿，因此把选中的分支回填给原对象。
+    *best_candidate.armor = best_candidate.solved_armor;
   }
 
-    // 门限拒绝时进入 temp_lost；短暂误拒仍保留预测，持续拒绝则由原状态机触发重捕获。
-    return accepted;
+  // 门限或后验拒绝时进入 temp_lost；持续拒绝由原状态机触发重捕获。
+  return accepted;
 }
 
 }  // namespace auto_aim

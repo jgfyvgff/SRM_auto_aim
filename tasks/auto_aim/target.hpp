@@ -48,9 +48,10 @@ public:
   // 兼容单匹配调用，返回马氏距离最小的模型。
   ArmorMatch match_armor(const Armor & armor) const;
 
-  void update(const Armor & armor);
+  // 已知几何目标按最大旋转直径检查后验；其他目标保持距离噪声检查。
+  bool update(const Armor & armor);
   // 使用已经完成关联的 ID 更新 EKF，避免同一帧内重复计算关联关系。
-  void update(const Armor & armor, int id);
+  bool update(const Armor & armor, int id);
 
   // 对机械尺寸已知的车辆持续约束两组装甲半径。variance 的单位为 m²；
   // 该约束会清除几何量与运动状态的错误互协方差，避免不可观测半径退化。
@@ -92,7 +93,7 @@ private:
   std::optional<GeometryConstraint> geometry_constraint_;
   double measurement_bearing_variance_ = 4e-3;
 
-  void update_ypda(const Armor & armor, int id);  // yaw pitch distance angle
+  bool update_ypda(const Armor & armor, int id);  // yaw pitch distance angle
   void apply_geometry_constraint();
   Eigen::Matrix4d measurement_noise(const Armor & armor) const;
 

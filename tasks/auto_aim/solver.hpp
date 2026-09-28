@@ -4,11 +4,20 @@
 #include <Eigen/Dense>  // 必须在opencv2/core/eigen.hpp上面
 #include <Eigen/Geometry>
 #include <opencv2/core/eigen.hpp>
+#include <optional>
 
 #include "armor.hpp"
 
 namespace auto_aim
 {
+// 平面装甲板 IPPE 可能返回多个姿态候选；此结构只用于诊断候选分支。
+struct PnpCandidateDebug
+{
+  double yaw_in_world = 0.0;
+  double reprojection_error = 0.0;  // 四个角点平均像素误差
+  Eigen::Vector3d xyz_in_world = Eigen::Vector3d::Zero();
+};
+
 class Solver
 {
 public:
@@ -18,7 +27,14 @@ public:
 
   void set_R_gimbal2world(const Eigen::Quaterniond & q);
 
-  void solve(Armor & armor) const;
+  // predicted_armor 为空时保持初始化行为；非空时使用预测装甲板 yaw
+  // 在 IPPE 多个平面姿态中选择连续分支。该参数只读，不转移所有权。
+  void solve(
+    Armor & armor,
+    std::optional<Eigen::Vector4d> predicted_armor = std::nullopt) const;
+
+  // 返回当前角点对应的全部 IPPE 候选，不改变 Armor 和 Tracker 状态。
+  std::vector<PnpCandidateDebug> pnp_candidates(const Armor & armor) const;
 
   // 使用原始装甲板四点执行一次 IPPE PnP，并将同一姿态回投影到图像。
   // 该误差用于隔离检测点、装甲板尺寸和 PnP 点序问题。

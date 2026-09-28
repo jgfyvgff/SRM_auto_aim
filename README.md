@@ -37,9 +37,19 @@ python3 tools/sim_tracker_analyzer.py --duration 30
 对该样本产生了正收益。默认允许的时间对齐误差为 `0.03 s`，可通过
 `--prediction-match-tolerance` 调整。
 
-Tracker 在同一帧只使用一个综合关联分数最低的同名装甲板更新 EKF。这样做是为了
-避免两个机器人同时进入画面时，把同名装甲板分别当成同一车辆的不同模型 ID；其余
-候选仍会发布到 `/sim_aim/debug` 供诊断。`configs/demo.yaml` 中的
+Tracker 对每个同名检测框分别以各模型 ID 的预测 yaw 选择 IPPE 姿态分支，再计算
+该分支与模型 ID 的关联误差。通过全部门限后，同一帧只使用马氏距离最小的一个组合
+更新 EKF，避免两个机器人同时进入画面时把同名装甲板一起写入同一个目标；其余
+检测候选仍会发布到 `/sim_aim/debug` 供诊断。
+`association_model_candidates` 额外记录每个检测框对各模型 ID 的门限、马氏距离、
+位置/姿态误差和该 ID 所选的 IPPE yaw，按检测框与模型 ID 的遍历顺序保存；
+最多保留八项，超出时只丢弃诊断记录，不影响实际关联。它用于分析初始
+模型 ID 锁定，不参与 Tracker 决策，也不能当作物理装甲板编号。
+关联门限通过后，还会比较同一块装甲板更新前后的三维位置残差。已知几何目标
+使用两组装甲中较大半径的旋转直径作为残差恶化上限；超过时恢复本帧预测状态与
+EKF 统计。其他目标仍使用本帧距离观测噪声的一个标准差。拒绝帧不增加装甲切换计数。
+`/sim_aim/debug` 中该候选可表现为 `gate_passed=true`、`accepted=false`。
+`configs/demo.yaml` 中的
 `association_max_score` 以等效弧度为单位，综合装甲板角度误差、按目标距离归一化的
 位置误差和距离误差，超限时保留预测状态而不吸收坏观测。为避免远距离下角度归一化
 掩盖较大的米制误差，`association_max_position_error` 和

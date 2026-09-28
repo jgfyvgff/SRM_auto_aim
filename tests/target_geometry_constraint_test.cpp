@@ -26,6 +26,7 @@ int main()
   armor.priority = auto_aim::ArmorPriority::first;
   armor.xyz_in_world = Eigen::Vector3d(1.0, 0.0, 0.5);
   armor.ypr_in_world = Eigen::Vector3d::Zero();
+  armor.ypd_in_world = tools::xyz2ypd(armor.xyz_in_world);
 
   Eigen::VectorXd initial_variance{{1, 64, 1, 64, 1, 64, 0.4, 100, 1, 1, 1}};
   auto_aim::Target target(
@@ -79,6 +80,69 @@ int main()
       tuned_matches[0].mahalanobis_distance <=
         default_matches[0].mahalanobis_distance) {
     std::cerr << "方位观测噪声未影响关联统计距离\n";
+    return 1;
+  }
+
+  auto_aim::Target rollback_target(
+    armor, std::chrono::steady_clock::now(), 0.1, 4, initial_variance);
+  const auto prior_ekf = rollback_target.ekf();
+  auto inconsistent_armor = armor;
+  // 模拟消息内三维位置与距离不一致：门控之前的候选可由 Tracker 校验，
+  // Target 自身必须防止这类观测把已知装甲位置向远处拉走。
+  inconsistent_armor.ypd_in_world = tools::xyz2ypd(Eigen::Vector3d(5.0, 0.0, 0.5));
+  if (rollback_target.update(inconsistent_armor, 0)) {
+    std::cerr << "后验位置残差劣化的观测未被拒绝\n";
+    return 1;
+  }
+  if (
+    !rollback_target.ekf_x().isApprox(prior_ekf.x) ||
+    !rollback_target.ekf().P.isApprox(prior_ekf.P) ||
+    rollback_target.ekf().data != prior_ekf.data ||
+    rollback_target.ekf().recent_nis_failures != prior_ekf.recent_nis_failures ||
+    !nearly_equal(rollback_target.ekf().last_nis, prior_ekf.last_nis) ||
+    rollback_target.last_id != 0 || rollback_target.jumped)
+  {
+    std::cerr << "拒绝观测后 EKF 或装甲关联状态未完全恢复\n";
+    return 1;
+  }
+  if (!rollback_target.update(armor, 0)) {
+    std::cerr << "正常观测被后验检查拒绝\n";
+    return 1;
+  }
+  auto_aim::Target small_error_target(
+    armor, std::chrono::steady_clock::now(), 0.1, 4, initial_variance);
+  auto small_error_armor = armor;
+  small_error_armor.ypd_in_world = tools::xyz2ypd(Eigen::Vector3d(1.2, 0.0, 0.5));
+  if (!small_error_target.update(small_error_armor, 0)) {
+    std::cerr << "观测噪声范围内的小幅位置残差增加被误拒\n";
+    return 1;
+  }
+
+  Eigen::VectorXd constrained_variance = initial_variance;
+  constrained_variance[8] = expected_variance;
+  constrained_variance[9] = expected_variance;
+  auto_aim::Target unconstrained_target(
+    armor, std::chrono::steady_clock::now(), expected_radius, 4, constrained_variance);
+  auto_aim::Target diameter_guard_target(
+    armor, std::chrono::steady_clock::now(), expected_radius, 4, constrained_variance);
+  diameter_guard_target.set_geometry_constraint(
+    expected_radius, 0.0, expected_variance, expected_variance);
+  const auto guarded_prior = diameter_guard_target.ekf();
+  auto radial_outlier = armor;
+  // 只改变距离观测，构造位置残差增长大于真实旋转直径、但小于原距离噪声门限的情形。
+  radial_outlier.ypd_in_world[2] += 1.5;
+  if (!unconstrained_target.update(radial_outlier, 0) ||
+      diameter_guard_target.update(radial_outlier, 0)) {
+    std::cerr << "已知几何目标未按旋转直径拦截异常后验\n";
+    return 1;
+  }
+  if (!diameter_guard_target.ekf_x().isApprox(guarded_prior.x) ||
+      !diameter_guard_target.ekf().P.isApprox(guarded_prior.P)) {
+    std::cerr << "旋转直径门限拒绝后未恢复 EKF 状态\n";
+    return 1;
+  }
+  if (!diameter_guard_target.update(armor, 0)) {
+    std::cerr << "旋转直径门限误拒正常观测\n";
     return 1;
   }
 

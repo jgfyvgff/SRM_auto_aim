@@ -210,14 +210,17 @@ ArmorMatch Target::match_armor(const Armor & armor) const
     });
 }
 
-void Target::update(const Armor & armor)
+bool Target::update(const Armor & armor)
 {
-  update(armor, match_armor(armor).id);
+  return update(armor, match_armor(armor).id);
 }
 
-void Target::update(const Armor & armor, int id)
+bool Target::update(const Armor & armor, int id)
 {
-  if (id < 0 || id >= armor_num_) return;
+  if (id < 0 || id >= armor_num_) return false;
+
+  // 状态机计数只在 EKF 更新成功后提交；失败帧不应伪装成一次装甲切换。
+  if (!update_ypda(armor, id)) return false;
 
   if (id != 0) jumped = true;//如果id不为0，说明跳过了
 
@@ -232,7 +235,7 @@ void Target::update(const Armor & armor, int id)
   last_id = id;
   update_count_++;//更新计数器加1
 
-  update_ypda(armor, id);//
+  return true;
 }
 
 void Target::set_geometry_constraint(
@@ -273,8 +276,14 @@ void Target::apply_geometry_constraint()
   constrain_state(9, constraint.radius_delta, constraint.radius_delta_variance);
 }
 
-void Target::update_ypda(const Armor & armor, int id)
+bool Target::update_ypda(const Armor & armor, int id)
 {
+  const double prior_error =
+    (armor.xyz_in_world - h_armor_xyz(ekf_.x, id)).norm();
+  if (!std::isfinite(prior_error)) return false;
+
+  // EKF 的 x/P、NIS 历史和内部计数一起保存，避免后验失败时只恢复位置。
+  const auto prior_ekf = ekf_;
   //观测jacobi
   Eigen::MatrixXd H = h_jacobian(ekf_.x, id);
   // 关联和 EKF 更新必须使用同一套观测噪声，否则马氏距离会与实际更新不一致。
@@ -304,6 +313,25 @@ void Target::update_ypda(const Armor & armor, int id)
   ekf_.update(z, H, R, h, z_subtract);
   // 观测更新可能再次把不可观测半径拉向发散下限，更新后恢复已知机械尺寸。
   apply_geometry_constraint();
+  const double posterior_error =
+    (armor.xyz_in_world - h_armor_xyz(ekf_.x, id)).norm();
+  // 仿真中机械尺寸已知时，一次更新若让三维残差恶化超过整个装甲旋转直径，
+  // 就不能再用相邻装甲切换解释；其他目标保持原距离观测噪声判据。
+  const double allowed_growth = geometry_constraint_
+                                  ? 2.0 * std::max(
+                                      std::abs(geometry_constraint_->radius),
+                                      std::abs(
+                                        geometry_constraint_->radius +
+                                        geometry_constraint_->radius_delta))
+                                  : std::sqrt(R(2, 2));
+  if (
+    !ekf_.x.allFinite() || !ekf_.P.allFinite() || !std::isfinite(posterior_error) ||
+    posterior_error > prior_error + allowed_growth)
+  {
+    ekf_ = prior_ekf;
+    return false;
+  }
+  return true;
 }
 
 Eigen::Matrix4d Target::measurement_noise(const Armor & armor) const

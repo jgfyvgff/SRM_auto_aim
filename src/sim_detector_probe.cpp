@@ -251,6 +251,7 @@ private:
     std::vector<cv::Point2f> reprojected_points;
     double future_center_shift = -1.0;
     std::vector<cv::Point2f> pnp_reprojected_points;
+    std::vector<auto_aim::PnpCandidateDebug> pnp_candidates;
     double pnp_reprojection_error = -1.0;
     double target_distance = -1.0;
     double armor_pixel_long_side = -1.0;
@@ -276,13 +277,21 @@ private:
 
         const auto & accepted = tracker_.association_debug().candidates[0];
         const auto * current_armor = static_cast<const auto_aim::Armor *>(nullptr);
-        if (accepted.accepted && accepted.model_id == target.last_id) {
-          const cv::Point2f accepted_center(
+        const auto * observed_armor = static_cast<const auto_aim::Armor *>(nullptr);
+        if (accepted.model_id >= 0) {
+          const cv::Point2f observed_center(
             static_cast<float>(accepted.image_x),
             static_cast<float>(accepted.image_y));
+          observed_armor = find_associated_armor(
+            tracker_armors, target.name, target.armor_type, observed_center);
+        }
+        if (observed_armor != nullptr) {
+          // 即使关联失败，也保留该观测的两个 IPPE 分支用于定位姿态歧义。
+          pnp_candidates = solver_.pnp_candidates(*observed_armor);
+        }
+        if (accepted.accepted && accepted.model_id == target.last_id) {
           // Tracker 在副本上完成 PnP，后验残差必须读取该副本的解算位姿。
-          current_armor = find_associated_armor(
-            tracker_armors, target.name, target.armor_type, accepted_center);
+          current_armor = observed_armor;
         }
         if (current_armor != nullptr) {
           // 只记录本帧实际进入 EKF 的角点，避免拿其他检测框分析 PnP。
@@ -441,6 +450,17 @@ private:
         plot_data["aimer_ms"] = duration_ms(aimer_start, aimer_end);
         plot_data["capture_to_aimer_ms"] = duration_ms(frame_timestamp, aimer_start);
         plot_data["pnp_error"] = pnp_reprojection_error;
+        plot_data["pnp_candidate_count"] =
+          static_cast<int>(pnp_candidates.size());
+        for (std::size_t i = 0; i < pnp_candidates.size() && i < 2; ++i) {
+          const auto prefix = "pnp_candidate_" + std::to_string(i);
+          plot_data[prefix + "_yaw"] = pnp_candidates[i].yaw_in_world;
+          plot_data[prefix + "_x"] = pnp_candidates[i].xyz_in_world[0];
+          plot_data[prefix + "_y"] = pnp_candidates[i].xyz_in_world[1];
+          plot_data[prefix + "_z"] = pnp_candidates[i].xyz_in_world[2];
+          plot_data[prefix + "_reprojection_error"] =
+            pnp_candidates[i].reprojection_error;
+        }
         plot_data["current_ekf_error"] = current_reprojection_error;
         plot_data["accepted_pnp_error"] = accepted_pnp_error;
         plot_data["accepted_model_error"] = accepted_model_error;
@@ -460,6 +480,40 @@ private:
         plot_data["nis"] = target.ekf().last_nis;
         plot_data["nis_failure_rate"] = target.ekf().data.at("recent_nis_failures");
         const auto & association = tracker_.association_debug();
+        // temp_lost 只表示本帧关联未通过；记录各门限，避免盲目放宽全部阈值。
+        if (tracker_.state() == "temp_lost") {
+          const auto & primary = association.candidates[0];
+          const double model_yaw =
+            primary.model_id >= 0 &&
+                static_cast<std::size_t>(primary.model_id) < current_armor_xyza_list.size()
+            ? current_armor_xyza_list[primary.model_id][3]
+            : std::numeric_limits<double>::quiet_NaN();
+          RCLCPP_WARN(
+            get_logger(),
+            "[Probe] association rejected: candidates=%d primary_id=%d "
+            "gate=%d angle=%d score=%d position=%d distance=%d mahalanobis=%d "
+            "mahalanobis_distance=%.3f score=%.3f position_error=%.3f distance_error=%.3f "
+            "raw_yaw=%.3f optimized_yaw=%.3f yaw_correction=%.3f model_yaw=%.3f "
+            "orientation_error=%.3f bearing_error=%.3f",
+            association.candidate_count,
+            primary.model_id,
+            primary.gate_passed,
+            primary.angle_gate_passed,
+            primary.score_gate_passed,
+            primary.position_gate_passed,
+            primary.distance_gate_passed,
+            primary.mahalanobis_gate_passed,
+            primary.mahalanobis_distance,
+            primary.score,
+            primary.position_error,
+            primary.distance_error,
+            primary.raw_yaw,
+            primary.optimized_yaw,
+            primary.yaw_correction,
+            model_yaw,
+            primary.orientation_error,
+            primary.bearing_error);
+        }
         plot_data["tracker_generation"] = tracker_.target_generation();
         plot_data["association_candidate_count"] = association.candidate_count;
         plot_data["association_accepted_count"] = association.accepted_count;
@@ -504,6 +558,25 @@ private:
         };
         add_association_candidate("association_primary", association.candidates[0]);
         add_association_candidate("association_secondary", association.candidates[1]);
+        // 保留同一检测框的全部模型假设，便于判断初始 ID 是否被单一预测分支锁住。
+        // 仅写入诊断话题，不参与 Tracker 的候选排序或控制输出。
+        plot_data["association_model_candidates"] = nlohmann::json::array();
+        for (int index = 0; index < association.model_candidate_count; ++index) {
+          const auto & candidate = association.model_candidates[index];
+          plot_data["association_model_candidates"].push_back({
+            {"model_id", candidate.model_id},
+            {"image_x", candidate.image_x},
+            {"image_y", candidate.image_y},
+            {"gate_passed", candidate.gate_passed},
+            {"mahalanobis_distance", candidate.mahalanobis_distance},
+            {"score", candidate.score},
+            {"position_error", candidate.position_error},
+            {"distance_error", candidate.distance_error},
+            {"orientation_error", candidate.orientation_error},
+            {"bearing_error", candidate.bearing_error},
+            {"raw_yaw", candidate.raw_yaw},
+            {"optimized_yaw", candidate.optimized_yaw}});
+        }
         plot_data["current_armor_id"] = target.last_id;
         plot_data["aim_armor_id"] = aimer_.debug_aim_point.armor_id;
         // center_* 表示车辆旋转中心；current_* 表示当前关联装甲板的位置。

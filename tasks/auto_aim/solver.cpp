@@ -2,6 +2,7 @@
 
 #include <yaml-cpp/yaml.h>
 
+#include <algorithm>
 #include <cmath>
 #include <limits>
 #include <stdexcept>
@@ -70,16 +71,126 @@ void Solver::set_R_gimbal2world(const Eigen::Quaterniond & q)
   R_gimbal2world_ = R_gimbal2imubody_.transpose() * R_imubody2imuabs * R_gimbal2imubody_;
 }
 
+std::vector<PnpCandidateDebug> Solver::pnp_candidates(const Armor & armor) const
+{
+  if (armor.points.size() != 4) {
+    return {};
+  }
+
+  const auto & object_points =
+    (armor.type == ArmorType::big) ? BIG_ARMOR_POINTS : SMALL_ARMOR_POINTS;
+
+  std::vector<cv::Mat> rvecs;
+  std::vector<cv::Mat> tvecs;
+  const bool solved = cv::solvePnPGeneric(
+    object_points,
+    armor.points,
+    camera_matrix_,
+    distort_coeffs_,
+    rvecs,
+    tvecs,
+    false,
+    cv::SOLVEPNP_IPPE);
+  if (!solved || rvecs.empty() || rvecs.size() != tvecs.size()) {
+    return {};
+  }
+
+  std::vector<PnpCandidateDebug> candidates;
+  candidates.reserve(rvecs.size());
+  for (std::size_t i = 0; i < rvecs.size(); ++i) {
+    cv::Mat rotation_matrix;
+    cv::Rodrigues(rvecs[i], rotation_matrix);
+
+    Eigen::Matrix3d R_armor2camera;
+    Eigen::Vector3d xyz_in_camera;
+    cv::cv2eigen(rotation_matrix, R_armor2camera);
+    cv::cv2eigen(tvecs[i], xyz_in_camera);
+
+    const Eigen::Vector3d xyz_in_gimbal =
+      R_camera2gimbal_ * xyz_in_camera + t_camera2gimbal_;
+    const Eigen::Vector3d xyz_in_world =
+      R_gimbal2world_ * xyz_in_gimbal;
+    const Eigen::Matrix3d R_armor2world =
+      R_gimbal2world_ * R_camera2gimbal_ * R_armor2camera;
+
+    std::vector<cv::Point2f> projected_points;
+    cv::projectPoints(
+      object_points,
+      rvecs[i],
+      tvecs[i],
+      camera_matrix_,
+      distort_coeffs_,
+      projected_points);
+
+    double reprojection_error = 0.0;
+    for (std::size_t point_id = 0; point_id < armor.points.size(); ++point_id) {
+      reprojection_error +=
+        cv::norm(armor.points[point_id] - projected_points[point_id]);
+    }
+    reprojection_error /= static_cast<double>(armor.points.size());
+
+    PnpCandidateDebug candidate;
+    candidate.yaw_in_world = tools::eulers(R_armor2world, 2, 1, 0)[0];
+    candidate.reprojection_error = reprojection_error;
+    candidate.xyz_in_world = xyz_in_world;
+    candidates.push_back(candidate);
+  }
+  return candidates;
+}
+
 //solvePnP（获得姿态）
-void Solver::solve(Armor & armor) const
+void Solver::solve(
+  Armor & armor, std::optional<Eigen::Vector4d> predicted_armor) const
 {
   const auto & object_points =
     (armor.type == ArmorType::big) ? BIG_ARMOR_POINTS : SMALL_ARMOR_POINTS;
 
-  cv::Vec3d rvec, tvec;
-  cv::solvePnP(
-    object_points, armor.points, camera_matrix_, distort_coeffs_, rvec, tvec, false,
-    cv::SOLVEPNP_IPPE);//使用IPPE算法求解PnP问题，获得rvec和tvec，IPPE算法适用于共面点集，且在共面点集上比EPnP更稳定
+  cv::Mat rvec, tvec;
+  if (!predicted_armor.has_value()) {
+    cv::solvePnP(
+      object_points, armor.points, camera_matrix_, distort_coeffs_, rvec, tvec, false,
+      cv::SOLVEPNP_IPPE);
+  } else {
+    std::vector<cv::Mat> candidate_rvecs;
+    std::vector<cv::Mat> candidate_tvecs;
+    const bool solved = cv::solvePnPGeneric(
+      object_points,
+      armor.points,
+      camera_matrix_,
+      distort_coeffs_,
+      candidate_rvecs,
+      candidate_tvecs,
+      false,
+      cv::SOLVEPNP_IPPE);
+
+    if (!solved || candidate_rvecs.empty() ||
+        candidate_rvecs.size() != candidate_tvecs.size()) {
+      cv::solvePnP(
+        object_points, armor.points, camera_matrix_, distort_coeffs_, rvec, tvec, false,
+        cv::SOLVEPNP_IPPE);
+    } else {
+      std::size_t selected_index = 0;
+      auto selected_error = std::numeric_limits<double>::infinity();
+      for (std::size_t i = 0; i < candidate_rvecs.size(); ++i) {
+        cv::Mat candidate_rotation;
+        cv::Rodrigues(candidate_rvecs[i], candidate_rotation);
+        Eigen::Matrix3d R_armor2camera;
+        cv::cv2eigen(candidate_rotation, R_armor2camera);
+
+        const auto R_armor2world =
+          R_gimbal2world_ * R_camera2gimbal_ * R_armor2camera;
+        const auto candidate_yaw = tools::eulers(R_armor2world, 2, 1, 0)[0];
+        const auto yaw_error = std::abs(tools::limit_rad(
+          candidate_yaw - (*predicted_armor)[3]));
+        if (yaw_error < selected_error) {
+          selected_error = yaw_error;
+          selected_index = i;
+        }
+      }
+      rvec = candidate_rvecs[selected_index];
+      tvec = candidate_tvecs[selected_index];
+    }
+  }
 
   Eigen::Vector3d xyz_in_camera;
   cv::cv2eigen(tvec, xyz_in_camera);

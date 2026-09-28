@@ -61,6 +61,9 @@ struct AssociationDebug
   int candidate_count = 0;
   int accepted_count = 0;
   std::array<AssociationCandidateDebug, 2> candidates{};
+  // 最多记录前八个模型假设（四装甲车通常覆盖两个检测框）；满后只丢弃诊断。
+  int model_candidate_count = 0;
+  std::array<AssociationCandidateDebug, 8> model_candidates{};
 };
 
 class Tracker
