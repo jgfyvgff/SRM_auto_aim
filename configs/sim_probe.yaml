@@ -14,7 +14,9 @@ roi:
   y: 50
   width: 600
   height: 600
-use_roi: false
+# 固定位置小陀螺诊断：放大 YOLO 输入中的灯条短边。
+# 目标离开此 ROI 时应关闭该实验设置。
+use_roi: true
 use_traditional: false
 
 threshold: 150
