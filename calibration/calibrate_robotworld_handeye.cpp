@@ -6,6 +6,7 @@
 #include <opencv2/core/eigen.hpp>
 #include <opencv2/opencv.hpp>
 
+#include "calibration/calibration_pattern.hpp"
 #include "tools/img_tools.hpp"
 #include "tools/math_tools.hpp"
 
@@ -46,14 +47,12 @@ void load(
 {
   // 读取yaml参数
   auto yaml = YAML::LoadFile(config_path);
-  auto pattern_cols = yaml["pattern_cols"].as<int>();
-  auto pattern_rows = yaml["pattern_rows"].as<int>();
-  auto center_distance_mm = yaml["center_distance_mm"].as<double>();
+  const auto pattern = calibration::load_pattern_spec(yaml);
+  const auto center_distance_mm = pattern.point_spacing_mm;
   R_gimbal2imubody_data = yaml["R_gimbal2imubody"].as<std::vector<double>>();
   auto camera_matrix_data = yaml["camera_matrix"].as<std::vector<double>>();
   auto distort_coeffs_data = yaml["distort_coeffs"].as<std::vector<double>>();
 
-  cv::Size pattern_size(pattern_cols, pattern_rows);
   Eigen::Matrix<double, 3, 3, Eigen::RowMajor> R_gimbal2imubody(R_gimbal2imubody_data.data());
   cv::Matx33d camera_matrix(camera_matrix_data.data());
   cv::Mat distort_coeffs(distort_coeffs_data);
@@ -80,10 +79,10 @@ void load(
 
     // 识别标定板
     std::vector<cv::Point2f> centers_2d;
-    auto success = cv::findCirclesGrid(img, pattern_size, centers_2d);  // 默认是对称圆点图案
+    auto success = calibration::detect_pattern(img, pattern, centers_2d);
 
     // 显示识别结果
-    cv::drawChessboardCorners(drawing, pattern_size, centers_2d, success);
+    calibration::draw_pattern(drawing, pattern, centers_2d, success);
     cv::resize(drawing, drawing, {}, 0.5, 0.5);  // 显示时缩小图片尺寸
     cv::imshow("Press any to continue", drawing);
     cv::waitKey(0);
@@ -98,7 +97,7 @@ void load(
     cv::Mat R_world2gimbal_cv;
     cv::eigen2cv(R_world2gimbal, R_world2gimbal_cv);
     cv::Mat rvec, tvec;
-    auto centers_3d_ = centers_3d(pattern_size, center_distance_mm);
+    auto centers_3d_ = centers_3d(pattern.size, center_distance_mm);
     cv::solvePnP(
       centers_3d_, centers_2d, camera_matrix, distort_coeffs, rvec, tvec, false, cv::SOLVEPNP_IPPE);
 

@@ -1,3 +1,6 @@
+# 标定板类型：circles 为当前对称圆点阵，chessboard 为棋盘格。
+# 棋盘格模式下，pattern_cols/pattern_rows 表示内角点数量，不是方格数量。
+pattern_type: "circles"
 pattern_cols: 10
 pattern_rows: 7
 center_distance_mm: 40

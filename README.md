@@ -68,6 +68,26 @@ ROI 测试样本数减少，且测试不是严格同步的 A/B 实验，不能�
 因此当前项目仍处于仿真验证阶段：可以输出并分析瞄准结果，但还不能宣称
 已经达到小陀螺和云台运动场景下的稳定击打要求。
 
+## 相机标定板模式
+
+`configs/calibration.yaml` 中的 `pattern_type` 控制采集、相机内参标定和两种手眼标定程序使用的标定板检测分支：
+
+- `circles`：保持当前的对称圆点阵方式；
+- `chessboard`：使用棋盘格内角点，并进行亚像素角点优化。
+
+`pattern_cols` 和 `pattern_rows` 对圆点阵表示点的列数和行数；对棋盘格表示内角点列数和行数，不是方格数量。`center_distance_mm` 表示相邻圆心或相邻棋盘格内角点之间的实际距离，单位为毫米。
+
+例如使用 9×6 内角点棋盘格时，将配置改为：
+
+```yaml
+pattern_type: "chessboard"
+pattern_cols: 9
+pattern_rows: 6
+center_distance_mm: 25
+```
+
+配置默认为 `circles`，因此旧的圆点阵采集数据不需要迁移。
+
 启动 `sim_detector_probe` 后，可使用独立脚本订阅 `/sim_aim/debug`，自动比较静止与小陀螺阶段的车辆中心、速度、半径和装甲板 ID 切换情况：
 
 ```bash

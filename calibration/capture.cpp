@@ -1,9 +1,11 @@
 #include <fmt/core.h>
+#include <yaml-cpp/yaml.h>
 
 #include <filesystem>
 #include <fstream>
 #include <opencv2/opencv.hpp>
 
+#include "calibration/calibration_pattern.hpp"
 #include "io/camera.hpp"
 #include "io/cboard.hpp"
 #include "tools/img_tools.hpp"
@@ -25,7 +27,8 @@ void write_q(const std::string q_path, const Eigen::Quaterniond & q)
 }
 
 void capture_loop(
-  const std::string & config_path, const std::string & can, const std::string & output_folder)
+  const std::string & config_path, const std::string & can, const std::string & output_folder,
+  const calibration::PatternSpec & pattern)
 {
   io::CBoard cboard(config_path);
   io::Camera camera(config_path);
@@ -45,8 +48,8 @@ void capture_loop(
     tools::draw_text(img_with_ypr, fmt::format("X {:.2f}", zyx[2]), {40, 120}, {0, 0, 255});
 
     std::vector<cv::Point2f> centers_2d;
-    auto success = cv::findCirclesGrid(img, cv::Size(10, 7), centers_2d);  // 默认是对称圆点图案
-    cv::drawChessboardCorners(img_with_ypr, cv::Size(10, 7), centers_2d, success);  // 显示识别结果
+    auto success = calibration::detect_pattern(img, pattern, centers_2d);
+    calibration::draw_pattern(img_with_ypr, pattern, centers_2d, success);
     cv::resize(img_with_ypr, img_with_ypr, {}, 0.5, 0.5);  // 显示时缩小图片尺寸
 
     // 按“s”保存图片和对应四元数，按“q”退出程序
@@ -79,13 +82,17 @@ int main(int argc, char * argv[])
   }
   auto config_path = cli.get<std::string>(0);
   auto output_folder = cli.get<std::string>("output-folder");
+  auto calibration_yaml = YAML::LoadFile(config_path);
+  const auto pattern = calibration::load_pattern_spec(calibration_yaml);
 
   // 新建输出文件夹
   std::filesystem::create_directory(output_folder);
 
-  tools::logger()->info("默认标定板尺寸为10列7行");
+  tools::logger()->info(
+    "标定板模式: {}, 尺寸: {}列{}行", calibration::pattern_type_name(pattern.type),
+    pattern.size.width, pattern.size.height);
   // 主循环，保存图片和对应四元数
-  capture_loop(config_path, "can0", output_folder);
+  capture_loop(config_path, "can0", output_folder, pattern);
 
   tools::logger()->warn("注意四元数输出顺序为wxyz");
 

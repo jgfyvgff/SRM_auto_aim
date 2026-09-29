@@ -4,6 +4,7 @@
 #include <fstream>
 #include <opencv2/opencv.hpp>
 
+#include "calibration/calibration_pattern.hpp"
 #include "tools/img_tools.hpp"
 
 const std::string keys =
@@ -29,10 +30,7 @@ void load(
 {
   // 读取yaml参数
   auto yaml = YAML::LoadFile(config_path);
-  auto pattern_cols = yaml["pattern_cols"].as<int>();
-  auto pattern_rows = yaml["pattern_rows"].as<int>();
-  auto center_distance_mm = yaml["center_distance_mm"].as<double>();
-  cv::Size pattern_size(pattern_cols, pattern_rows);
+  const auto pattern = calibration::load_pattern_spec(yaml);
 
   for (int i = 1; true; i++) {
     // 读取图片
@@ -45,11 +43,11 @@ void load(
 
     // 识别标定板
     std::vector<cv::Point2f> centers_2d;
-    auto success = cv::findCirclesGrid(img, pattern_size, centers_2d, cv::CALIB_CB_SYMMETRIC_GRID);
+    auto success = calibration::detect_pattern(img, pattern, centers_2d);
 
     // 显示识别结果
     auto drawing = img.clone();
-    cv::drawChessboardCorners(drawing, pattern_size, centers_2d, success);
+    calibration::draw_pattern(drawing, pattern, centers_2d, success);
     cv::resize(drawing, drawing, {}, 0.5, 0.5);  // 缩小图片尺寸便于显示完全
     cv::imshow("Press any to continue", drawing);
     cv::waitKey(0);
@@ -60,7 +58,8 @@ void load(
 
     // 记录所需的数据
     img_points.emplace_back(centers_2d);
-    obj_points.emplace_back(centers_3d(pattern_size, center_distance_mm));
+    obj_points.emplace_back(
+      centers_3d(pattern.size, static_cast<float>(pattern.point_spacing_mm)));
   }
 }
 
