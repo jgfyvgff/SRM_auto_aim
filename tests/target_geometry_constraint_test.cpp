@@ -118,6 +118,53 @@ int main()
     return 1;
   }
 
+  // 同一观测先不带门限更新，再把其后验残差作为确定性边界，验证
+  // 越界时 EKF 的状态、协方差和诊断历史均回滚；真实跳变由仿真回归验证。
+  auto far_armor = armor;
+  far_armor.xyz_in_world = Eigen::Vector3d(3.2, 0.9, 0.3);
+  far_armor.ypr_in_world[0] = 0.5;
+  far_armor.ypd_in_world = tools::xyz2ypd(far_armor.xyz_in_world);
+  auto_aim::Target predicted_target(
+    far_armor, std::chrono::steady_clock::now(), expected_radius, 4, initial_variance);
+  predicted_target.set_geometry_constraint(
+    expected_radius, 0.0, expected_variance, expected_variance);
+  predicted_target.set_measurement_bearing_variance(4e-5);
+  predicted_target.predict(0.1);
+  auto candidate = far_armor;
+  candidate.xyz_in_world[1] += 0.2;
+  candidate.ypr_in_world[0] += 0.2;
+  candidate.ypd_in_world = tools::xyz2ypd(candidate.xyz_in_world);
+
+  auto unguarded = predicted_target;
+  if (!unguarded.update(candidate, 0)) {
+    std::cerr << "测试观测未通过原有后验检查\n";
+    return 1;
+  }
+  const double posterior_distance =
+    tools::xyz2ypd(unguarded.armor_xyza_list()[0].head<3>())[2];
+  const double posterior_distance_error =
+    std::abs(candidate.ypd_in_world[2] - posterior_distance);
+  if (posterior_distance_error <= 1e-8) {
+    std::cerr << "测试观测没有可检查的后验距离残差\n";
+    return 1;
+  }
+  auto guarded = predicted_target;
+  const auto prior = guarded.ekf();
+  if (
+    guarded.update(candidate, 0, posterior_distance_error / 2.0) ||
+    !guarded.ekf_x().isApprox(prior.x) || !guarded.ekf().P.isApprox(prior.P) ||
+    guarded.ekf().data != prior.data ||
+    guarded.ekf().recent_nis_failures != prior.recent_nis_failures ||
+    guarded.last_id != predicted_target.last_id || guarded.jumped)
+  {
+    std::cerr << "后验距离越界未完整回滚\n";
+    return 1;
+  }
+  if (!guarded.update(far_armor, 0, 0.45)) {
+    std::cerr << "后验拒绝后正常观测不能恢复更新\n";
+    return 1;
+  }
+
   Eigen::VectorXd constrained_variance = initial_variance;
   constrained_variance[8] = expected_variance;
   constrained_variance[9] = expected_variance;

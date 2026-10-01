@@ -87,6 +87,47 @@ def make_future_observation(prefix="association_primary", armor_id=2, generation
 
 
 class SimTrackerAnalyzerTest(unittest.TestCase):
+    def test_truth_geometry_derives_signed_residual_and_groups_samples(self):
+        payload = {
+            "angular_velocity": 0.0,
+            "center_x": 1.0,
+            "center_y": 0.0,
+            "association_primary_truth_valid": 1,
+            "association_primary_accepted": 1,
+            "association_primary_id": 3,
+            "association_primary_observed_x": 1.04,
+            "association_primary_observed_y": -0.02,
+            "association_primary_observed_z": 0.50,
+            "association_primary_observed_distance": 1.20,
+            "association_primary_truth_x": 1.00,
+            "association_primary_truth_y": 0.00,
+            "association_primary_truth_z": 0.48,
+            "association_primary_truth_distance": 1.18,
+            "association_primary_truth_position_error": 0.0447,
+            "target_armor_type": "small",
+        }
+        sample = analyzer.normalize_sample(payload, 1.0)
+        report = analyzer.analyze_samples([sample, dict(sample, timestamp=1.01)])
+
+        self.assertAlmostEqual(
+            sample["association_primary_truth_residual_x"], 0.04
+        )
+        self.assertAlmostEqual(
+            sample["association_primary_truth_residual_y"], -0.02
+        )
+        self.assertAlmostEqual(
+            sample["association_primary_truth_distance_error"], 0.02
+        )
+        geometry = report["truth_geometry"]
+        self.assertEqual(geometry["sample_count"], 2)
+        self.assertEqual(geometry["accepted_sample_count"], 2)
+        self.assertEqual(geometry["by_armor_type"]["small"]["sample_count"], 2)
+        self.assertEqual(geometry["by_armor_id"]["3"]["sample_count"], 2)
+        self.assertAlmostEqual(
+            geometry["accepted_stats"]["association_primary_truth_residual_x"]["mean"],
+            0.04,
+        )
+
     def test_position_residual_keeps_fractional_precision(self):
         sample = analyzer.normalize_sample(
             {

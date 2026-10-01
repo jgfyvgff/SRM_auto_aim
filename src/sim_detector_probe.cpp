@@ -3,14 +3,17 @@
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/image.hpp>
 #include <std_msgs/msg/string.hpp>
+#include <tf2_ros/transform_listener.h>
 
 #include <algorithm>
 #include <chrono>
+#include <cstdint>
 #include <cmath>
 #include <functional>
 #include <list>
 #include <limits>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -20,6 +23,7 @@
 #include "tasks/auto_aim/aimer.hpp"
 #include "tools/math_tools.hpp"
 #include "src/sim_capture_time.hpp"
+#include "src/sim_gimbal_tf.hpp"
 
 class SimDetectorProbe final : public rclcpp::Node
 {
@@ -31,22 +35,42 @@ public:
     solver_(tracker_config_path),
     tracker_(tracker_config_path, solver_),
     aimer_(tracker_config_path),
+    tf_buffer_(get_clock()),
+    // 使用 tf2 独立接收线程，避免 YOLO/PnP/窗口刷新阻塞 /tf 缓冲更新。
+    // Listener 成员声明在 Buffer 后面，析构时先停止线程，再销毁 Buffer。
+    tf_listener_(tf_buffer_, this, true),
     frame_count_(0)
   {
+    // lookupTransform 的有限等待依赖独立 TF 线程；Listener 已启用 spin_thread。
+    tf_buffer_.setUsingDedicatedThread(true);
+
     debug_publisher_ = create_publisher<std_msgs::msg::String>(
       "/sim_aim/debug", rclcpp::QoS(100).best_effort());
+    tracker_status_publisher_ = create_publisher<std_msgs::msg::String>(
+      "/sim_aim/tracker_status", rclcpp::QoS(100).best_effort());
 
     image_subscription_ = create_subscription<sensor_msgs::msg::Image>(
       "/image_raw", rclcpp::SensorDataQoS(),
       std::bind(&SimDetectorProbe::on_image, this, std::placeholders::_1));
 
-    // 推理放在 Timer 中执行，避免在 ROS2 图像回调里阻塞 DDS 接收线程。
+    // 单线程执行器中，推理 Timer 与图像回调实际串行执行；
+    // 这里保留最新帧是为了降低延迟，但不能保证图像回调不被推理耗时阻塞。
     inference_timer_ = create_wall_timer(
       std::chrono::milliseconds(10),
       std::bind(&SimDetectorProbe::run_inference, this));
   }
 
 private:
+  // TF 尚未到达时暂存一帧；只保留这一帧，避免等待期间形成无界队列。
+  struct PendingFrame
+  {
+    cv::Mat image;
+    std::chrono::steady_clock::time_point timestamp;
+    rclcpp::Time ros_stamp{0, 0, RCL_ROS_TIME};
+    double header_age_ms = 0.0;
+    std::uint64_t sequence = 0;
+  };
+
   // 探针直接调用 Tracker 时没有经过 Decider，因此这里补齐模式1的优先级，
   // 避免 Tracker 按未初始化的 priority 排序，导致两台机器人之间选择不确定。
   static auto_aim::ArmorPriority probe_priority(auto_aim::ArmorName name)
@@ -146,6 +170,72 @@ private:
     return total_error / 4.0;
   }
 
+  struct TruthArmorPose
+  {
+    int frame_id = -1;
+    Eigen::Vector3d position = Eigen::Vector3d::Zero();
+    double yaw = 0.0;
+    double distance = 0.0;
+    double position_error = 0.0;
+    double second_position_error = std::numeric_limits<double>::infinity();
+  };
+
+  // 将候选的 odom 坐标与模拟器发布的 armor_N 真值逐一比较。
+  // 这里只用于诊断，不把真值反馈给 Tracker，避免仿真真值污染算法。
+  std::optional<TruthArmorPose> lookup_truth_armor(
+    const rclcpp::Time & stamp, const Eigen::Vector3d & observed)
+  {
+    if (stamp.nanoseconds() <= 0 || !observed.allFinite()) {
+      return std::nullopt;
+    }
+
+    std::optional<TruthArmorPose> nearest;
+    constexpr int max_truth_frame_id = 64;
+    for (int frame_id = 0; frame_id < max_truth_frame_id; ++frame_id) {
+      try {
+        const auto transform = tf_buffer_.lookupTransform(
+          "odom", "armor_" + std::to_string(frame_id), tf2_ros::fromRclcpp(stamp));
+        const Eigen::Vector3d position(
+          transform.transform.translation.x,
+          transform.transform.translation.y,
+          transform.transform.translation.z);
+        const Eigen::Quaterniond orientation(
+          transform.transform.rotation.w,
+          transform.transform.rotation.x,
+          transform.transform.rotation.y,
+          transform.transform.rotation.z);
+        if (!position.allFinite() || !orientation.coeffs().allFinite() ||
+            orientation.norm() < 1e-6)
+        {
+          continue;
+        }
+
+        const double position_error = (observed - position).norm();
+        if (!nearest || position_error < nearest->position_error) {
+          const auto previous_best_error =
+            nearest ? nearest->position_error : std::numeric_limits<double>::infinity();
+          nearest = TruthArmorPose{
+            frame_id,
+            position,
+            tools::eulers(orientation.normalized().toRotationMatrix(), 2, 1, 0)[0],
+            position.norm(),
+            position_error,
+            previous_best_error};
+        } else if (position_error < nearest->second_position_error) {
+          nearest->second_position_error = position_error;
+        }
+      } catch (const tf2::TransformException &) {
+        // 仿真器不一定同时发布所有 armor_N，缺失帧不是算法错误。
+      }
+    }
+
+    // 最近真值距离过大时不强行配对，避免把另一台机器人误当成真值。
+    if (!nearest || nearest->position_error > 0.5) {
+      return std::nullopt;
+    }
+    return nearest;
+  }
+
   static double duration_ms(
     const std::chrono::steady_clock::time_point & begin,
     const std::chrono::steady_clock::time_point & end)
@@ -213,7 +303,9 @@ private:
       return;
     }
     latest_frame_ = bgr.clone();
+    ++latest_frame_sequence_;
     latest_frame_timestamp_ = capture->timestamp;
+    latest_frame_ros_stamp_ = rclcpp::Time(msg->header.stamp);
     latest_header_age_ms_ = capture->header_age_ms;
   }
 
@@ -221,16 +313,76 @@ private:
   {
     cv::Mat frame;
     std::chrono::steady_clock::time_point frame_timestamp;
+    std::uint64_t frame_sequence = 0;
+    rclcpp::Time frame_ros_stamp(0, 0, RCL_ROS_TIME);
     double frame_header_age_ms;
     {
       std::lock_guard<std::mutex> lock(frame_mutex_);
-      if (latest_frame_.empty()) {
-        return;
+      // TF 暂不可用时，旧 pending 帧不能阻塞更新图像；
+      // 实时探针优先处理最新帧，避免时间偏差随重试不断扩大。
+      if (
+        pending_frame_ && !latest_frame_.empty() &&
+        latest_frame_sequence_ > pending_frame_->sequence)
+      {
+        pending_frame_.reset();
       }
-      frame = std::move(latest_frame_);
-      frame_timestamp = latest_frame_timestamp_;
-      frame_header_age_ms = latest_header_age_ms_;
+      if (pending_frame_) {
+        frame = std::move(pending_frame_->image);
+        frame_timestamp = pending_frame_->timestamp;
+        frame_sequence = pending_frame_->sequence;
+        frame_ros_stamp = pending_frame_->ros_stamp;
+        frame_header_age_ms = pending_frame_->header_age_ms;
+        pending_frame_.reset();
+      } else if (latest_frame_.empty()) {
+        return;
+      } else {
+        frame = std::move(latest_frame_);
+        frame_timestamp = latest_frame_timestamp_;
+        frame_sequence = latest_frame_sequence_;
+        frame_ros_stamp = latest_frame_ros_stamp_;
+        frame_header_age_ms = latest_header_age_ms_;
+      }
     }
+
+    // TF 使用图像采集时间；缺失或错位时跳过整帧，不能混用旧云台姿态更新 EKF。
+    std::string tf_failure_reason;
+    const auto gimbal_tf = sim_gimbal_tf::lookup_rotation(
+      tf_buffer_, frame_ros_stamp, &tf_failure_reason);
+    if (!gimbal_tf) {
+      {
+        std::lock_guard<std::mutex> lock(frame_mutex_);
+        // 只有没有更新图像时才重试当前帧；有更新帧时直接丢弃旧帧，
+        // 防止 pending_frame_ 无限占用推理循环。
+        if (latest_frame_.empty() || latest_frame_sequence_ <= frame_sequence) {
+          pending_frame_ = PendingFrame{
+            std::move(frame), frame_timestamp, frame_ros_stamp,
+            frame_header_age_ms, frame_sequence};
+        }
+      }
+      ++tf_skipped_frames_;
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), 2000,
+        "Skipping image without a time-aligned odom -> gimbal_link TF: %s",
+        tf_failure_reason.c_str());
+      return;
+    }
+
+    // 这些字段只用于区分“图像回调覆盖/跳过”与“Tracker 关联失败”，不参与算法决策。
+    const double tracker_capture_dt_ms =
+      last_tracked_frame_timestamp_ == std::chrono::steady_clock::time_point{}
+        ? -1.0
+        : duration_ms(last_tracked_frame_timestamp_, frame_timestamp);
+    const auto received_frame_gap =
+      last_tracked_frame_sequence_ == 0
+        ? 0
+        : frame_sequence - last_tracked_frame_sequence_;
+    const auto tf_skipped_frames = tf_skipped_frames_;
+    last_tracked_frame_timestamp_ = frame_timestamp;
+    last_tracked_frame_sequence_ = frame_sequence;
+    tf_skipped_frames_ = 0;
+
+    solver_.set_R_gimbal2world(gimbal_tf->rotation);
+    const Eigen::Vector3d gimbal_ypr = tools::eulers(solver_.R_gimbal2world(), 2, 1, 0);
 
     const auto detector_start = std::chrono::steady_clock::now();
     const auto armors = detector_.detect(frame, frame_count_++);
@@ -251,11 +403,39 @@ private:
         armor.center.y);
     }
 
-    // 当前假设底盘不动，Target 坐标直接作为云台局部坐标交给 Aimer。
+    // 模拟器 odom 与云台原点重合；姿态已转换到 odom，Aimer 可使用同一原点求弹道。
     const auto tracker_start = std::chrono::steady_clock::now();
     const auto timestamp = frame_timestamp;
     const auto targets = tracker_.track(tracker_armors, timestamp);
     const auto tracker_end = std::chrono::steady_clock::now();
+
+    // 状态 Topic 每个处理帧都发布，即使 Tracker 已经没有有效 target。
+    // debug Topic 只在有 target 时发布完整几何数据，不能用于统计连续 temp_lost。
+    // 这里使用 BEST_EFFORT，诊断消息绝不能反过来阻塞实时推理。
+    // status_sequence 用于识别状态消息丢失；input_frame_sequence 只表示输入图像
+    // 序号，可能因为“只保留最新帧”而跳变，不能拿它判断 DDS 是否丢状态消息。
+    nlohmann::json tracker_status;
+    tracker_status["status_sequence"] = tracker_status_sequence_++;
+    tracker_status["input_frame_sequence"] = frame_sequence;
+    tracker_status["stamp_ns"] = frame_ros_stamp.nanoseconds();
+    tracker_status["tracker_state"] = tracker_.state();
+    tracker_status["tracker_generation"] = tracker_.target_generation();
+    tracker_status["temp_lost_count"] = tracker_.temp_lost_count();
+    tracker_status["max_temp_lost_count"] = tracker_.max_temp_lost_count();
+    tracker_status["target_present"] = targets.empty() ? 0 : 1;
+    const auto & association_status = tracker_.association_debug();
+    tracker_status["association_matching_detection_count"] =
+      association_status.matching_detection_count;
+    tracker_status["association_gate_passed_count"] =
+      association_status.gate_passed_count;
+    tracker_status["association_candidate_count"] = association_status.candidate_count;
+    tracker_status["association_accepted_count"] = association_status.accepted_count;
+    tracker_status["received_frame_gap"] = received_frame_gap;
+    tracker_status["tf_skipped_frames"] = tf_skipped_frames;
+    std_msgs::msg::String tracker_status_message;
+    tracker_status_message.data = tracker_status.dump();
+    tracker_status_publisher_->publish(tracker_status_message);
+
     constexpr double sim_bullet_speed_mps = 23.0;
     const auto aimer_start = std::chrono::steady_clock::now();
     const auto command = aimer_.aim(targets, timestamp, sim_bullet_speed_mps);
@@ -264,6 +444,7 @@ private:
     std::vector<cv::Point2f> current_reprojected_points;
     double current_reprojection_error = -1.0;
     double accepted_pnp_error = -1.0;
+    double association_pnp_error = -1.0;
     double accepted_model_error = -1.0;
     std::vector<cv::Point2f> accepted_armor_points;
     double post_update_position_error = -1.0;
@@ -310,6 +491,8 @@ private:
         if (observed_armor != nullptr) {
           // 即使关联失败，也保留该观测的两个 IPPE 分支用于定位姿态歧义。
           pnp_candidates = solver_.pnp_candidates(*observed_armor);
+          association_pnp_error = mean_reprojection_error(
+            *observed_armor, solver_.reproject_pnp(*observed_armor));
         }
         if (accepted.accepted && accepted.model_id == target.last_id) {
           // Tracker 在副本上完成 PnP，后验残差必须读取该副本的解算位姿。
@@ -460,6 +643,8 @@ private:
         plot_data["command_yaw_deg"] = command.yaw * 180.0 / CV_PI;
         plot_data["command_pitch_deg"] = command.pitch * 180.0 / CV_PI;
         plot_data["target_distance"] = target_distance;
+        plot_data["target_armor_name"] = auto_aim::ARMOR_NAMES.at(target.name);
+        plot_data["target_armor_type"] = auto_aim::ARMOR_TYPES.at(target.armor_type);
         plot_data["armor_pixel_long_side"] = armor_pixel_long_side;
         plot_data["armor_pixel_short_side"] = armor_pixel_short_side;
         plot_data["high_speed_mode"] = aimer_.debug_high_speed_mode ? 1 : 0;
@@ -467,12 +652,25 @@ private:
         plot_data["base_prediction_dt"] = aimer_.debug_base_prediction_dt;
         plot_data["fly_time"] = aimer_.debug_fly_time;
         plot_data["image_header_age_ms"] = frame_header_age_ms;
+        plot_data["tracker_capture_dt_ms"] = tracker_capture_dt_ms;
+        plot_data["received_frame_gap"] = received_frame_gap;
+        plot_data["tf_skipped_frames"] = tf_skipped_frames;
+        plot_data["gimbal_tf_skew_ms"] = gimbal_tf->skew_ms;
+        plot_data["gimbal_yaw_rad"] = gimbal_ypr[0];
+        plot_data["gimbal_pitch_rad"] = gimbal_ypr[1];
+        // 保存完整云台姿态，供离线几何审计把 PnP 结果还原到 odom 坐标系；
+        // 这些字段只用于复算，不改变在线 Solver 使用的姿态。
+        plot_data["gimbal_tf_qx"] = gimbal_tf->rotation.x();
+        plot_data["gimbal_tf_qy"] = gimbal_tf->rotation.y();
+        plot_data["gimbal_tf_qz"] = gimbal_tf->rotation.z();
+        plot_data["gimbal_tf_qw"] = gimbal_tf->rotation.w();
         plot_data["capture_to_detector_ms"] = duration_ms(frame_timestamp, detector_start);
         plot_data["detector_ms"] = duration_ms(detector_start, detector_end);
         plot_data["tracker_ms"] = duration_ms(tracker_start, tracker_end);
         plot_data["aimer_ms"] = duration_ms(aimer_start, aimer_end);
         plot_data["capture_to_aimer_ms"] = duration_ms(frame_timestamp, aimer_start);
         plot_data["pnp_error"] = pnp_reprojection_error;
+        plot_data["association_pnp_error"] = association_pnp_error;
         plot_data["pnp_candidate_count"] =
           static_cast<int>(pnp_candidates.size());
         for (std::size_t i = 0; i < pnp_candidates.size() && i < 2; ++i) {
@@ -559,9 +757,12 @@ private:
             primary.bearing_error);
         }
         plot_data["tracker_generation"] = tracker_.target_generation();
+        plot_data["association_matching_detection_count"] =
+          association.matching_detection_count;
+        plot_data["association_gate_passed_count"] = association.gate_passed_count;
         plot_data["association_candidate_count"] = association.candidate_count;
         plot_data["association_accepted_count"] = association.accepted_count;
-        auto add_association_candidate = [&plot_data](
+        auto add_association_candidate = [this, &plot_data, &frame_ros_stamp](
                                            const std::string & prefix,
                                            const auto_aim::AssociationCandidateDebug & candidate) {
           if (candidate.model_id < 0) return;
@@ -594,9 +795,48 @@ private:
           plot_data[prefix + "_predicted_distance"] = candidate.predicted_distance;
           plot_data[prefix + "_orientation_error"] = candidate.orientation_error;
           plot_data[prefix + "_bearing_error"] = candidate.bearing_error;
+          plot_data[prefix + "_angle_error"] = candidate.angle_error;
+          plot_data[prefix + "_raw_yaw_prediction_error"] =
+            candidate.raw_yaw_prediction_error;
+          plot_data[prefix + "_optimized_yaw_prediction_error"] =
+            candidate.optimized_yaw_prediction_error;
           plot_data[prefix + "_raw_yaw"] = candidate.raw_yaw;
           plot_data[prefix + "_optimized_yaw"] = candidate.optimized_yaw;
           plot_data[prefix + "_yaw_correction"] = candidate.yaw_correction;
+
+          // 同时记录实际接受的主候选和被拒绝的候选：前者用于验证
+          // PnP/外参/TF 真值是否一致，后者用于验证关联门限。
+          // 真值只写入诊断消息，不反馈给 Tracker，也不改变任何算法决策。
+          const auto truth = (candidate.accepted || !candidate.gate_passed)
+            ? lookup_truth_armor(
+              frame_ros_stamp,
+              Eigen::Vector3d(candidate.observed_x, candidate.observed_y, candidate.observed_z))
+            : std::nullopt;
+          plot_data[prefix + "_truth_valid"] = truth ? 1 : 0;
+          if (truth) {
+            plot_data[prefix + "_truth_frame_id"] = truth->frame_id;
+            plot_data[prefix + "_truth_x"] = truth->position[0];
+            plot_data[prefix + "_truth_y"] = truth->position[1];
+            plot_data[prefix + "_truth_z"] = truth->position[2];
+            plot_data[prefix + "_truth_yaw"] = truth->yaw;
+            plot_data[prefix + "_truth_distance"] = truth->distance;
+            plot_data[prefix + "_truth_position_error"] = truth->position_error;
+            plot_data[prefix + "_truth_second_position_error"] =
+              truth->second_position_error;
+            plot_data[prefix + "_truth_match_margin"] =
+              truth->second_position_error - truth->position_error;
+            // armor_N 的局部法向可能与 PnP 装甲板坐标相反，因此同时检查
+            // 原始方向和绕法向翻转 pi 后的方向，不能把固定 pi 偏置误判为外参错误。
+            const auto flipped_truth_yaw = tools::limit_rad(truth->yaw + CV_PI);
+            plot_data[prefix + "_raw_yaw_truth_direct_error"] =
+              std::abs(tools::limit_rad(candidate.raw_yaw - truth->yaw));
+            plot_data[prefix + "_optimized_yaw_truth_direct_error"] =
+              std::abs(tools::limit_rad(candidate.optimized_yaw - truth->yaw));
+            plot_data[prefix + "_raw_yaw_truth_flipped_error"] =
+              std::abs(tools::limit_rad(candidate.raw_yaw - flipped_truth_yaw));
+            plot_data[prefix + "_optimized_yaw_truth_flipped_error"] =
+              std::abs(tools::limit_rad(candidate.optimized_yaw - flipped_truth_yaw));
+          }
           plot_data[prefix + "_image_x"] = candidate.image_x;
           plot_data[prefix + "_image_y"] = candidate.image_y;
         };
@@ -813,12 +1053,23 @@ private:
   auto_aim::Solver solver_;
   auto_aim::Tracker tracker_;
   auto_aim::Aimer aimer_;
+  // Listener 自带独立接收线程；先析构 Listener，再析构其引用的 Buffer。
+  tf2_ros::Buffer tf_buffer_;
+  tf2_ros::TransformListener tf_listener_;
   rclcpp::Publisher<std_msgs::msg::String>::SharedPtr debug_publisher_;
+  rclcpp::Publisher<std_msgs::msg::String>::SharedPtr tracker_status_publisher_;
   rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr image_subscription_;
   rclcpp::TimerBase::SharedPtr inference_timer_;
   std::mutex frame_mutex_;
   cv::Mat latest_frame_;
+  std::optional<PendingFrame> pending_frame_;
+  std::uint64_t latest_frame_sequence_ = 0;
   std::chrono::steady_clock::time_point latest_frame_timestamp_;
+  std::uint64_t last_tracked_frame_sequence_ = 0;
+  std::chrono::steady_clock::time_point last_tracked_frame_timestamp_;
+  std::uint64_t tf_skipped_frames_ = 0;
+  std::uint64_t tracker_status_sequence_ = 0;
+  rclcpp::Time latest_frame_ros_stamp_{0, 0, RCL_ROS_TIME};
   double latest_header_age_ms_ = 0.0;
   int frame_count_;
 };

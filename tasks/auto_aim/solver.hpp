@@ -5,6 +5,7 @@
 #include <Eigen/Geometry>
 #include <opencv2/core/eigen.hpp>
 #include <optional>
+#include <vector>
 
 #include "armor.hpp"
 
@@ -54,10 +55,18 @@ private:
   Eigen::Matrix3d R_camera2gimbal_;
   Eigen::Vector3d t_camera2gimbal_;
   Eigen::Matrix3d R_gimbal2world_;
+  // PnP 角点对应的灯条有效长度，单位为 m；由配置决定，避免仿真尺寸污染实车默认值。
+  double lightbar_length_;
+  std::vector<cv::Point3f> big_armor_points_;
+  std::vector<cv::Point3f> small_armor_points_;
+
+  const std::vector<cv::Point3f> & armor_points(ArmorType type) const;
   // yaw 优化相对原始 PnP yaw 的最大允许修正，单位为 rad。
   double max_yaw_optimization_correction_;
 
-  void optimize_yaw(Armor & armor) const;
+  // 有预测姿态时，优化结果不能破坏与预测 yaw 的连续性。
+  void optimize_yaw(
+    Armor & armor, std::optional<double> reference_yaw = std::nullopt) const;
 
   double armor_reprojection_error(const Armor & armor, double yaw, const double & inclined) const;
   double SJTU_cost(

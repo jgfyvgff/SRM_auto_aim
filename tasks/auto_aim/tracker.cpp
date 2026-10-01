@@ -12,6 +12,7 @@
 
 #include "tools/logger.hpp"
 #include "tools/math_tools.hpp"
+#include "tracker_time_policy.hpp"
 
 namespace auto_aim
 {
@@ -65,6 +66,9 @@ Tracker::Tracker(const std::string & config_path, Solver & solver)
     yaml["measurement_bearing_variance"].IsDefined()
       ? yaml["measurement_bearing_variance"].as<double>()
       : 4e-3;
+  max_prediction_gap_ = yaml["tracker_max_prediction_gap"].IsDefined()
+                          ? yaml["tracker_max_prediction_gap"].as<double>()
+                          : 0.3;
 
   if (
     standard_radius_ <= 0.05 || standard_radius_ >= 0.5 ||
@@ -82,7 +86,11 @@ Tracker::Tracker(const std::string & config_path, Solver & solver)
   if (association_max_score_ <= 0.0 || association_max_score_ > 3.141592653589793 * 3.0) {
     throw std::runtime_error("Invalid association_max_score configuration");
   }
-  if (association_max_position_error_ <= 0.0 || association_max_distance_error_ <= 0.0) {
+  if (
+    !std::isfinite(association_max_position_error_) ||
+    !std::isfinite(association_max_distance_error_) ||
+    association_max_position_error_ <= 0.0 || association_max_distance_error_ <= 0.0)
+  {
     throw std::runtime_error("Invalid association absolute error configuration");
   }
   if (
@@ -95,6 +103,10 @@ Tracker::Tracker(const std::string & config_path, Solver & solver)
       measurement_bearing_variance_ <= 0.0) {
     throw std::runtime_error("Invalid measurement_bearing_variance configuration");
   }
+  if (!std::isfinite(max_prediction_gap_) ||
+      max_prediction_gap_ <= tracker_time_policy::large_dt_warning_seconds) {
+    throw std::runtime_error("Invalid tracker_max_prediction_gap configuration");
+  }
 }
 
 std::string Tracker::state() const { return state_; }
@@ -103,6 +115,10 @@ const AssociationDebug & Tracker::association_debug() const { return association
 
 std::uint64_t Tracker::target_generation() const { return target_generation_; }
 
+int Tracker::temp_lost_count() const { return temp_lost_count_; }
+
+int Tracker::max_temp_lost_count() const { return max_temp_lost_count_; }
+
 std::list<Target> Tracker::track(
   std::list<Armor> & armors, std::chrono::steady_clock::time_point t, bool use_enemy_color)
 {
@@ -110,10 +126,16 @@ std::list<Target> Tracker::track(
   auto dt = tools::delta_time(t, last_timestamp_);
   last_timestamp_ = t;
 
-  // 时间间隔过长，说明可能发生了相机离线
-  if (state_ != "lost" && dt > 0.1) {
+  // 单次 100 ms 左右的图像采集抖动不能直接重建目标；EKF 会使用真实 dt
+  // 增大预测协方差，再由关联门控、NIS 和几何发散检查判断观测是否可信。
+  if (state_ != "lost" && dt > tracker_time_policy::large_dt_warning_seconds) {
     tools::logger()->warn("[Tracker] Large dt: {:.3f}s", dt);
-    state_ = "lost";
+    if (tracker_time_policy::exceeds_max_prediction_gap(dt, max_prediction_gap_)) {
+      tools::logger()->warn(
+        "[Tracker] Prediction gap exceeded safety limit: {:.3f}s > {:.3f}s",
+        dt, max_prediction_gap_);
+      state_ = "lost";
+    }
   }
   // 过滤掉非我方装甲板
   armors.remove_if([&](const auto_aim::Armor & a) { return a.color != enemy_color_; });
@@ -150,17 +172,21 @@ std::list<Target> Tracker::track(
 
   // 发散检测
   if (state_ != "lost" && target_.diverged()) {
-    tools::logger()->debug("[Tracker] Target diverged!");
+    tools::logger()->warn("[Tracker] Lost: target geometry diverged");
     state_ = "lost";
     return {};
   }
 
   // 收敛效果检测：
-  if (
-    std::accumulate(
-      target_.ekf().recent_nis_failures.begin(), target_.ekf().recent_nis_failures.end(), 0) >=
-    (0.4 * target_.ekf().window_size)) {
-    tools::logger()->debug("[Target] Bad Converge Found!");
+  const int nis_failures = std::accumulate(
+    target_.ekf().recent_nis_failures.begin(), target_.ekf().recent_nis_failures.end(), 0);
+  if (nis_failures >= (0.4 * target_.ekf().window_size)) {
+    // 已在其他路径进入 lost 时不重复报因；此处只记录真正触发状态变化的 NIS 失败。
+    if (state_ != "lost") {
+      tools::logger()->warn(
+        "[Tracker] Lost: NIS failures={} window_size={}",
+        nis_failures, target_.ekf().window_size);
+    }
     state_ = "lost";
     return {};
   }
@@ -185,10 +211,15 @@ std::tuple<omniperception::DetectionResult, std::list<Target>> Tracker::track(
   auto dt = tools::delta_time(t, last_timestamp_);
   last_timestamp_ = t;
 
-  // 时间间隔过长，说明可能发生了相机离线
-  if (state_ != "lost" && dt > 0.1) {
+  // 与单路 Tracker 保持一致：短时抖动继续使用真实 dt，超过安全边界才重建。
+  if (state_ != "lost" && dt > tracker_time_policy::large_dt_warning_seconds) {
     tools::logger()->warn("[Tracker] Large dt: {:.3f}s", dt);
-    state_ = "lost";
+    if (tracker_time_policy::exceeds_max_prediction_gap(dt, max_prediction_gap_)) {
+      tools::logger()->warn(
+        "[Tracker] Prediction gap exceeded safety limit: {:.3f}s > {:.3f}s",
+        dt, max_prediction_gap_);
+      state_ = "lost";
+    }
   }
 
   // 优先选择靠近图像中心的装甲板
@@ -288,7 +319,11 @@ void Tracker::state_machine(bool found)
       state_ = "detecting";
     } else {
       temp_lost_count_++;
-      if (temp_lost_count_ > 200) state_ = "lost";
+      if (temp_lost_count_ > 200) {
+        tools::logger()->warn(
+          "[Tracker] Lost: switching timeout after {} failed frames", temp_lost_count_);
+        state_ = "lost";
+      }
     }
   }
 
@@ -303,7 +338,16 @@ void Tracker::state_machine(bool found)
       else
         max_temp_lost_count_ = normal_temp_lost_count_;
 
-      if (temp_lost_count_ > max_temp_lost_count_) state_ = "lost";
+      if (temp_lost_count_ > max_temp_lost_count_) {
+        // 只在真正丢失时输出一次；候选信息属于最后一帧，不代表此前每次失败。
+        const auto & last_candidate = association_debug_.candidates[0];
+        tools::logger()->warn(
+          "[Tracker] Lost: association timeout after {} failed frames "
+          "(limit={}, last_candidates={}, last_gate={}, last_accepted={})",
+          temp_lost_count_, max_temp_lost_count_, association_debug_.candidate_count,
+          last_candidate.gate_passed, association_debug_.accepted_count);
+        state_ = "lost";
+      }
     }
   }
 }
@@ -421,6 +465,11 @@ bool Tracker::update_target(std::list<Armor> & armors, std::chrono::steady_clock
     debug.predicted_distance = predicted_ypd[2];
     debug.orientation_error = candidate.orientation_error;
     debug.bearing_error = candidate.bearing_error;
+    debug.angle_error = candidate.angle_error;
+    debug.raw_yaw_prediction_error = std::abs(
+      tools::limit_rad(candidate.solved_armor.yaw_raw - predicted_armor[3]));
+    debug.optimized_yaw_prediction_error = std::abs(
+      tools::limit_rad(candidate.solved_armor.ypr_in_world[0] - predicted_armor[3]));
     debug.raw_yaw = candidate.solved_armor.yaw_raw;
     debug.optimized_yaw = candidate.solved_armor.ypr_in_world[0];
     debug.yaw_correction = tools::limit_rad(
@@ -432,6 +481,7 @@ bool Tracker::update_target(std::list<Armor> & armors, std::chrono::steady_clock
   std::vector<Candidate> candidates;
   for (auto & armor : armors) {
     if (armor.name != target_.name || armor.type != target_.armor_type) continue;
+    ++association_debug_.matching_detection_count;
 
     std::optional<Candidate> best_gated_match;
     std::optional<Candidate> best_rejected_match;
@@ -473,8 +523,11 @@ bool Tracker::update_target(std::list<Armor> & armors, std::chrono::steady_clock
       const auto distance_gate_passed = distance_error <= association_max_distance_error_;
       const auto mahalanobis_gate_passed =
         match.mahalanobis_distance <= association_max_mahalanobis_distance_;
+      // 关联接受由综合分数、绝对空间误差和 EKF 创新协方差共同决定。
+      // 固定 angle_gate 只用于诊断，避免在小陀螺状态下拒绝统计上合理的观测；
+      // angle_error 仍然参与 association_score，明显错误的姿态不会绕过综合门限。
       const auto gate_passed =
-        angle_gate_passed && score_gate_passed && position_gate_passed &&
+        score_gate_passed && position_gate_passed &&
         distance_gate_passed && mahalanobis_gate_passed;
 
       Candidate candidate{
@@ -498,6 +551,7 @@ bool Tracker::update_target(std::list<Armor> & armors, std::chrono::steady_clock
 
     // 每个检测只保留一个最优的“分支 × 模型 ID”组合，避免重复框多次更新 EKF。
     if (best_gated_match) {
+      ++association_debug_.gate_passed_count;
       candidates.push_back(*best_gated_match);
     } else if (best_rejected_match) {
       candidates.push_back(*best_rejected_match);
@@ -532,8 +586,9 @@ bool Tracker::update_target(std::list<Armor> & armors, std::chrono::steady_clock
   // 只吸收通过门限且马氏距离最小的一个候选；其余候选仍保留在 debug 中供诊断。
   const auto & best_candidate = candidates.front();
   // 通过关联门限后仍需检查 EKF 后验；拒绝时保持预测状态和诊断候选。
-  const bool accepted =
-    best_candidate.gate_passed && target_.update(best_candidate.solved_armor, best_candidate.id);
+  // 预测关联和更新后验共用距离门限，避免候选虽通过门控却被一次 EKF 更新拉出门限。
+  const bool accepted = best_candidate.gate_passed && target_.update(
+    best_candidate.solved_armor, best_candidate.id, association_max_distance_error_);
   association_debug_.candidates[0].accepted = accepted;
   if (accepted) {
     association_debug_.accepted_count = 1;

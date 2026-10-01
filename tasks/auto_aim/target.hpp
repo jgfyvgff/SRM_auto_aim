@@ -50,8 +50,11 @@ public:
 
   // 已知几何目标按最大旋转直径检查后验；其他目标保持距离噪声检查。
   bool update(const Armor & armor);
-  // 使用已经完成关联的 ID 更新 EKF，避免同一帧内重复计算关联关系。
-  bool update(const Armor & armor, int id);
+  // 使用已经完成关联的 ID 更新 EKF。可选后验距离门限与 Tracker 的关联门限同单位（m）；
+  // 超限时恢复更新前的完整滤波状态，避免方位观测把中心拉出已接受的距离范围。
+  bool update(
+    const Armor & armor, int id,
+    std::optional<double> max_posterior_distance_error = std::nullopt);
 
   // 对机械尺寸已知的车辆持续约束两组装甲半径。variance 的单位为 m²；
   // 该约束会清除几何量与运动状态的错误互协方差，避免不可观测半径退化。
@@ -93,7 +96,9 @@ private:
   std::optional<GeometryConstraint> geometry_constraint_;
   double measurement_bearing_variance_ = 4e-3;
 
-  bool update_ypda(const Armor & armor, int id);  // yaw pitch distance angle
+  bool update_ypda(
+    const Armor & armor, int id,
+    std::optional<double> max_posterior_distance_error);  // yaw pitch distance angle
   void apply_geometry_constraint();
   Eigen::Matrix4d measurement_noise(const Armor & armor) const;
 

@@ -3,6 +3,7 @@
 
 import argparse
 import bisect
+import collections
 import json
 import math
 import statistics
@@ -59,6 +60,38 @@ ANALYZED_FIELDS = (
     "pnp_error",
     "nis",
     "nis_failure_rate",
+    "association_matching_detection_count",
+    "association_gate_passed_count",
+    "association_primary_truth_position_error",
+    "association_primary_truth_second_position_error",
+    "association_primary_truth_match_margin",
+    "association_primary_truth_x",
+    "association_primary_truth_y",
+    "association_primary_truth_z",
+    "association_primary_truth_distance",
+    "association_primary_truth_residual_x",
+    "association_primary_truth_residual_y",
+    "association_primary_truth_residual_z",
+    "association_primary_truth_distance_error",
+    "association_primary_raw_yaw_truth_direct_error",
+    "association_primary_optimized_yaw_truth_direct_error",
+    "association_primary_raw_yaw_truth_flipped_error",
+    "association_primary_optimized_yaw_truth_flipped_error",
+    "association_secondary_truth_position_error",
+    "association_secondary_truth_second_position_error",
+    "association_secondary_truth_match_margin",
+    "association_secondary_truth_x",
+    "association_secondary_truth_y",
+    "association_secondary_truth_z",
+    "association_secondary_truth_distance",
+    "association_secondary_truth_residual_x",
+    "association_secondary_truth_residual_y",
+    "association_secondary_truth_residual_z",
+    "association_secondary_truth_distance_error",
+    "association_secondary_raw_yaw_truth_direct_error",
+    "association_secondary_optimized_yaw_truth_direct_error",
+    "association_secondary_raw_yaw_truth_flipped_error",
+    "association_secondary_optimized_yaw_truth_flipped_error",
     "association_primary_score",
     "association_primary_orientation_error",
     "association_primary_bearing_error",
@@ -128,8 +161,30 @@ OUTLIER_CONTEXT_FIELDS = (
     "pnp_error",
     "association_candidate_count",
     "association_accepted_count",
+    "association_matching_detection_count",
+    "association_gate_passed_count",
     "association_primary_id",
     "association_primary_accepted",
+    "association_primary_truth_valid",
+    "association_primary_truth_frame_id",
+    "association_primary_truth_x",
+    "association_primary_truth_y",
+    "association_primary_truth_z",
+    "association_primary_truth_distance",
+    "association_primary_truth_residual_x",
+    "association_primary_truth_residual_y",
+    "association_primary_truth_residual_z",
+    "association_primary_truth_distance_error",
+    "association_secondary_truth_valid",
+    "association_secondary_truth_frame_id",
+    "association_secondary_truth_x",
+    "association_secondary_truth_y",
+    "association_secondary_truth_z",
+    "association_secondary_truth_distance",
+    "association_secondary_truth_residual_x",
+    "association_secondary_truth_residual_y",
+    "association_secondary_truth_residual_z",
+    "association_secondary_truth_distance_error",
     "association_primary_gate_passed",
     "association_primary_angle_gate_passed",
     "association_primary_score_gate_passed",
@@ -341,6 +396,74 @@ def _analyze_range_buckets(samples, bin_size):
     return result
 
 
+TRUTH_GEOMETRY_FIELDS = (
+    "association_primary_truth_residual_x",
+    "association_primary_truth_residual_y",
+    "association_primary_truth_residual_z",
+    "association_primary_truth_position_error",
+    "association_primary_truth_distance_error",
+)
+
+
+def _summarize_truth_geometry(samples):
+    """汇总同帧 PnP 观测与 TF 真值的固定偏差及随机波动。"""
+    stats = {}
+    for field in TRUTH_GEOMETRY_FIELDS:
+        summary = _summarize(
+            [sample[field] for sample in samples if field in sample]
+        )
+        if summary is not None:
+            stats[field] = summary
+    return stats
+
+
+def _analyze_truth_geometry(samples):
+    """按装甲板模型和 Tracker 模型 ID 分组分析 PnP-TF 残差。"""
+    valid_samples = [
+        sample
+        for sample in samples
+        if sample.get("association_primary_truth_valid") == 1
+        and all(field in sample for field in TRUTH_GEOMETRY_FIELDS)
+    ]
+    accepted_samples = [
+        sample
+        for sample in valid_samples
+        if sample.get("association_primary_accepted") == 1
+    ]
+
+    def grouped_by(key, use_string=False):
+        groups = {}
+        for sample in valid_samples:
+            value = sample.get(key)
+            if value is None:
+                value = "unknown"
+            elif use_string:
+                value = str(value)
+            else:
+                value = str(int(value))
+            groups.setdefault(value, []).append(sample)
+        return {
+            key_value: {
+                "sample_count": len(group_samples),
+                "accepted_sample_count": sum(
+                    sample.get("association_primary_accepted") == 1
+                    for sample in group_samples
+                ),
+                "stats": _summarize_truth_geometry(group_samples),
+            }
+            for key_value, group_samples in sorted(groups.items())
+        }
+
+    return {
+        "sample_count": len(valid_samples),
+        "accepted_sample_count": len(accepted_samples),
+        "stats": _summarize_truth_geometry(valid_samples),
+        "accepted_stats": _summarize_truth_geometry(accepted_samples),
+        "by_armor_type": grouped_by("target_armor_type", use_string=True),
+        "by_armor_id": grouped_by("association_primary_id"),
+    }
+
+
 def _outlier_snapshot(sample):
     """仅保留定位异常所需字段，避免报告复制全部高频采样数据。"""
     return {
@@ -398,6 +521,21 @@ def normalize_sample(payload, timestamp):
         if correction is not None:
             sample[f"{prefix}_yaw_correction_abs"] = abs(correction)
 
+        # 用观测位置减去 TF 真值位置，保留方向信息；绝对位置误差只说明大小，
+        # 有符号分量才能判断是否存在稳定的坐标轴偏差。
+        observed = [sample.get(f"{prefix}_observed_{axis}") for axis in "xyz"]
+        truth = [sample.get(f"{prefix}_truth_{axis}") for axis in "xyz"]
+        if all(value is not None for value in observed + truth):
+            for axis, observed_value, truth_value in zip("xyz", observed, truth):
+                sample[f"{prefix}_truth_residual_{axis}"] = observed_value - truth_value
+
+        observed_distance = sample.get(f"{prefix}_observed_distance")
+        truth_distance = sample.get(f"{prefix}_truth_distance")
+        if observed_distance is not None and truth_distance is not None:
+            sample[f"{prefix}_truth_distance_error"] = abs(
+                observed_distance - truth_distance
+            )
+
     # 将每个观测通道对中心 x/y 的修正合成为二维距离，便于横向比较影响大小。
     for index in range(4):
         correction_x = sample.get(f"ekf_center_x_correction_{index}")
@@ -413,8 +551,14 @@ def normalize_sample(payload, timestamp):
         "tracker_generation",
         "association_candidate_count",
         "association_accepted_count",
+        "association_matching_detection_count",
+        "association_gate_passed_count",
         "association_primary_id",
         "association_primary_accepted",
+        "association_primary_truth_valid",
+        "association_primary_truth_frame_id",
+        "association_secondary_truth_valid",
+        "association_secondary_truth_frame_id",
         "association_primary_gate_passed",
         "association_primary_angle_gate_passed",
         "association_primary_score_gate_passed",
@@ -436,7 +580,112 @@ def normalize_sample(payload, timestamp):
         value = payload.get(field)
         if _finite_number(value):
             sample[field] = int(value)
+
+    for field in ("target_armor_name", "target_armor_type"):
+        value = payload.get(field)
+        if isinstance(value, str) and value:
+            sample[field] = value
     return sample
+
+
+STATUS_NUMERIC_FIELDS = (
+    "status_sequence",
+    "input_frame_sequence",
+    "stamp_ns",
+    "tracker_generation",
+    "temp_lost_count",
+    "max_temp_lost_count",
+    "target_present",
+    "association_matching_detection_count",
+    "association_gate_passed_count",
+    "association_candidate_count",
+    "association_accepted_count",
+    "received_frame_gap",
+    "tf_skipped_frames",
+)
+
+
+def normalize_tracker_status(payload, timestamp):
+    """解析每帧 Tracker 状态，不把无 target 帧混入几何误差统计。"""
+    sample = {"timestamp": float(timestamp)}
+    for field in STATUS_NUMERIC_FIELDS:
+        value = payload.get(field)
+        if _finite_number(value):
+            sample[field] = int(value)
+    state = payload.get("tracker_state")
+    if isinstance(state, str):
+        sample["tracker_state"] = state
+    return sample
+
+
+def analyze_tracker_status(status_samples):
+    """统计连续临时丢失，并检查 BEST_EFFORT 状态消息是否有序列缺口。"""
+    if not status_samples:
+        return {
+            "sample_count": 0,
+            "state_counts": {},
+            "temp_lost_sequence_count": 0,
+            "temp_lost_frame_count": 0,
+            "temp_lost_max_frames": 0,
+            "temp_lost_max_duration": 0.0,
+            "generation_change_count": 0,
+            "status_sequence_gap_count": 0,
+            "input_frame_sequence_gap_count": 0,
+        }
+
+    ordered = sorted(status_samples, key=lambda sample: sample["timestamp"])
+    state_counts = collections.Counter(
+        sample.get("tracker_state", "unknown") for sample in ordered
+    )
+    temp_lost_sequence_count = 0
+    temp_lost_frame_count = 0
+    temp_lost_max_frames = 0
+    temp_lost_max_duration = 0.0
+    sequence_start = None
+    sequence_frames = 0
+    previous_state = None
+    for sample in ordered:
+        is_temp_lost = sample.get("tracker_state") == "temp_lost"
+        if is_temp_lost and previous_state != "temp_lost":
+            temp_lost_sequence_count += 1
+            sequence_start = sample["timestamp"]
+            sequence_frames = 0
+        if is_temp_lost:
+            temp_lost_frame_count += 1
+            sequence_frames += 1
+            temp_lost_max_frames = max(temp_lost_max_frames, sequence_frames)
+            temp_lost_max_duration = max(
+                temp_lost_max_duration,
+                sample["timestamp"] - sequence_start,
+            )
+        previous_state = sample.get("tracker_state")
+
+    generation_change_count = sum(
+        previous.get("tracker_generation") != current.get("tracker_generation")
+        for previous, current in zip(ordered, ordered[1:])
+        if "tracker_generation" in previous and "tracker_generation" in current
+    )
+    status_sequence_gap_count = sum(
+        current["status_sequence"] > previous["status_sequence"] + 1
+        for previous, current in zip(ordered, ordered[1:])
+        if "status_sequence" in previous and "status_sequence" in current
+    )
+    input_frame_sequence_gap_count = sum(
+        current["input_frame_sequence"] > previous["input_frame_sequence"] + 1
+        for previous, current in zip(ordered, ordered[1:])
+        if "input_frame_sequence" in previous and "input_frame_sequence" in current
+    )
+    return {
+        "sample_count": len(ordered),
+        "state_counts": dict(state_counts),
+        "temp_lost_sequence_count": temp_lost_sequence_count,
+        "temp_lost_frame_count": temp_lost_frame_count,
+        "temp_lost_max_frames": temp_lost_max_frames,
+        "temp_lost_max_duration": temp_lost_max_duration,
+        "generation_change_count": generation_change_count,
+        "status_sequence_gap_count": status_sequence_gap_count,
+        "input_frame_sequence_gap_count": input_frame_sequence_gap_count,
+    }
 
 
 def _accepted_armor_observation(sample, armor_id):
@@ -743,7 +992,10 @@ def _analyze_phase(samples):
     association_frame_count = 0
     two_candidate_count = 0
     duplicate_model_id_count = 0
-    rejected_candidate_frame_count = 0
+    candidate_deprioritized_frame_count = 0
+    no_matching_detection_frame_count = 0
+    all_gate_rejected_frame_count = 0
+    post_update_rejected_frame_count = 0
     gate_rejected_frame_count = 0
     gate_rejection_counts = {
         "angle": 0,
@@ -760,8 +1012,18 @@ def _analyze_phase(samples):
         if candidate_count is None or accepted_count is None:
             continue
         association_frame_count += 1
+        matching_detection_count = sample.get("association_matching_detection_count")
+        gate_passed_count = sample.get("association_gate_passed_count")
         if accepted_count < candidate_count:
-            rejected_candidate_frame_count += 1
+            # Tracker 每帧最多只吸收一个候选；其余候选被降级是设计行为，
+            # 不能再解释成“候选未完全接收”或检测漏检。
+            candidate_deprioritized_frame_count += 1
+        if matching_detection_count == 0:
+            no_matching_detection_frame_count += 1
+        elif gate_passed_count == 0:
+            all_gate_rejected_frame_count += 1
+        elif accepted_count == 0:
+            post_update_rejected_frame_count += 1
         gate_passed = []
         if sample.get("association_primary_gate_passed") is not None:
             gate_passed.append(sample["association_primary_gate_passed"])
@@ -815,8 +1077,30 @@ def _analyze_phase(samples):
             if two_candidate_count
             else None
         ),
+        "candidate_deprioritized_frame_rate": (
+            candidate_deprioritized_frame_count / association_frame_count
+            if association_frame_count
+            else None
+        ),
+        # 兼容旧报告和旧测试；当前字段的准确语义是“候选降级”，
+        # 不表示检测框被 Tracker 拒绝。
         "rejected_candidate_frame_rate": (
-            rejected_candidate_frame_count / association_frame_count
+            candidate_deprioritized_frame_count / association_frame_count
+            if association_frame_count
+            else None
+        ),
+        "no_matching_detection_frame_rate": (
+            no_matching_detection_frame_count / association_frame_count
+            if association_frame_count
+            else None
+        ),
+        "all_gate_rejected_frame_rate": (
+            all_gate_rejected_frame_count / association_frame_count
+            if association_frame_count
+            else None
+        ),
+        "post_update_rejected_frame_rate": (
+            post_update_rejected_frame_count / association_frame_count
             if association_frame_count
             else None
         ),
@@ -978,6 +1262,7 @@ def analyze_samples(samples, thresholds=None):
         "range_buckets": _analyze_range_buckets(
             samples, limits["range_bin_size"]
         ),
+        "truth_geometry": _analyze_truth_geometry(samples),
         "aimer_prediction": _analyze_aimer_predictions(samples, limits),
         "outliers": _extract_outlier_events(samples),
         "diagnoses": diagnoses,
@@ -1057,6 +1342,20 @@ def print_report(report):
         "pnp_error": "px",
         "nis": "",
         "nis_failure_rate": "",
+        "association_primary_truth_position_error": "m",
+        "association_primary_truth_second_position_error": "m",
+        "association_primary_truth_match_margin": "m",
+        "association_primary_raw_yaw_truth_direct_error": "rad",
+        "association_primary_optimized_yaw_truth_direct_error": "rad",
+        "association_primary_raw_yaw_truth_flipped_error": "rad",
+        "association_primary_optimized_yaw_truth_flipped_error": "rad",
+        "association_secondary_truth_position_error": "m",
+        "association_secondary_truth_second_position_error": "m",
+        "association_secondary_truth_match_margin": "m",
+        "association_secondary_raw_yaw_truth_direct_error": "rad",
+        "association_secondary_optimized_yaw_truth_direct_error": "rad",
+        "association_secondary_raw_yaw_truth_flipped_error": "rad",
+        "association_secondary_optimized_yaw_truth_flipped_error": "rad",
         "association_primary_score": "rad",
         "association_primary_position_error": "m",
         "association_primary_distance_error": "m",
@@ -1109,11 +1408,83 @@ def print_report(report):
             )
         if phase["association_frame_count"]:
             print(
-                "  候选未完全接收帧比例="
-                f"{phase['rejected_candidate_frame_rate']:.3f}"
+                "  候选降级帧比例="
+                f"{phase['candidate_deprioritized_frame_rate']:.3f}"
+            )
+            print(
+                "  无同名检测帧比例="
+                f"{phase['no_matching_detection_frame_rate']:.3f}"
+            )
+            print(
+                "  全部门控拒绝帧比例="
+                f"{phase['all_gate_rejected_frame_rate']:.3f}"
+            )
+            print(
+                "  后验更新拒绝帧比例="
+                f"{phase['post_update_rejected_frame_rate']:.3f}"
             )
             if phase["gate_rejected_frame_rate"] is not None:
                 print(f"  关联门限拒绝帧比例={phase['gate_rejected_frame_rate']:.3f}")
+
+    geometry = report.get("truth_geometry", {})
+    if geometry.get("sample_count", 0):
+        print("\n[PnP-TF 几何残差]")
+        print(
+            f"  有效真值帧={geometry['sample_count']} "
+            f"其中实际接收={geometry['accepted_sample_count']}"
+        )
+        for field, label in (
+            ("association_primary_truth_residual_x", "x有符号残差"),
+            ("association_primary_truth_residual_y", "y有符号残差"),
+            ("association_primary_truth_residual_z", "z有符号残差"),
+            ("association_primary_truth_position_error", "位置误差"),
+            ("association_primary_truth_distance_error", "距离误差"),
+        ):
+            summary = geometry["accepted_stats"].get(field)
+            if summary is not None:
+                print(
+                    f"  {label:12s} mean={summary['mean']:.4f}m "
+                    f"P95={summary['p95']:.4f}m "
+                    f"P95-P05={summary['robust_span']:.4f}m"
+                )
+
+        for group_name, groups in (
+            ("装甲板模型", geometry.get("by_armor_type", {})),
+            ("模型ID", geometry.get("by_armor_id", {})),
+        ):
+            if not groups:
+                continue
+            print(f"  按{group_name}分组:")
+            for group_key, group in groups.items():
+                position_summary = group["stats"].get(
+                    "association_primary_truth_position_error"
+                )
+                if position_summary is None:
+                    continue
+                print(
+                    f"    {group_key}: 样本={group['sample_count']} "
+                    f"接收={group['accepted_sample_count']} "
+                    f"位置误差mean={position_summary['mean']:.4f}m "
+                    f"P95={position_summary['p95']:.4f}m"
+                )
+
+    status = report.get("tracker_status", {})
+    if status.get("sample_count", 0):
+        state_counts = status.get("state_counts", {})
+        state_text = ", ".join(
+            f"{state}={count}" for state, count in sorted(state_counts.items())
+        )
+        print("\n[Tracker 状态连续性]")
+        print(f"  状态样本={status['sample_count']} ({state_text})")
+        print(
+            f"  temp_lost序列={status['temp_lost_sequence_count']} "
+            f"帧数={status['temp_lost_frame_count']} "
+            f"最长帧数={status['temp_lost_max_frames']} "
+            f"最长持续={status['temp_lost_max_duration'] * 1000.0:.1f}ms"
+        )
+        print(f"  Tracker世代变化={status['generation_change_count']}")
+        print(f"  状态消息序列缺口={status['status_sequence_gap_count']}")
+        print(f"  输入图像序列跳帧={status['input_frame_sequence_gap_count']}")
 
     print("\n[Aimer 时间对齐预测]")
     for phase_name, title in (
@@ -1260,6 +1631,7 @@ def collect_ros_samples(args):
     rclpy.init()
     node = rclpy.create_node("sim_tracker_analyzer")
     samples = []
+    status_samples = []
     invalid_count = 0
     start_time = time.monotonic()
 
@@ -1276,8 +1648,21 @@ def collect_ros_samples(args):
         except (json.JSONDecodeError, TypeError, ValueError):
             invalid_count += 1
 
+    def on_status_message(message):
+        nonlocal invalid_count
+        try:
+            payload = json.loads(message.data)
+            status_samples.append(
+                normalize_tracker_status(payload, time.monotonic() - start_time)
+            )
+        except (json.JSONDecodeError, TypeError, ValueError):
+            invalid_count += 1
+
     # 保留订阅对象直到采集结束，避免生命周期短于事件循环。
     subscription = node.create_subscription(String, args.topic, on_message, qos)
+    status_subscription = node.create_subscription(
+        String, args.status_topic, on_status_message, qos
+    )
     deadline = start_time + args.duration if args.duration > 0 else math.inf
     next_progress = start_time + 5.0
     try:
@@ -1291,12 +1676,13 @@ def collect_ros_samples(args):
         print("收到 Ctrl-C，使用当前样本生成报告。")
     finally:
         del subscription
+        del status_subscription
         node.destroy_node()
         rclpy.shutdown()
 
     if invalid_count:
         print(f"忽略了 {invalid_count} 条无效 JSON 消息。")
-    return samples
+    return samples, status_samples
 
 
 def _positive_float(value):
@@ -1311,6 +1697,7 @@ def parse_args():
         description="自动分析 /sim_aim/debug 中的 Tracker 与 Aimer 数据"
     )
     parser.add_argument("--topic", default="/sim_aim/debug")
+    parser.add_argument("--status-topic", default="/sim_aim/tracker_status")
     parser.add_argument("--duration", type=float, default=30.0, help="采集秒数，0 表示直到 Ctrl-C")
     parser.add_argument("--static-angular-threshold", type=float, default=0.3)
     parser.add_argument("--spin-angular-threshold", type=float, default=1.0)
@@ -1355,12 +1742,13 @@ def main():
         "range_bin_size": args.range_bin_size,
         "minimum_samples": args.minimum_samples,
     }
-    samples = collect_ros_samples(args)
+    samples, status_samples = collect_ros_samples(args)
     if not samples:
         print("未收到有效调试数据，请检查 sim_detector_probe 和 Topic QoS。")
         return 2
 
     report = analyze_samples(samples, thresholds)
+    report["tracker_status"] = analyze_tracker_status(status_samples)
     print_report(report)
     if args.output:
         output_path = Path(args.output)

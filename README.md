@@ -28,6 +28,19 @@
 `capture_to_detector_ms`、`capture_to_aimer_ms` 从采集时刻起算。
 一秒仅是过期帧拒绝上限，不是预测延迟补偿。
 
+Tracker 对时间间隔采用两级策略：约 `0.1 s` 只用于记录采集抖动告警，短时
+间隔仍保留当前目标，并由 EKF 使用真实 `dt` 继续预测；只有超过
+`configs/demo.yaml` 中的 `tracker_max_prediction_gap`（默认 `0.3 s`）才进入
+`lost`，作为长时间失联保护。因此 `0.1 s` 不是固定预测延迟，也不是直接
+重置 Tracker 的阈值。
+
+仿真探针还会按图像 Header 时间查询 `odom -> gimbal_link`：有前后 TF 时由
+tf2 插值；仅有最近 TF 时，时间差必须不超过 5 ms。缺少有效姿态的图像会被
+跳过，不更新 Tracker。`/sim_aim/debug` 的 `gimbal_tf_skew_ms`、
+`gimbal_yaw_rad`、`gimbal_pitch_rad` 用于核对实际使用的云台姿态。
+当前模拟器中 `odom -> gimbal_link` 的平移恒为零，探针因此只接入动态旋转；
+本验证仍以底盘位置不变为前提，尚未覆盖底盘平移或实车 IMU 坐标系。
+
 固定位置的小陀螺 ROI 实验使用
 `./build/sim_detector_probe configs/sim_probe.yaml configs/demo.yaml`。
 `sim_probe.yaml` 的 ROI 只覆盖图像 x=420～1020、y=50～650；
@@ -41,6 +54,7 @@
   `ROS_DOMAIN_ID=30` 和 `FASTDDS_BUILTIN_TRANSPORTS=UDPv4`；
 - 使用图像采集时间参与 Tracker/Aimer 计算，补充过期帧、未来帧和乱序帧检查；
 - 修正模拟器相机到云台的静态外参；
+- 按图像采集时间把 `odom -> gimbal_link` 的云台旋转送入仿真 Solver；
 - 在装甲板关联中加入 EKF 预测协方差对应的马氏距离，同时保留位置、距离和姿态安全门；
 - 增加 PnP、IPPE 分支、EKF 当前状态和 Aimer 未来状态的重投影诊断；
 - 固定位置小陀螺的三轮 ROI 对照中，旋转中心 x 的典型摆动约由
@@ -54,8 +68,8 @@ ROI 测试样本数减少，且测试不是严格同步的 A/B 实验，不能�
 
 当前仍未解决：
 
-- 探针尚未将动态 `odom -> gimbal_link` 姿态送入 Solver，当前 world 坐标
-  仍主要按云台局部坐标解释；
+- 尚未验证底盘平移和实车 IMU 姿态；模拟器的 `odom` 目前与云台原点重合，
+  本阶段只验证其动态旋转；
 - TF 真值对照下的 PnP 距离误差尾部仍约为 0.3～0.4 m，少数帧的
   `current_ekf_error` 仍可能达到数百像素；
 - 双装甲板小陀螺中的少量错误关联、姿态分支异常和中心跳变还没有完全定位；
@@ -67,6 +81,16 @@ ROI 测试样本数减少，且测试不是严格同步的 A/B 实验，不能�
 
 因此当前项目仍处于仿真验证阶段：可以输出并分析瞄准结果，但还不能宣称
 已经达到小陀螺和云台运动场景下的稳定击打要求。
+
+## Tracker 后验距离门限回归（2026-09-30）
+
+Tracker 对通过关联的观测复用 `association_max_distance_error`（`demo.yaml`
+中为 0.45 m）检查 EKF 更新后的装甲距离；越界时恢复本帧更新前的预测状态。
+这只约束后验距离残差，不限制切向中心移动，也不解决断帧后的目标重建。
+
+旋转目标的三轮 30 秒回归中，Tracker 分别重建 2、14、9 次；同一目标世代
+仍可观察到约 0.41～0.60 m 的单帧中心跳变。与旧三轮结果并非同步 A/B，
+目前只能确认后验距离未越过该门限，不能宣称跟踪稳定性已经改善。
 
 ## 相机标定板模式
 
@@ -96,6 +120,12 @@ python3 tools/sim_tracker_analyzer.py --duration 30
 
 建议在采集开始后先让目标静止 5～10 秒，再开启小陀螺。脚本会根据角速度自动分类，并输出中心峰峰值、半径波动、ID 切换跳变量、关联门限拒绝比例和诊断结论。
 
+探针还会在每个已处理帧发布 `/sim_aim/tracker_status`。该 Topic 即使 Tracker
+暂时没有有效 target 也会发布，用于统计 `temp_lost` 的连续帧数、持续时间、
+Tracker 世代变化和状态消息序列缺口。分析脚本会同时订阅该 Topic；状态数据不会
+混入装甲板几何误差统计。若状态消息序列存在缺口，应先检查 DDS/QoS，再解释
+连续丢失帧数。
+
 报告中的 `Aimer 时间对齐预测` 会把时刻 `t` 生成的未来瞄准点，与
 `t + prediction_dt` 附近相同 Tracker 世代、相同装甲板模型 ID 的已接收 PnP
 观测进行比较。`不预测位置误差` 使用该瞄准 ID 在时刻 `t` 的模型位置作为基线，
@@ -120,12 +150,13 @@ EKF 统计。其他目标仍使用本帧距离观测噪声的一个标准差。�
 位置误差和距离误差，超限时保留预测状态而不吸收坏观测。为避免远距离下角度归一化
 掩盖较大的米制误差，`association_max_position_error` 和
 `association_max_distance_error` 还分别限制三维位置、距离残差，单位为 m。
-`association_max_angle_error` 单独限制装甲板姿态与视线方位的综合误差，单位为 rad，
-用于拒绝位置误差尚未超限但朝向明显错误的观测。
+`association_max_angle_error` 仅用于记录固定角度诊断结果，单位为 rad，不再单独拒绝
+观测。实际关联接受由综合分数、位置/距离绝对误差和 `S = HPHᵀ + R` 的 Mahalanobis
+门控共同决定；角度误差仍参与综合分数，因此明显错误的姿态仍会被拒绝。
 
 Tracker 还会计算 4 维观测创新的马氏距离：`S = HPHᵀ + R`，关联优先选择马氏距离
-最小的模型装甲板。`association_max_mahalanobis_distance` 是无量纲统计门限；原有
-角度、位置和距离绝对误差门限仍保留，作为安全门和诊断项。它不是固定处理延迟，
+最小的模型装甲板。`association_max_mahalanobis_distance` 是无量纲统计门限；位置
+和距离绝对误差门限仍保留作为安全门；固定角度门降级为诊断项。它不是固定处理延迟，
 也不替代基于真实时间戳的延迟测量与预测时间对齐。
 
 该指标使用仿真视觉观测作为近似真值，适合比较预测前后的相对效果；它仍包含 PnP
@@ -156,6 +187,30 @@ Tracker 还会计算 4 维观测创新的马氏距离：`S = HPHᵀ + R`，关�
 `accepted_pnp_error` 是已接收框的原始 PnP 回投影误差；
 `accepted_model_error` 是该框的 PnP 位置加当前固定俯仰角模型的回投影误差。
 两者与 `current_ekf_error` 使用同一个框，仅用于区分 PnP、姿态模型和滤波误差。
+
+### PnP-TF 几何审计
+
+`/sim_aim/debug` 会额外发布 `accepted_corner_*`、同帧
+`association_primary_truth_*` 和完整 `gimbal_tf_q*`。这些字段只用于离线审计，
+不参与 Tracker 或 Aimer 决策。可以把保存的逐行 JSON 样本交给几何审计脚本，
+扫描装甲板宽度和灯条长度对 PnP-TF 真值残差的影响：
+
+```bash
+python3 tools/sim_pnp_geometry_audit.py \
+    --input /tmp/sim_debug_samples.jsonl \
+    --config configs/demo.yaml \
+    --armor-type small \
+    --output /tmp/sim_pnp_geometry_audit.json
+```
+
+审计脚本会同时输出当前配置中的 `0.135 m × pnp_lightbar_length` 基线和扫描得到的最优组合。
+`pnp_lightbar_length` 是 PnP 物点中的灯条有效长度，单位为 m。未声明时默认值为
+`0.056`，保持实车配置兼容；Daedalus 的 `configs/demo.yaml` 使用 `0.060`，因为模型中
+可见灯条高度约为 59.6 mm。该参数只影响 PnP 物点，不改变 YOLO 输出或 TF。
+审计脚本的主 `best` 指标按样本中的 `association_primary_optimized_yaw` 选择
+与在线 Tracker 接近的 IPPE 分支；报告同时保留 `truth_best_*`，仅用于判断
+“是否存在某个姿态分支能够解释 TF 真值”，不能把它当作在线改进结果。只有在多个
+视角和距离下重复确认后，才可以考虑修改 `solver.cpp` 中的 PnP 物点常量。
 
 `measurement_bearing_variance` 是方位观测噪声方差（rad²），同时用于关联创新
 协方差和 EKF 更新。仅仿真 `demo.yaml` 暂用 `4e-5` 做对照实验；未配置时保持

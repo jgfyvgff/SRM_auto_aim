@@ -215,12 +215,19 @@ bool Target::update(const Armor & armor)
   return update(armor, match_armor(armor).id);
 }
 
-bool Target::update(const Armor & armor, int id)
+bool Target::update(
+  const Armor & armor, int id, std::optional<double> max_posterior_distance_error)
 {
+  if (
+    max_posterior_distance_error &&
+    (!std::isfinite(*max_posterior_distance_error) || *max_posterior_distance_error <= 0.0))
+  {
+    throw std::invalid_argument("Invalid posterior distance error limit");
+  }
   if (id < 0 || id >= armor_num_) return false;
 
   // 状态机计数只在 EKF 更新成功后提交；失败帧不应伪装成一次装甲切换。
-  if (!update_ypda(armor, id)) return false;
+  if (!update_ypda(armor, id, max_posterior_distance_error)) return false;
 
   if (id != 0) jumped = true;//如果id不为0，说明跳过了
 
@@ -276,7 +283,8 @@ void Target::apply_geometry_constraint()
   constrain_state(9, constraint.radius_delta, constraint.radius_delta_variance);
 }
 
-bool Target::update_ypda(const Armor & armor, int id)
+bool Target::update_ypda(
+  const Armor & armor, int id, std::optional<double> max_posterior_distance_error)
 {
   const double prior_error =
     (armor.xyz_in_world - h_armor_xyz(ekf_.x, id)).norm();
@@ -315,6 +323,16 @@ bool Target::update_ypda(const Armor & armor, int id)
   apply_geometry_constraint();
   const double posterior_error =
     (armor.xyz_in_world - h_armor_xyz(ekf_.x, id)).norm();
+  // 关联前后的距离必须服从同一门限；仅靠三维残差增长检查会放过
+  // 后验距离已经越界的更新。此检查不约束纯切向中心移动。
+  bool posterior_distance_limit_exceeded = false;
+  if (max_posterior_distance_error) {
+    const double posterior_distance_error = std::abs(
+      armor.ypd_in_world[2] - tools::xyz2ypd(h_armor_xyz(ekf_.x, id))[2]);
+    posterior_distance_limit_exceeded =
+      !std::isfinite(posterior_distance_error) ||
+      posterior_distance_error > *max_posterior_distance_error;
+  }
   // 仿真中机械尺寸已知时，一次更新若让三维残差恶化超过整个装甲旋转直径，
   // 就不能再用相邻装甲切换解释；其他目标保持原距离观测噪声判据。
   const double allowed_growth = geometry_constraint_
@@ -326,6 +344,7 @@ bool Target::update_ypda(const Armor & armor, int id)
                                   : std::sqrt(R(2, 2));
   if (
     !ekf_.x.allFinite() || !ekf_.P.allFinite() || !std::isfinite(posterior_error) ||
+    posterior_distance_limit_exceeded ||
     posterior_error > prior_error + allowed_growth)
   {
     ekf_ = prior_ekf;

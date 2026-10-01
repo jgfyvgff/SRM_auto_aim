@@ -37,10 +37,13 @@ min_confidence: 0.8
 min_detect_count: 5
 max_temp_lost_count: 15
 outpost_max_temp_lost_count: 75
+# 最大可信预测间隔，单位为 s。0.1~0.3 s 的短时采集抖动继续由 EKF 使用真实 dt 处理；
+# 超过该边界才进入 lost，避免单次图像延迟破坏小陀螺的装甲板相位连续性。
+tracker_max_prediction_gap: 0.3
 
 # 同一帧只允许综合关联分数最低的一个同名装甲板更新 EKF，单位为等效 rad。
 # 分数 = 装甲板角度误差 + 位置误差视线角 + 距离误差视线角。
-# 装甲板姿态与视线方位综合误差门限，单位为 rad，约束明显错误的朝向匹配。
+# 装甲板姿态与视线方位诊断阈值，单位为 rad；不单独拒绝 EKF 协方差门控通过的观测。
 association_max_angle_error: 0.35
 association_max_score: 0.8
 # 远距离下角度归一化可能掩盖较大的空间误差，绝对误差单位为 m。
@@ -84,6 +87,9 @@ vid_pid: "2bdf:0001"
 # Daedalus 模拟器相机参数，来自 /camera_info：
 # 图像分辨率为 1440x1080，fx=fy=1303.675283，cx=720，cy=540。
 # 模拟器没有镜头畸变。
+# Daedalus GLB 中可见灯条高度约 59.6 mm；YOLOv5 角点联合审计使用 60 mm。
+# 其他配置未声明时仍使用 Solver 的实车默认值 56 mm。
+pnp_lightbar_length: 0.060
 camera_matrix: [
   1303.675283386667, 0, 720.0,
   0, 1303.675283386667, 540.0,
@@ -104,8 +110,8 @@ R_camera2gimbal: [
 ]
 t_camera2gimbal: [0.137378988, 0.002016783, 0.152578746]
 
-# 当前探针还没有把 odom -> gimbal_link 的动态姿态送入 Solver，
-# 因此先使用单位旋转，world 坐标暂按云台局部坐标解释。
+# 仿真探针按图像采集时间读取 odom -> gimbal_link 的动态姿态。
+# 这里只保留 gimbal_link 与 IMU body 的轴标定；模拟器中二者轴向一致。
 R_gimbal2imubody: [
   1, 0, 0,
   0, 1, 0,

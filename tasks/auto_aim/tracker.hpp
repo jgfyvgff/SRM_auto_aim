@@ -22,7 +22,7 @@ struct AssociationCandidateDebug
   int model_id = -1;
   bool gate_passed = false;
   bool accepted = false;
-  // 分别记录各安全门限，便于判断拒绝原因；不参与控制决策。
+  // 分别记录各安全门限，便于判断拒绝原因；固定 angle 门仅作诊断。
   bool angle_gate_passed = false;
   bool score_gate_passed = false;
   bool position_gate_passed = false;
@@ -48,6 +48,11 @@ struct AssociationCandidateDebug
   double predicted_distance = 0.0;
   double orientation_error = 0.0;
   double bearing_error = 0.0;
+  // match.angle_error 的最终值，单位为 rad；用于定位角度门限失败。
+  double angle_error = 0.0;
+  // raw/optimized yaw 相对当前预测装甲板 yaw 的误差，单位为 rad。
+  double raw_yaw_prediction_error = 0.0;
+  double optimized_yaw_prediction_error = 0.0;
   double raw_yaw = 0.0;
   double optimized_yaw = 0.0;
   double yaw_correction = 0.0;
@@ -58,6 +63,10 @@ struct AssociationCandidateDebug
 // 每帧最多保留两个最优候选用于诊断，但实际只允许一个候选更新 EKF。
 struct AssociationDebug
 {
+  // matching_detection_count 表示输入中与当前目标同名同类型的检测数量。
+  // gate_passed_count 表示这些检测中至少有一个模型 ID 通过全部关联门限的数量。
+  int matching_detection_count = 0;
+  int gate_passed_count = 0;
   int candidate_count = 0;
   int accepted_count = 0;
   std::array<AssociationCandidateDebug, 2> candidates{};
@@ -74,6 +83,8 @@ public:
   std::string state() const;
   const AssociationDebug & association_debug() const;
   std::uint64_t target_generation() const;
+  int temp_lost_count() const;
+  int max_temp_lost_count() const;
 
   std::list<Target> track(
     std::list<Armor> & armors, std::chrono::steady_clock::time_point t,
@@ -98,7 +109,7 @@ private:
   double standard_radius_variance_;
   double standard_radius_delta_variance_;
   double standard_height_delta_variance_;
-  // 关联误差门限，单位为 rad；超限观测只保留为诊断候选，不进入 EKF。
+  // 固定角度诊断阈值，单位为 rad；实际接受由综合分数和 EKF 协方差门控决定。
   double association_max_angle_error_;
   // 综合关联分数门限，单位为等效 rad；用于拒绝其他机器人同名装甲板。
   double association_max_score_;
@@ -109,6 +120,8 @@ private:
   double association_max_mahalanobis_distance_;
   // 配置值仅改变方位观测噪声；未配置时保持原实现。
   double measurement_bearing_variance_;
+  // 最大可信预测间隔，单位为 s；短时抖动由 EKF 使用真实 dt 吸收。
+  double max_prediction_gap_;
   std::string state_, pre_state_;
   Target target_;
   std::chrono::steady_clock::time_point last_timestamp_;
