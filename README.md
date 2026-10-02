@@ -112,6 +112,43 @@ center_distance_mm: 25
 
 配置默认为 `circles`，因此旧的圆点阵采集数据不需要迁移。
 
+## 实车相机内参标定
+
+采集程序只保存成功检测到完整标定板的帧；按 `s` 保存，按 `q` 退出。
+相机返回空帧或当前帧未检测到标定板时不会生成样本。
+
+只做相机内参标定时，使用 `--camera-only=1` 跳过 CAN/IMU：
+
+```bash
+./build/capture \
+  -c configs/calibration.yaml \
+  -o assets/real_intrinsics \
+  --camera-only=1
+```
+
+普通模式仍然需要 `can0`，用于同时保存相机图像和 IMU 四元数，供手眼标定使用。
+
+```bash
+./build/capture \
+  -c configs/calibration.yaml \
+  -o assets/real_intrinsics
+```
+
+离线计算内参时，程序会检查图像分辨率一致性、有效样本数量，并输出
+RMS、逐帧平均误差、P95 和最大误差：
+
+```bash
+./build/calibrate_camera \
+  assets/real_intrinsics \
+  -c configs/calibration.yaml \
+  --min-samples=12 \
+  --show=0 \
+  -o configs/intrinsics_real.yaml
+```
+
+`intrinsics_real.yaml` 只包含相机内参和畸变参数，不包含相机到云台的手眼外参，
+因此不会直接覆盖 `configs/demo.yaml`。手眼标定仍需在完成内参和时间同步检查后单独执行。
+
 启动 `sim_detector_probe` 后，可使用独立脚本订阅 `/sim_aim/debug`，自动比较静止与小陀螺阶段的车辆中心、速度、半径和装甲板 ID 切换情况：
 
 ```bash
