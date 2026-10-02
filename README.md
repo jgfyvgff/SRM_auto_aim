@@ -110,7 +110,7 @@ pattern_rows: 6
 center_distance_mm: 25
 ```
 
-配置默认为 `circles`，因此旧的圆点阵采集数据不需要迁移。
+配置缺少 `pattern_type` 时默认使用 `circles`，因此旧的圆点阵配置仍可读取。
 
 ## 实车相机内参标定
 
@@ -121,17 +121,19 @@ center_distance_mm: 25
 
 ```bash
 ./build/capture \
-  -c configs/calibration.yaml \
-  -o assets/real_intrinsics \
+  configs/calibration.yaml \
+  --output-folder=assets/real_intrinsics \
   --camera-only=1
 ```
 
-普通模式仍然需要 `can0`，用于同时保存相机图像和 IMU 四元数，供手眼标定使用。
+默认姿态来源仍为 `can`，用于兼容旧的 CAN 图像/IMU 数据采集。实车 USB CDC
+请使用下一节的 `--pose-source=serial`，不要使用默认 CAN 模式。
 
 ```bash
 ./build/capture \
-  -c configs/calibration.yaml \
-  -o assets/real_intrinsics
+  configs/calibration.yaml \
+  --pose-source=can \
+  --output-folder=assets/handeye_can
 ```
 
 离线计算内参时，程序会检查图像分辨率一致性、有效样本数量，并输出
@@ -140,14 +142,95 @@ RMS、逐帧平均误差、P95 和最大误差：
 ```bash
 ./build/calibrate_camera \
   assets/real_intrinsics \
-  -c configs/calibration.yaml \
+  --config-path=configs/calibration.yaml \
   --min-samples=12 \
   --show=0 \
-  -o configs/intrinsics_real.yaml
+  --output=configs/intrinsics_real.yaml
 ```
 
 `intrinsics_real.yaml` 只包含相机内参和畸变参数，不包含相机到云台的手眼外参，
 因此不会直接覆盖 `configs/demo.yaml`。手眼标定仍需在完成内参和时间同步检查后单独执行。
+
+## USB CDC 云台姿态手眼标定
+
+编译及无硬件测试：
+
+```bash
+cmake -S . -B build
+cmake --build build --target capture calibrate_handeye gimbal_pose_test handeye_support_test srm_auto_aim_protocol_test srm_auto_aim_transport_test -j2
+ctest --test-dir build --output-on-failure -R '^(gimbal_pose_test|handeye_support_test|srm_auto_aim_protocol_test|srm_auto_aim_transport_test)$'
+```
+
+固定标定板和底盘，改变云台的 yaw、pitch，分别停稳后按 `s` 保存，按 `q` 退出。
+与内参采集不同，手眼采集过程中**标定板不能移动**；也不能将原来的内参照片补配
+当前姿态。建议保存 15～25 个不同朝向，避免全部只转 yaw 或反复保存同一姿态。
+相机倒装时保持原始图像方向，由标定求解安装旋转；不要临时旋转部分样本。
+
+```bash
+./build/capture configs/calibration.yaml \
+  --pose-source=serial \
+  --serial-port=/dev/ttyACM0 \
+  --output-folder=assets/real_handeye
+```
+
+串口由 `SerialGimbalPose` 独占，复用已验证的 `SrmAutoAimTransport` 接收通道，
+采集工具不会发送云台角度或开火指令。构造后开始接收，后台异常传回主线程；
+退出时先停止并等待接收线程，再关闭串口。Fake 字节流与真实串口走相同协议解析。
+
+反馈角度按度、右手系 ZYX（`Rz(yaw) * Ry(pitch) * Rx(roll)`）转换为
+`R_gimbal2world`：`p_world = R_gimbal2world * p_gimbal`。这里使用你确认的云台
+姿态，不再乘旧 CAN 路径的 `R_gimbal2imubody`。下位机仍需与此轴方向和欧拉角顺序
+一致；程序不会自动猜测符号或补偿某个轴。
+
+接收缓存最多 256 个姿态，满时丢弃最旧项。同一批串口帧没有独立源时间戳，
+仅保留最后一帧并记录主机 `steady_clock` 接收时间。按 `s` 时，要求图像时间
+两侧存在姿态，在四元数上插值，并检查图像前的稳定窗口：
+
+| 参数 | 默认值 | 含义 |
+|---|---:|---|
+| `--stable-ms` | 500 ms | 图像前必须覆盖的停稳窗口 |
+| `--pose-gap-ms` | 100 ms | 最大反馈间隔、最新反馈年龄和等待后侧姿态的上限 |
+| `--stable-deg` | 0.5° | 窗口内姿态相对匹配姿态的最大旋转偏差 |
+
+这些是拒收门限，不是固定延迟补偿。当前相机时间戳为 SDK 返回图像后的主机时间，
+串口反馈没有下位机采样时间，因而此流程用于**停稳采集**，不能声称实现了曝光时刻
+与 IMU 的精确硬件同步。反馈缺失、过期、间隔过大或仍在运动时，本次保存被拒绝。
+
+照片以编号 JPG 保存，对应 TXT 第一行为 `w x y z`，第二行为 `gimbal`，随后记录
+图像主机时间、姿态插值间隔和稳定角偏差。旧 CAN 文件的第二行是 `imubody`；
+没有第二行的历史文件按旧 CAN 数据处理。各来源必须使用独立目录。
+重新采集会寻找空闲编号，已有照片和姿态不会覆盖；写入失败的 `.pending.*`
+文件保留供检查，不参与离线标定。
+
+读取独立内参并计算外参：
+
+```bash
+./build/calibrate_handeye assets/real_handeye \
+  --config-path=configs/calibration.yaml \
+  --intrinsics=configs/intrinsics_real.yaml \
+  --min-samples=12 \
+  --show=0 \
+  --output=configs/handeye_real.yaml
+```
+
+程序检查配对姿态、四元数、分辨率、内参和有效样本数，允许图像编号中间有空缺。
+通过相对转角和旋转轴奇异值检查拒收近似单轴数据；默认最小转角为 5°，第二/第一
+奇异值下限为 0.05，可用 `--min-rotation-deg` 和 `--min-axis-ratio` 配置。
+满足采集条件后使用 OpenCV Park 手眼算法，输出 `R_camera2gimbal`（按行排列）
+和 `t_camera2gimbal`（米）。该旋转的方向是相机 optical → 云台。
+结果文件已存在时会拒绝覆盖，请使用新文件名保存新一次标定。
+
+此版本沿用**云台参考原点固定**的运动模型，将每张样本的 `t_gimbal2world` 设为零。
+只有姿态反馈不能提供平移：若 yaw/pitch 轴不共点使参考原点移动，或底盘移动，
+需补充机构运动学/平移测量，不能把这种误差归入相机安装外参。
+程序同时输出标定板在 world 中的位置及朝向离散度（RMS、最大值），用于检查
+`T_world_gimbal * T_gimbal_camera * T_camera_board` 是否一致；这是采集样本的内部
+一致性指标，不是实车精度真值验收。程序不会改写已完成的内参或自瞄运行配置。
+
+实现边界：`gimbal_pose.hpp` 管理纯时间/稳定性逻辑，`serial_gimbal_pose.*` 管理串口
+及线程，`handeye_support.*` 管理姿态格式、坐标变换和求解，两个入口负责采集/离线流程。
+自动化测试覆盖缓存丢旧策略、无数据/过期/运动拒收、角度跨 ±180°、串口分包、后台异常、
+重复停止、资源释放、零发送、旧 CAN 格式，以及已知外参（含相机倒装）的合成恢复。
 
 启动 `sim_detector_probe` 后，可使用独立脚本订阅 `/sim_aim/debug`，自动比较静止与小陀螺阶段的车辆中心、速度、半径和装甲板 ID 切换情况：
 

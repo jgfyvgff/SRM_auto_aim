@@ -138,7 +138,7 @@ Bytes encode(const FeedbackFrame & frame)
   append_i16_le(bytes, kShootRecordId);//开火记录ID
   append_f32_le(bytes, frame.bullet_speed_mps);
   return bytes;
-}
+}//imu获取的，Yaw、Pitch、Roll，可以用这个数值来做TF变换创建一个world_to_gimbal的变换
 
 bool decode(const Bytes & bytes, CommandFrame & output)
 {
