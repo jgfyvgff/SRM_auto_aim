@@ -89,7 +89,7 @@ inline bool detect_pattern(
     cv::cvtColor(image, gray, cv::COLOR_BGR2GRAY);
   }
 
-  const auto flags = cv::CALIB_CB_ADAPTIVE_THRESH | cv::CALIB_CB_NORMALIZE_IMAGE;
+  const auto flags = cv::CALIB_CB_ADAPTIVE_THRESH | cv::CALIB_CB_NORMALIZE_IMAGE | cv::CALIB_CB_FAST_CHECK;
   const auto found = cv::findChessboardCorners(gray, pattern.size, points, flags);
   if (found) {
     // 棋盘格角点需要亚像素优化；圆点阵分支保持 OpenCV 原有输出行为。

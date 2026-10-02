@@ -63,6 +63,14 @@ void capture_loop(
     } else {
       tools::draw_text(img_with_ypr, "Camera only", {40, 40}, {0, 255, 0});
     }
+    // 先显示原始画面，避免棋盘格检测耗时导致用户误以为相机没有输出。
+    cv::Mat preview;
+    cv::resize(img_with_ypr, preview, {}, 0.5, 0.5);
+    cv::imshow("Press s to save, q to quit", preview);
+    auto key = cv::waitKey(1);
+    if (key == 'q')
+      break;
+
 
     std::vector<cv::Point2f> centers_2d;
     auto success = calibration::detect_pattern(img, pattern, centers_2d);
@@ -71,7 +79,7 @@ void capture_loop(
 
     // 按“s”保存图片和对应四元数，按“q”退出程序
     cv::imshow("Press s to save, q to quit", img_with_ypr);
-    auto key = cv::waitKey(1);
+    key = cv::waitKey(1);
     if (key == 'q')
       break;
     else if (key != 's')
