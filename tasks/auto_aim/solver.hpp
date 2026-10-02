@@ -44,6 +44,13 @@ public:
   std::vector<cv::Point2f> reproject_armor(
     const Eigen::Vector3d & xyz_in_world, double yaw, ArmorType type, ArmorName name) const;
 
+  // 使用 TF 提供的完整装甲板姿态，将物点四角投影到图像。
+  // 仅供仿真几何审计，不参与 Tracker 或 Aimer 决策。
+  std::vector<cv::Point2f> reproject_armor_pose(
+    const Eigen::Vector3d & xyz_in_world,
+    const Eigen::Matrix3d & R_armor2world,
+    ArmorType type) const;
+
   double oupost_reprojection_error(Armor armor, const double & picth);
 
   std::vector<cv::Point2f> world2pixel(const std::vector<cv::Point3f> & worldPoints);

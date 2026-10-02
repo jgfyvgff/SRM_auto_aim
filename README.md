@@ -212,6 +212,14 @@ python3 tools/sim_pnp_geometry_audit.py \
 “是否存在某个姿态分支能够解释 TF 真值”，不能把它当作在线改进结果。只有在多个
 视角和距离下重复确认后，才可以考虑修改 `solver.cpp` 中的 PnP 物点常量。
 
+小陀螺时多个 `armor_N` 可能在世界坐标中距离接近，因此探针按真值中心投影到图像后
+与检测中心的像素误差选择真值身份；`association_primary_truth_match_margin` 表示
+第一、第二投影候选的像素误差差值，不再表示世界坐标最近邻的距离差。
+
+`association_primary_truth_corner_error_0..3` 和对应的 `truth_corner_error` 使用 TF 发布的
+完整装甲板姿态，将当前装甲板物点四角投影后与同一检测框逐点比较。它们只用于区分
+角点点序、相机外参、装甲板尺寸和 PnP 深度误差，不参与 Tracker 或 Aimer 决策。
+
 `measurement_bearing_variance` 是方位观测噪声方差（rad²），同时用于关联创新
 协方差和 EKF 更新。仅仿真 `demo.yaml` 暂用 `4e-5` 做对照实验；未配置时保持
 原值 `4e-3`。是否保留该值取决于同场景下的误差、拒绝率和重初始化次数。

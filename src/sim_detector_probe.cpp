@@ -1,6 +1,7 @@
 #include <opencv2/opencv.hpp>
 #include <nlohmann/json.hpp>
 #include <rclcpp/rclcpp.hpp>
+#include <rm_interfaces/msg/gimbal_cmd.hpp>
 #include <sensor_msgs/msg/image.hpp>
 #include <std_msgs/msg/string.hpp>
 #include <tf2_ros/transform_listener.h>
@@ -21,6 +22,7 @@
 #include "tasks/auto_aim/solver.hpp"
 #include "tasks/auto_aim/tracker.hpp"
 #include "tasks/auto_aim/aimer.hpp"
+#include "tasks/auto_aim/shooter.hpp"
 #include "tools/math_tools.hpp"
 #include "src/sim_capture_time.hpp"
 #include "src/sim_gimbal_tf.hpp"
@@ -35,6 +37,7 @@ public:
     solver_(tracker_config_path),
     tracker_(tracker_config_path, solver_),
     aimer_(tracker_config_path),
+    shooter_(tracker_config_path),
     tf_buffer_(get_clock()),
     // 使用 tf2 独立接收线程，避免 YOLO/PnP/窗口刷新阻塞 /tf 缓冲更新。
     // Listener 成员声明在 Buffer 后面，析构时先停止线程，再销毁 Buffer。
@@ -48,6 +51,9 @@ public:
       "/sim_aim/debug", rclcpp::QoS(100).best_effort());
     tracker_status_publisher_ = create_publisher<std_msgs::msg::String>(
       "/sim_aim/tracker_status", rclcpp::QoS(100).best_effort());
+    gimbal_command_publisher_ =
+      create_publisher<rm_interfaces::msg::GimbalCmd>(
+        "/rm_gimbal/cmd", rclcpp::QoS(10).best_effort());
 
     image_subscription_ = create_subscription<sensor_msgs::msg::Image>(
       "/image_raw", rclcpp::SensorDataQoS(),
@@ -170,20 +176,40 @@ private:
     return total_error / 4.0;
   }
 
+  // 计算检测四角与 TF 真值四角的平均像素误差；只用于离线几何审计。
+  static double mean_corner_error(
+    const std::vector<cv::Point2f> & observed_points,
+    const std::vector<cv::Point2f> & truth_points)
+  {
+    if (observed_points.size() != 4 || truth_points.size() != 4) {
+      return -1.0;
+    }
+
+    double total_error = 0.0;
+    for (std::size_t i = 0; i < observed_points.size(); ++i) {
+      total_error += cv::norm(observed_points[i] - truth_points[i]);
+    }
+    return total_error / 4.0;
+  }
+
   struct TruthArmorPose
   {
     int frame_id = -1;
     Eigen::Vector3d position = Eigen::Vector3d::Zero();
+    Eigen::Matrix3d orientation = Eigen::Matrix3d::Identity();
     double yaw = 0.0;
     double distance = 0.0;
     double position_error = 0.0;
     double second_position_error = std::numeric_limits<double>::infinity();
+    double image_error = std::numeric_limits<double>::infinity();
+    double second_image_error = std::numeric_limits<double>::infinity();
   };
 
-  // 将候选的 odom 坐标与模拟器发布的 armor_N 真值逐一比较。
+  // 将候选中心投影到图像后与模拟器发布的 armor_N 真值逐一比较。
   // 这里只用于诊断，不把真值反馈给 Tracker，避免仿真真值污染算法。
   std::optional<TruthArmorPose> lookup_truth_armor(
-    const rclcpp::Time & stamp, const Eigen::Vector3d & observed)
+    const rclcpp::Time & stamp, const Eigen::Vector3d & observed,
+    const cv::Point2f & observed_center)
   {
     if (stamp.nanoseconds() <= 0 || !observed.allFinite()) {
       return std::nullopt;
@@ -209,20 +235,45 @@ private:
         {
           continue;
         }
+        const auto normalized_orientation = orientation.normalized();
 
         const double position_error = (observed - position).norm();
-        if (!nearest || position_error < nearest->position_error) {
+        const auto projected_center = solver_.world2pixel({cv::Point3f(
+          static_cast<float>(position.x()),
+          static_cast<float>(position.y()),
+          static_cast<float>(position.z()))});
+        if (projected_center.size() != 1) {
+          continue;
+        }
+        const double image_error = cv::norm(observed_center - projected_center.front());
+
+        // 小陀螺时不同装甲板可能在世界坐标中很接近，世界坐标最近邻会误配。
+        // 图像投影同时受当前云台姿态和相机模型约束，更适合判断检测对应的真值身份。
+        if (!nearest || image_error < nearest->image_error ||
+            (image_error == nearest->image_error &&
+            position_error < nearest->position_error))
+        {
           const auto previous_best_error =
             nearest ? nearest->position_error : std::numeric_limits<double>::infinity();
+          const auto previous_best_image_error =
+            nearest ? nearest->image_error : std::numeric_limits<double>::infinity();
           nearest = TruthArmorPose{
             frame_id,
             position,
-            tools::eulers(orientation.normalized().toRotationMatrix(), 2, 1, 0)[0],
+            normalized_orientation.toRotationMatrix(),
+            tools::eulers(normalized_orientation.toRotationMatrix(), 2, 1, 0)[0],
             position.norm(),
             position_error,
-            previous_best_error};
-        } else if (position_error < nearest->second_position_error) {
-          nearest->second_position_error = position_error;
+            previous_best_error,
+            image_error,
+            previous_best_image_error};
+        } else {
+          if (position_error < nearest->second_position_error) {
+            nearest->second_position_error = position_error;
+          }
+          if (image_error < nearest->second_image_error) {
+            nearest->second_image_error = image_error;
+          }
         }
       } catch (const tf2::TransformException &) {
         // 仿真器不一定同时发布所有 armor_N，缺失帧不是算法错误。
@@ -436,9 +487,14 @@ private:
     tracker_status_message.data = tracker_status.dump();
     tracker_status_publisher_->publish(tracker_status_message);
 
-    constexpr double sim_bullet_speed_mps = 23.0;
+    // 必须与模拟器 projectile.speed=25.0 m/s 保持一致，
+    // 否则自瞄预测弹道和实际弹丸轨迹会产生系统性偏差。
+    constexpr double sim_bullet_speed_mps = 25.0;
     const auto aimer_start = std::chrono::steady_clock::now();
-    const auto command = aimer_.aim(targets, timestamp, sim_bullet_speed_mps);
+    auto command = aimer_.aim(targets, timestamp, sim_bullet_speed_mps);
+    // Shooter 根据上一帧命令、当前云台 TF 和瞄准点稳定性决定是否开火。
+    // 这里不强制 fire_advice，保持与真实自瞄链路相同的开火判定。
+    command.shoot = shooter_.shoot(command, aimer_, targets, gimbal_ypr);
     const auto aimer_end = std::chrono::steady_clock::now();
 
     std::vector<cv::Point2f> current_reprojected_points;
@@ -546,6 +602,24 @@ private:
         }
       }
     }
+
+    // 将 Aimer + Shooter 的最终结果送入模拟器真实订阅接口。
+    // command 内部角度为弧度，rm_interfaces/GimbalCmd 使用角度。
+    // distance=-1.0 表示当前没有有效目标，模拟器应清除旧瞄准状态。
+    rm_interfaces::msg::GimbalCmd gimbal_command;
+    gimbal_command.header.stamp = get_clock()->now();
+    gimbal_command.header.frame_id = "gimbal_link";
+    // Aimer 内部约定抬头为负，Daedalus GimbalCmd 约定 pitch>0 表示抬头。
+    gimbal_command.pitch = -command.pitch * 180.0 / CV_PI;
+    gimbal_command.yaw = command.yaw * 180.0 / CV_PI;
+    gimbal_command.yaw_diff = 0.0;
+    gimbal_command.pitch_diff = 0.0;
+    // 模拟器不接收 command.control，只用 distance=-1.0 表示当前没有有效解。
+    const bool has_valid_aim =
+      command.control && !targets.empty() && target_distance >= 0.0;
+    gimbal_command.distance = has_valid_aim ? target_distance : -1.0;
+    gimbal_command.fire_advice = command.shoot;
+    gimbal_command_publisher_->publish(gimbal_command);
 
     RCLCPP_INFO_THROTTLE(
       get_logger(), *get_clock(), 1000,
@@ -762,7 +836,7 @@ private:
         plot_data["association_gate_passed_count"] = association.gate_passed_count;
         plot_data["association_candidate_count"] = association.candidate_count;
         plot_data["association_accepted_count"] = association.accepted_count;
-        auto add_association_candidate = [this, &plot_data, &frame_ros_stamp](
+        auto add_association_candidate = [this, &plot_data, &frame_ros_stamp, &tracker_armors, &target](
                                            const std::string & prefix,
                                            const auto_aim::AssociationCandidateDebug & candidate) {
           if (candidate.model_id < 0) return;
@@ -810,8 +884,15 @@ private:
           const auto truth = (candidate.accepted || !candidate.gate_passed)
             ? lookup_truth_armor(
               frame_ros_stamp,
-              Eigen::Vector3d(candidate.observed_x, candidate.observed_y, candidate.observed_z))
-            : std::nullopt;
+              Eigen::Vector3d(candidate.observed_x, candidate.observed_y, candidate.observed_z),
+              cv::Point2f(
+                static_cast<float>(candidate.image_x),
+                static_cast<float>(candidate.image_y)))
+              : std::nullopt;
+          plot_data[prefix + "_truth_corner_error"] = -1.0;
+          for (int corner_id = 0; corner_id < 4; ++corner_id) {
+            plot_data[prefix + "_truth_corner_error_" + std::to_string(corner_id)] = -1.0;
+          }
           plot_data[prefix + "_truth_valid"] = truth ? 1 : 0;
           if (truth) {
             plot_data[prefix + "_truth_frame_id"] = truth->frame_id;
@@ -823,8 +904,28 @@ private:
             plot_data[prefix + "_truth_position_error"] = truth->position_error;
             plot_data[prefix + "_truth_second_position_error"] =
               truth->second_position_error;
+            plot_data[prefix + "_truth_image_error"] = truth->image_error;
+            plot_data[prefix + "_truth_second_image_error"] =
+              truth->second_image_error;
             plot_data[prefix + "_truth_match_margin"] =
-              truth->second_position_error - truth->position_error;
+              truth->second_image_error - truth->image_error;
+            const cv::Point2f observed_center(
+              static_cast<float>(candidate.image_x),
+              static_cast<float>(candidate.image_y));
+            const auto * matched_armor = find_associated_armor(
+              tracker_armors, target.name, target.armor_type, observed_center);
+            if (matched_armor != nullptr) {
+              const auto truth_points = solver_.reproject_armor_pose(
+                truth->position, truth->orientation, target.armor_type);
+              if (truth_points.size() == 4) {
+                plot_data[prefix + "_truth_corner_error"] =
+                  mean_corner_error(matched_armor->points, truth_points);
+                for (std::size_t corner_id = 0; corner_id < truth_points.size(); ++corner_id) {
+                  plot_data[prefix + "_truth_corner_error_" + std::to_string(corner_id)] =
+                    cv::norm(matched_armor->points[corner_id] - truth_points[corner_id]);
+                }
+              }
+            }
             // armor_N 的局部法向可能与 PnP 装甲板坐标相反，因此同时检查
             // 原始方向和绕法向翻转 pi 后的方向，不能把固定 pi 偏置误判为外参错误。
             const auto flipped_truth_yaw = tools::limit_rad(truth->yaw + CV_PI);
@@ -1053,11 +1154,14 @@ private:
   auto_aim::Solver solver_;
   auto_aim::Tracker tracker_;
   auto_aim::Aimer aimer_;
+  auto_aim::Shooter shooter_;
   // Listener 自带独立接收线程；先析构 Listener，再析构其引用的 Buffer。
   tf2_ros::Buffer tf_buffer_;
   tf2_ros::TransformListener tf_listener_;
   rclcpp::Publisher<std_msgs::msg::String>::SharedPtr debug_publisher_;
   rclcpp::Publisher<std_msgs::msg::String>::SharedPtr tracker_status_publisher_;
+  rclcpp::Publisher<rm_interfaces::msg::GimbalCmd>::SharedPtr
+    gimbal_command_publisher_;
   rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr image_subscription_;
   rclcpp::TimerBase::SharedPtr inference_timer_;
   std::mutex frame_mutex_;

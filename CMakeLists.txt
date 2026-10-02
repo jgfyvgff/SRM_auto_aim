@@ -128,6 +128,7 @@ find_package(geometry_msgs QUIET)
 find_package(tf2 QUIET)
 find_package(tf2_msgs QUIET)
 find_package(tf2_ros QUIET)
+find_package(rm_interfaces QUIET)
 # 只有在找到 ROS 环境时才会添加 sentry 和 publish_test
 if(ament_cmake_FOUND AND rclcpp_FOUND AND std_msgs_FOUND AND rosidl_typesupport_cpp_FOUND AND sp_msgs_FOUND)
     # 编译 sentry 和 publish_test
@@ -150,7 +151,7 @@ else()
     message(STATUS "ROS2 environment not found, skipping ROS2-related code.")
 endif()
 
-# 仿真数据源探针：只验证图像、相机内参和 TF，不启动自瞄算法。
+# 仿真自瞄探针：运行检测、跟踪、瞄准和 Shooter，并发布模拟器云台指令。
 if(
   ament_cmake_FOUND AND rclcpp_FOUND AND sensor_msgs_FOUND AND
   std_msgs_FOUND AND tf2_msgs_FOUND)
@@ -158,10 +159,12 @@ if(
     target_link_libraries(sim_data_probe ${OpenCV_LIBS})
     ament_target_dependencies(sim_data_probe rclcpp sensor_msgs tf2_msgs)
 
-    if(tf2_ros_FOUND AND tf2_FOUND AND geometry_msgs_FOUND)
+    if(tf2_ros_FOUND AND tf2_FOUND AND geometry_msgs_FOUND AND rm_interfaces_FOUND)
         add_executable(sim_detector_probe src/sim_detector_probe.cpp)
         target_link_libraries(sim_detector_probe ${OpenCV_LIBS} fmt::fmt yaml-cpp auto_aim tools io)
-        ament_target_dependencies(sim_detector_probe rclcpp sensor_msgs std_msgs geometry_msgs tf2 tf2_ros)
+        ament_target_dependencies(
+          sim_detector_probe rclcpp sensor_msgs std_msgs geometry_msgs tf2 tf2_ros
+          rm_interfaces)
 
         add_executable(sim_gimbal_tf_test tests/sim_gimbal_tf_test.cpp)
         ament_target_dependencies(sim_gimbal_tf_test rclcpp geometry_msgs tf2 tf2_ros)

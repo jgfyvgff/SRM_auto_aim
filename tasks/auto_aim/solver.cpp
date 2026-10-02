@@ -293,6 +293,32 @@ std::vector<cv::Point2f> Solver::reproject_armor(
   return image_points;
 }//重投影装甲板的四个角点到图像平面上，返回图像坐标系下的四个点
 
+std::vector<cv::Point2f> Solver::reproject_armor_pose(
+  const Eigen::Vector3d & xyz_in_world,
+  const Eigen::Matrix3d & R_armor2world,
+  ArmorType type) const
+{
+  // 这里直接使用 TF 的完整姿态，避免用固定俯仰角或仅 yaw 重建真值角点，
+  // 从而把姿态误差、角点点序和 PnP 尺寸误差分开观察。
+  const Eigen::Matrix3d R_armor2camera =
+    R_camera2gimbal_.transpose() * R_gimbal2world_.transpose() * R_armor2world;
+  const Eigen::Vector3d t_armor2camera =
+    R_camera2gimbal_.transpose() *
+    (R_gimbal2world_.transpose() * xyz_in_world - t_camera2gimbal_);
+
+  cv::Vec3d rvec;
+  cv::Mat R_armor2camera_cv;
+  cv::eigen2cv(R_armor2camera, R_armor2camera_cv);
+  cv::Rodrigues(R_armor2camera_cv, rvec);
+  const cv::Vec3d tvec(
+    t_armor2camera[0], t_armor2camera[1], t_armor2camera[2]);
+
+  std::vector<cv::Point2f> image_points;
+  cv::projectPoints(
+    armor_points(type), rvec, tvec, camera_matrix_, distort_coeffs_, image_points);
+  return image_points;
+}
+
 double Solver::oupost_reprojection_error(Armor armor, const double & pitch)
 {
   // solve

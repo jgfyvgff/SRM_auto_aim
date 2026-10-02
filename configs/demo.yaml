@@ -66,7 +66,7 @@ standard_height_delta_variance: 1e-4
 max_yaw_optimization_correction: 0.35
 
 #####-----aimer参数-----#####
-yaw_offset: -1 # degree -2.5
+yaw_offset: 0 # 仿真器中先取消旧的实机 yaw 偏置
 pitch_offset: -1.4 # degree 2
 comming_angle: 60 # degree
 leaving_angle: 20 # degree
