@@ -148,11 +148,19 @@ void HikRobot::capture_start()
       cv::Mat dst_image;
       //Bayer格式转换映射表
       const static std::unordered_map<MvGvspPixelType, cv::ColorConversionCodes> type_map = {
-        {PixelType_Gvsp_BayerGR8, cv::COLOR_BayerGR2RGB},
-        {PixelType_Gvsp_BayerRG8, cv::COLOR_BayerRG2RGB},
-        {PixelType_Gvsp_BayerGB8, cv::COLOR_BayerGB2RGB},
-        {PixelType_Gvsp_BayerBG8, cv::COLOR_BayerBG2RGB}};
-      cv::cvtColor(img, dst_image, type_map.at(pixel_type));
+        {PixelType_Gvsp_BayerGR8, cv::COLOR_BayerGR2BGR},
+        {PixelType_Gvsp_BayerRG8, cv::COLOR_BayerRG2BGR},
+        {PixelType_Gvsp_BayerGB8, cv::COLOR_BayerGB2BGR},
+        {PixelType_Gvsp_BayerBG8, cv::COLOR_BayerBG2BGR}};
+      const auto conversion = type_map.find(pixel_type);
+      if (conversion == type_map.end()) {
+        tools::logger()->error(
+          "HikRobot unsupported pixel type: {:#x}",
+          static_cast<unsigned int>(pixel_type));
+        MV_CC_FreeImageBuffer(handle_, &raw);
+        break;
+      }
+      cv::cvtColor(img, dst_image, conversion->second);
       img = dst_image;
 
       queue_.push({img, timestamp});
