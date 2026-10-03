@@ -232,6 +232,57 @@ ctest --test-dir build --output-on-failure -R '^(gimbal_pose_test|handeye_suppor
 自动化测试覆盖缓存丢旧策略、无数据/过期/运动拒收、角度跨 ±180°、串口分包、后台异常、
 重复停止、资源释放、零发送、旧 CAN 格式，以及已知外参（含相机倒装）的合成恢复。
 
+真机自瞄的只读接收边界另由 `real_auto_aim/SerialFeedbackReader` 提供：它独占一个
+`SrmAutoAimTransport`，后台接收反馈，按图像主机时间等待后侧样本并插值云台姿态；
+同时返回邻近反馈的弹速、模式和颜色。默认等待上限 30 ms、反馈间隔上限 100 ms，
+无数据或过期时不提供姿态。接收器不发送任何串口指令，错误传回采集主线程；
+相机现在同时保存 SDK 帧号、设备原始计数和取帧后的主机时间。仅在相机提供
+`DeviceTimestampFrequency` 节点、设备计数与主机帧间隔一致且完成 16 帧预热后，
+使用设备计数间隔与最短收帧延迟估计映射到主机 `steady_clock`，供反馈匹配和
+Tracker 使用。该映射仍带有未知的
+固定传输延迟，**不是硬件同步或精确曝光中点**；频率缺失、计数异常、预热中均跳过
+真机自瞄帧，不退回主机取帧时间。串口协议不带下位机采样时刻，只能用完整反馈
+到达主机的时间；同批反馈只保留最后一帧。预热和映射仅影响真机只读入口，旧相机
+`read()` 保持主机收帧时间供标定程序使用。无硬件测试：
+`ctest --test-dir build -R '^(device_clock_mapper|real_feedback_buffer|real_serial_feedback)_test$'`。
+
+真机只读自瞄入口 `standard_srm` 复用海康图像、串口反馈、YOLOv5、PnP、Tracker
+和 Aimer，但不创建 Shooter、也不发送串口控制帧。先运行无硬件配置检查：
+
+```bash
+./build/standard_srm configs/real_auto_aim.yaml --check-config=1
+```
+
+在相机与 `/dev/ttyACM0` 均已连接时运行只读链路：
+
+```bash
+./build/standard_srm configs/real_auto_aim.yaml --port=/dev/ttyACM0
+```
+
+日志中的 `diagnostic_yaw/pitch` 只是 Aimer 计算结果，`NO_TX` 表示无控制输出。
+`frame/ticks/tick_hz` 为 SDK 帧号、原始计数和相机报告的频率；`mapped_age` 与
+`mapping_delay` 均基于估计的主机映射时间，不能解释为已测得的曝光/串口硬件延迟。
+配置暂用 `handeye_real2.yaml` 外参、`intrinsics_real.yaml` 内参及固定蓝色敌方设置；
+模式和颜色反馈只记录原始整数，不猜测协议映射。图像尺寸不符会直接报错；姿态缺失
+或图像过期时不更新 Tracker。当前海康 `Camera::read()` 在无图像时仍可能阻塞，
+该入口的退出有赖于相机持续返回图像，尚未完成硬件验收。
+
+### MPC PlotJuggler 曲线
+
+启动 `sim_curve_plotter` 后，探针的 `/sim_aim/debug` JSON 会通过 UDP
+`127.0.0.1:9870` 转发给 PlotJuggler。加载根目录的 `mpc_layout.xml`，
+即可查看 MPC 参考角度、MPC 状态、实际云台 TF 姿态、速度、加速度和开火建议：
+
+```bash
+./build/sim_curve_plotter
+```
+
+其中 `mpc_target_*` 是参考轨迹，`mpc_*` 是规划器输出，
+`gimbal_*` 是 TF 测得的实际云台状态，`published_fire_advice` 是最终发送给
+模拟器的开火建议。
+
+### Tracker 自动分析
+
 启动 `sim_detector_probe` 后，可使用独立脚本订阅 `/sim_aim/debug`，自动比较静止与小陀螺阶段的车辆中心、速度、半径和装甲板 ID 切换情况：
 
 ```bash
@@ -288,7 +339,16 @@ Tracker 还会计算 4 维观测创新的马氏距离：`S = HPHᵀ + R`，关�
 未来实测角度”，等效 `dt` 修正用于判断当前时间补偿是偏超前还是偏滞后。
 
 `/sim_aim/debug` 中的 `command_yaw`、`command_pitch` 使用弧度，带 `_deg` 后缀的
-字段使用角度；它们只是 Aimer 输出诊断，不会自动向模拟器发布云台控制命令。
+字段使用角度；它们保留为 Aimer 输出基线。探针现在使用 `auto_aim::Planner`
+中的 TinyMPC 生成实际云台轨迹，`mpc_*` 是 MPC 规划结果，`published_*` 是实际
+发布到 `/rm_gimbal/cmd` 的命令。没有有效 MPC 轨迹时，探针发布
+`distance=-1` 并关闭开火建议，避免模拟器继续执行旧目标。
+
+MPC 使用 `configs/demo.yaml` 中的 `max_yaw_acc`、`max_pitch_acc`、`Q_yaw`、
+`R_yaw`、`Q_pitch` 和 `R_pitch`。`mpc_yaw_vel`、`mpc_pitch_vel` 的单位为
+rad/s，`mpc_yaw_acc`、`mpc_pitch_acc` 的单位为 rad/s²，`mpc_ms` 为单帧
+规划耗时。`mpc_fire` 是规划器自身的误差判定；最终 `published_fire_advice`
+仍需同时通过现有 Shooter 判定。
 
 `association_primary_*_error` 是 EKF 更新前的关联残差；`post_update_*_error`
 使用同一帧实际接受的装甲板计算 EKF 更新后的残差。未接受或无法配对时值为 `-1`。

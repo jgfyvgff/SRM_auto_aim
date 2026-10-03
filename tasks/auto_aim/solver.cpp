@@ -86,6 +86,14 @@ void Solver::set_R_gimbal2world(const Eigen::Quaterniond & q)
   R_gimbal2world_ = R_gimbal2imubody_.transpose() * R_imubody2imuabs * R_gimbal2imubody_;
 }
 
+void Solver::set_gimbal_to_world(const Eigen::Quaterniond & q)
+{
+    if (!q.coeffs().allFinite() || std::abs(q.norm() - 1.0) > 0.01) {
+        throw std::invalid_argument("Invalid gimbal-to-world quaternion");
+    }
+    R_gimbal2world_ = q.normalized().toRotationMatrix();
+}
+
 std::vector<PnpCandidateDebug> Solver::pnp_candidates(const Armor & armor) const
 {
   if (armor.points.size() != 4) {

@@ -28,6 +28,9 @@ public:
 
   void set_R_gimbal2world(const Eigen::Quaterniond & q);
 
+  // 串口反馈已经是云台到世界系的姿态；此入口不再应用 IMU 安装轴变换。
+  void set_gimbal_to_world(const Eigen::Quaterniond & q);
+
   // predicted_armor 为空时保持初始化行为；非空时使用预测装甲板 yaw
   // 在 IPPE 多个平面姿态中选择连续分支。该参数只读，不转移所有权。
   void solve(

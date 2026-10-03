@@ -53,6 +53,11 @@ add_library(handeye_support STATIC calibration/handeye_support.cpp)
 target_link_libraries(handeye_support PUBLIC Eigen3::Eigen ${OpenCV_LIBS})
 add_library(serial_gimbal_pose STATIC calibration/serial_gimbal_pose.cpp)
 target_link_libraries(serial_gimbal_pose PUBLIC io Eigen3::Eigen Threads::Threads)
+add_library(real_serial_feedback STATIC src/real_auto_aim/serial_feedback_reader.cpp)
+target_link_libraries(real_serial_feedback PUBLIC io Eigen3::Eigen Threads::Threads)
+add_executable(standard_srm src/standard_srm.cpp)
+target_link_libraries(standard_srm
+    ${OpenCV_LIBS} fmt::fmt yaml-cpp auto_aim tools io real_serial_feedback)
 
 add_executable(capture calibration/capture.cpp)
 add_executable(calibrate_camera calibration/calibrate_camera.cpp)
@@ -92,6 +97,25 @@ add_executable(calibration_pattern_test tests/calibration_pattern_test.cpp)
 add_executable(srm_auto_aim_serial_test tests/srm_auto_aim_serial_test.cpp)
 add_executable(gimbal_pose_test tests/gimbal_pose_test.cpp)
 add_executable(handeye_support_test tests/handeye_support_test.cpp)
+add_executable(solver_gimbal_pose_test tests/solver_gimbal_pose_test.cpp)
+add_executable(real_feedback_buffer_test tests/real_feedback_buffer_test.cpp)
+target_link_libraries(real_feedback_buffer_test Eigen3::Eigen)
+add_test(NAME real_feedback_buffer_test COMMAND real_feedback_buffer_test)
+add_executable(device_clock_mapper_test tests/device_clock_mapper_test.cpp)
+add_test(NAME device_clock_mapper_test COMMAND device_clock_mapper_test)
+add_executable(real_serial_feedback_test tests/real_serial_feedback_test.cpp)
+target_link_libraries(real_serial_feedback_test real_serial_feedback)
+add_test(NAME real_serial_feedback_test COMMAND real_serial_feedback_test)
+add_executable(real_config_test tests/real_config_test.cpp)
+target_link_libraries(real_config_test yaml-cpp Eigen3::Eigen)
+add_test(
+    NAME real_config_test
+    COMMAND real_config_test ${PROJECT_SOURCE_DIR}/configs/real_auto_aim.yaml)
+target_link_libraries(solver_gimbal_pose_test ${OpenCV_LIBS} fmt::fmt yaml-cpp tools io auto_aim)
+add_test(
+    NAME solver_gimbal_pose_test
+    COMMAND solver_gimbal_pose_test
+            ${PROJECT_SOURCE_DIR}/tests/fixtures/solver_gimbal_pose.yaml)
 target_link_libraries(gimbal_pose_test serial_gimbal_pose)
 target_link_libraries(handeye_support_test handeye_support)
 enable_testing()

@@ -22,6 +22,7 @@
 #include "tasks/auto_aim/solver.hpp"
 #include "tasks/auto_aim/tracker.hpp"
 #include "tasks/auto_aim/aimer.hpp"
+#include "tasks/auto_aim/planner/planner.hpp"
 #include "tasks/auto_aim/shooter.hpp"
 #include "tools/math_tools.hpp"
 #include "src/sim_capture_time.hpp"
@@ -37,6 +38,7 @@ public:
     solver_(tracker_config_path),
     tracker_(tracker_config_path, solver_),
     aimer_(tracker_config_path),
+    planner_(tracker_config_path),
     shooter_(tracker_config_path),
     tf_buffer_(get_clock()),
     // 使用 tf2 独立接收线程，避免 YOLO/PnP/窗口刷新阻塞 /tf 缓冲更新。
@@ -435,6 +437,24 @@ private:
     solver_.set_R_gimbal2world(gimbal_tf->rotation);
     const Eigen::Vector3d gimbal_ypr = tools::eulers(solver_.R_gimbal2world(), 2, 1, 0);
 
+    // 用同一时间基准计算 TF 中实际云台姿态的离散速度；
+    // 首帧或断帧过大时不计算，避免把初始化跳变误当成云台运动。
+    double gimbal_yaw_vel_rad_s = 0.0;
+    double gimbal_pitch_vel_rad_s = 0.0;
+    if (last_gimbal_tf_timestamp_ != std::chrono::steady_clock::time_point{}) {
+      const double gimbal_dt_s =
+        duration_ms(last_gimbal_tf_timestamp_, frame_timestamp) / 1000.0;
+      if (gimbal_dt_s > 1e-6 && gimbal_dt_s < 1.0) {
+        gimbal_yaw_vel_rad_s =
+          tools::limit_rad(gimbal_ypr[0] - last_gimbal_yaw_rad_) / gimbal_dt_s;
+        gimbal_pitch_vel_rad_s =
+          (gimbal_ypr[1] - last_gimbal_pitch_rad_) / gimbal_dt_s;
+      }
+    }
+    last_gimbal_tf_timestamp_ = frame_timestamp;
+    last_gimbal_yaw_rad_ = gimbal_ypr[0];
+    last_gimbal_pitch_rad_ = gimbal_ypr[1];
+
     const auto detector_start = std::chrono::steady_clock::now();
     const auto armors = detector_.detect(frame, frame_count_++);
     const auto detector_end = std::chrono::steady_clock::now();
@@ -496,6 +516,19 @@ private:
     // 这里不强制 fire_advice，保持与真实自瞄链路相同的开火判定。
     command.shoot = shooter_.shoot(command, aimer_, targets, gimbal_ypr);
     const auto aimer_end = std::chrono::steady_clock::now();
+
+    // MPC 使用 Tracker 的目标副本生成未来参考轨迹，不修改 Tracker 当前状态。
+    // Aimer 的结果保留用于弹道和 Shooter 诊断；MPC 结果作为实际云台执行命令。
+    std::optional<auto_aim::Target> mpc_target;
+    if (!targets.empty()) {
+      mpc_target = targets.front();
+    }
+    const auto mpc_start = std::chrono::steady_clock::now();
+    const auto mpc_plan = planner_.plan(mpc_target, sim_bullet_speed_mps);
+    const auto mpc_end = std::chrono::steady_clock::now();
+    const bool mpc_control = mpc_plan.control && !targets.empty();
+    const double published_yaw = mpc_control ? mpc_plan.yaw : 0.0;
+    const double published_pitch = mpc_control ? mpc_plan.pitch : 0.0;
 
     std::vector<cv::Point2f> current_reprojected_points;
     double current_reprojection_error = -1.0;
@@ -603,22 +636,21 @@ private:
       }
     }
 
-    // 将 Aimer + Shooter 的最终结果送入模拟器真实订阅接口。
-    // command 内部角度为弧度，rm_interfaces/GimbalCmd 使用角度。
+    // 将 MPC + Shooter 的最终结果送入模拟器真实订阅接口。
+    // Aimer/Planner 内部角度为弧度，rm_interfaces/GimbalCmd 使用角度。
     // distance=-1.0 表示当前没有有效目标，模拟器应清除旧瞄准状态。
     rm_interfaces::msg::GimbalCmd gimbal_command;
     gimbal_command.header.stamp = get_clock()->now();
     gimbal_command.header.frame_id = "gimbal_link";
     // Aimer 内部约定抬头为负，Daedalus GimbalCmd 约定 pitch>0 表示抬头。
-    gimbal_command.pitch = -command.pitch * 180.0 / CV_PI;
-    gimbal_command.yaw = command.yaw * 180.0 / CV_PI;
+    gimbal_command.pitch = -published_pitch * 180.0 / CV_PI;
+    gimbal_command.yaw = published_yaw * 180.0 / CV_PI;
     gimbal_command.yaw_diff = 0.0;
     gimbal_command.pitch_diff = 0.0;
     // 模拟器不接收 command.control，只用 distance=-1.0 表示当前没有有效解。
-    const bool has_valid_aim =
-      command.control && !targets.empty() && target_distance >= 0.0;
+    const bool has_valid_aim = mpc_control && target_distance >= 0.0;
     gimbal_command.distance = has_valid_aim ? target_distance : -1.0;
-    gimbal_command.fire_advice = command.shoot;
+    gimbal_command.fire_advice = mpc_control && command.shoot;
     gimbal_command_publisher_->publish(gimbal_command);
 
     RCLCPP_INFO_THROTTLE(
@@ -636,6 +668,17 @@ private:
       command.yaw * 180.0 / CV_PI,
       command.pitch * 180.0 / CV_PI,
       aimer_.debug_aim_point.valid ? "true" : "false");
+
+    RCLCPP_INFO_THROTTLE(
+      get_logger(),
+      *get_clock(),
+      1000,
+      "mpc control=%s yaw=%.2fdeg pitch=%.2fdeg yaw_vel=%.3f pitch_vel=%.3f",
+      mpc_control ? "true" : "false",
+      published_yaw * 180.0 / CV_PI,
+      published_pitch * 180.0 / CV_PI,
+      mpc_control ? mpc_plan.yaw_vel : 0.0,
+      mpc_control ? mpc_plan.pitch_vel : 0.0);
 
     RCLCPP_INFO_THROTTLE(
       get_logger(),
@@ -716,6 +759,23 @@ private:
         plot_data["command_pitch"] = command.pitch;
         plot_data["command_yaw_deg"] = command.yaw * 180.0 / CV_PI;
         plot_data["command_pitch_deg"] = command.pitch * 180.0 / CV_PI;
+        // command_* 保留 Aimer 基线；published_* 才是送给模拟器的实际命令。
+        plot_data["mpc_control"] = mpc_control ? 1 : 0;
+        plot_data["mpc_fire"] = mpc_control && mpc_plan.fire ? 1 : 0;
+        plot_data["mpc_target_yaw"] = mpc_control ? mpc_plan.target_yaw : 0.0;
+        plot_data["mpc_target_pitch"] = mpc_control ? mpc_plan.target_pitch : 0.0;
+        plot_data["mpc_yaw"] = mpc_control ? mpc_plan.yaw : 0.0;
+        plot_data["mpc_pitch"] = mpc_control ? mpc_plan.pitch : 0.0;
+        plot_data["mpc_yaw_vel"] = mpc_control ? mpc_plan.yaw_vel : 0.0;
+        plot_data["mpc_pitch_vel"] = mpc_control ? mpc_plan.pitch_vel : 0.0;
+        plot_data["mpc_yaw_acc"] = mpc_control ? mpc_plan.yaw_acc : 0.0;
+        plot_data["mpc_pitch_acc"] = mpc_control ? mpc_plan.pitch_acc : 0.0;
+        plot_data["published_yaw"] = published_yaw;
+        plot_data["published_pitch"] = published_pitch;
+        plot_data["published_yaw_deg"] = published_yaw * 180.0 / CV_PI;
+        plot_data["published_pitch_deg"] = published_pitch * 180.0 / CV_PI;
+        plot_data["published_fire_advice"] = gimbal_command.fire_advice ? 1 : 0;
+        plot_data["mpc_ms"] = duration_ms(mpc_start, mpc_end);
         plot_data["target_distance"] = target_distance;
         plot_data["target_armor_name"] = auto_aim::ARMOR_NAMES.at(target.name);
         plot_data["target_armor_type"] = auto_aim::ARMOR_TYPES.at(target.armor_type);
@@ -738,6 +798,8 @@ private:
         plot_data["gimbal_tf_qy"] = gimbal_tf->rotation.y();
         plot_data["gimbal_tf_qz"] = gimbal_tf->rotation.z();
         plot_data["gimbal_tf_qw"] = gimbal_tf->rotation.w();
+        plot_data["gimbal_yaw_vel_rad_s"] = gimbal_yaw_vel_rad_s;
+        plot_data["gimbal_pitch_vel_rad_s"] = gimbal_pitch_vel_rad_s;
         plot_data["capture_to_detector_ms"] = duration_ms(frame_timestamp, detector_start);
         plot_data["detector_ms"] = duration_ms(detector_start, detector_end);
         plot_data["tracker_ms"] = duration_ms(tracker_start, tracker_end);
@@ -1154,6 +1216,7 @@ private:
   auto_aim::Solver solver_;
   auto_aim::Tracker tracker_;
   auto_aim::Aimer aimer_;
+  auto_aim::Planner planner_;
   auto_aim::Shooter shooter_;
   // Listener 自带独立接收线程；先析构 Listener，再析构其引用的 Buffer。
   tf2_ros::Buffer tf_buffer_;
@@ -1175,6 +1238,10 @@ private:
   std::uint64_t tracker_status_sequence_ = 0;
   rclcpp::Time latest_frame_ros_stamp_{0, 0, RCL_ROS_TIME};
   double latest_header_age_ms_ = 0.0;
+  // 只保存上一帧有效 TF 姿态，供 PlotJuggler 显示实际云台速度。
+  std::chrono::steady_clock::time_point last_gimbal_tf_timestamp_;
+  double last_gimbal_yaw_rad_ = 0.0;
+  double last_gimbal_pitch_rad_ = 0.0;
   int frame_count_;
 };
 

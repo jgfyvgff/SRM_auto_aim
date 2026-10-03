@@ -8,24 +8,26 @@
       <plot flip_y="false" mode="TimeSeries" flip_x="false" style="Lines">
        <range left="2.850229" right="7.848447" bottom="-0.085876" top="0.079715"/>
        <limitY/>
-       <curve color="#17becf" name="/ref_yaw"/>
-       <curve color="#d62728" name="/gimbal_yaw"/>
+       <curve color="#17becf" name="/mpc_target_yaw"/>
+       <curve color="#9467bd" name="/mpc_yaw"/>
+       <curve color="#d62728" name="/gimbal_yaw_rad"/>
       </plot>
      </DockArea>
      <DockArea name="...">
       <plot flip_y="false" mode="TimeSeries" flip_x="false" style="Lines">
        <range left="2.850229" right="7.848447" bottom="-7.433146" top="0.951805"/>
        <limitY/>
-       <curve color="#bcbd22" name="/ref_vyaw"/>
-       <curve color="#1f77b4" name="/gimbal_vyaw"/>
+       <curve color="#bcbd22" name="/mpc_yaw_vel"/>
+       <curve color="#1f77b4" name="/gimbal_yaw_vel_rad_s"/>
       </plot>
      </DockArea>
      <DockArea name="...">
       <plot flip_y="false" mode="TimeSeries" flip_x="false" style="Lines">
        <range left="2.850229" right="7.848447" bottom="-11.155253" top="9.237359"/>
        <limitY/>
-       <curve color="#1ac938" name="/torque_yaw"/>
-       <curve color="#ff7f0e" name="/control"/>
+       <curve color="#1ac938" name="/mpc_yaw_acc"/>
+       <curve color="#ff7f0e" name="/mpc_control"/>
+       <curve color="#e377c2" name="/published_fire_advice"/>
       </plot>
      </DockArea>
     </DockSplitter>
@@ -38,23 +40,24 @@
       <plot flip_y="false" mode="TimeSeries" flip_x="false" style="Lines">
        <range left="2.850229" right="7.848447" bottom="-0.080032" top="-0.014399"/>
        <limitY/>
-       <curve color="#f14cc1" name="/ref_pitch"/>
-       <curve color="#1f77b4" name="/gimbal_pitch"/>
+       <curve color="#f14cc1" name="/mpc_target_pitch"/>
+       <curve color="#9467bd" name="/mpc_pitch"/>
+       <curve color="#1f77b4" name="/gimbal_pitch_rad"/>
       </plot>
      </DockArea>
      <DockArea name="...">
       <plot flip_y="false" mode="TimeSeries" flip_x="false" style="Lines">
        <range left="2.850229" right="7.848447" bottom="-2.829070" top="2.829055"/>
        <limitY/>
-       <curve color="#9467bd" name="/ref_vpitch"/>
-       <curve color="#bcbd22" name="/gimbal_vpitch"/>
+       <curve color="#9467bd" name="/mpc_pitch_vel"/>
+       <curve color="#bcbd22" name="/gimbal_pitch_vel_rad_s"/>
       </plot>
      </DockArea>
      <DockArea name="...">
       <plot flip_y="false" mode="TimeSeries" flip_x="false" style="Lines">
        <range left="2.850229" right="7.848447" bottom="-2.517863" top="2.508088"/>
        <limitY/>
-       <curve color="#17becf" name="/torque_pitch"/>
+       <curve color="#17becf" name="/mpc_pitch_acc"/>
       </plot>
      </DockArea>
     </DockSplitter>
@@ -108,4 +111,3 @@
  <snippets/>
  <!-- - - - - - - - - - - - - - - -->
 </root>
-

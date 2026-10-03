@@ -2,6 +2,7 @@
 
 #include <libusb-1.0/libusb.h>
 
+#include "device_clock_mapper.hpp"
 #include "tools/logger.hpp"
 
 using namespace std::chrono_literals;
@@ -44,11 +45,18 @@ HikRobot::~HikRobot()
 
 void HikRobot::read(cv::Mat & img, std::chrono::steady_clock::time_point & timestamp)
 {
+  FrameTiming timing;
+  read_timed(img, timing);
+  timestamp = timing.host_received_at;
+}
+
+void HikRobot::read_timed(cv::Mat & img, FrameTiming & timing)
+{
   CameraData data;
   queue_.pop(data);
 
   img = data.img;
-  timestamp = data.timestamp;
+  timing = data.timing;
 }
 
 
@@ -101,16 +109,33 @@ void HikRobot::capture_start()
   set_float_value("Gain", gain_);//设置增益
   MV_CC_SetFrameRate(handle_, 150);//设置帧率
 
+  // 设备时间戳单位由相机节点给出，不猜测 SDK 字段的计数频率。
+  MVCC_INTVALUE_EX frequency_value{};
+  const int frequency_ret =
+    MV_CC_GetIntValueEx(handle_, "DeviceTimestampFrequency", &frequency_value);
+  const std::uint64_t timestamp_frequency_hz =
+    frequency_ret == MV_OK && frequency_value.nCurValue > 0
+      ? static_cast<std::uint64_t>(frequency_value.nCurValue)
+      : 0;
+  if (timestamp_frequency_hz == 0) {
+    tools::logger()->warn(
+      "HikRobot DeviceTimestampFrequency unavailable (SDK code {:#x}); "
+      "real auto-aim will reject unmapped frames", frequency_ret);
+  } else {
+    tools::logger()->info("HikRobot device timestamp frequency: {} Hz", timestamp_frequency_hz);
+  }
+
   ret = MV_CC_StartGrabbing(handle_);
   if (ret != MV_OK) {
     tools::logger()->warn("MV_CC_StartGrabbing failed: {:#x}", ret);
     return;
   }
 
-  capture_thread_ = std::thread{[this] {
+  capture_thread_ = std::thread{[this, timestamp_frequency_hz] {
     tools::logger()->info("HikRobot's capture thread started.");
 
     capturing_ = true;
+    DeviceClockMapper clock_mapper(timestamp_frequency_hz);
 
     MV_FRAME_OUT raw;//原始图像
     MV_CC_PIXEL_CONVERT_PARAM cvt_param;
@@ -127,7 +152,18 @@ void HikRobot::capture_start()
         break;
       }
 
-      auto timestamp = std::chrono::steady_clock::now();
+      // GetImageBuffer 返回后立即记录主机到达时刻，转换/排队耗时不混入时标配对。
+      const auto received_at = std::chrono::steady_clock::now();
+      const auto & frame_info = raw.stFrameInfo;
+      const std::uint64_t device_ticks =
+        (static_cast<std::uint64_t>(frame_info.nDevTimeStampHigh) << 32) |
+        frame_info.nDevTimeStampLow;
+      FrameTiming timing;
+      timing.host_received_at = received_at;
+      timing.device_ticks = device_ticks;
+      timing.device_timestamp_hz = timestamp_frequency_hz;
+      timing.frame_id = frame_info.nFrameNum;
+      timing.mapped_capture_at = clock_mapper.observe(device_ticks, received_at);
       cv::Mat img(cv::Size(raw.stFrameInfo.nWidth, raw.stFrameInfo.nHeight), CV_8U, raw.pBufAddr);
       //转换OPENCV格式
 
@@ -143,7 +179,6 @@ void HikRobot::capture_start()
       cvt_param.enDstPixelType = PixelType_Gvsp_BGR8_Packed;
 
       // ret = MV_CC_ConvertPixelType(handle_, &cvt_param);
-      const auto & frame_info = raw.stFrameInfo;
       auto pixel_type = frame_info.enPixelType;
       cv::Mat dst_image;
       //Bayer格式转换映射表
@@ -163,7 +198,7 @@ void HikRobot::capture_start()
       cv::cvtColor(img, dst_image, conversion->second);
       img = dst_image;
 
-      queue_.push({img, timestamp});
+      queue_.push({img, timing});
 
       ret = MV_CC_FreeImageBuffer(handle_, &raw);
       if (ret != MV_OK) {

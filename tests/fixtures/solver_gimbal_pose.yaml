@@ -1,0 +1,5 @@
+R_gimbal2imubody: [0, -1, 0, 1, 0, 0, 0, 0, 1]
+R_camera2gimbal: [1, 0, 0, 0, 1, 0, 0, 0, 1]
+t_camera2gimbal: [0, 0, 0]
+camera_matrix: [1000, 0, 720, 0, 1000, 540, 0, 0, 1]
+distort_coeffs: [0, 0, 0, 0, 0]
