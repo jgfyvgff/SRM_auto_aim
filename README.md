@@ -259,6 +259,34 @@ Tracker 使用。该映射仍带有未知的
 ./build/standard_srm configs/real_auto_aim.yaml --port=/dev/ttyACM0
 ```
 
+需要在 NUC 桌面上观察实时调试画面并保存逐帧诊断数据时：
+
+```bash
+./build/standard_srm configs/real_auto_aim.yaml \
+  --port=/dev/ttyACM0 \
+  --show=1 \
+  --debug-jsonl=/tmp/real_srm_debug.jsonl
+```
+
+窗口中黄色为 YOLO 检测框，蓝色为当前 Tracker/EKF 装甲板投影，洋红色为 Aimer
+未来瞄准投影；按 `q` 或 `Esc` 退出。`--show=0`（默认）适用于无桌面环境。
+程序会同时记录成功帧和被跳过的帧，避免只分析检测成功样本。运行结束后在任意
+有 Python 的环境离线分析：
+
+```bash
+python3 tools/real_tracker_analyzer.py \
+  --input /tmp/real_srm_debug.jsonl \
+  --output /tmp/real_srm_report.json
+```
+
+评估脚本会检查设备计数和帧号单调性、`mapped_age`、`mapping_delay`、串口匹配间隔、
+检测率、Tracker 状态、中心速度、预测时间、瞄准角以及 `skip_reason`。它只分析记录，
+不修改 Tracker 或 Aimer 参数。脚本测试：
+
+```bash
+python3 -m unittest tests/test_real_tracker_analyzer.py
+```
+
 日志中的 `diagnostic_yaw/pitch` 只是 Aimer 计算结果，`NO_TX` 表示无控制输出。
 `frame/ticks/tick_hz` 为 SDK 帧号、原始计数和相机报告的频率；`mapped_age` 与
 `mapping_delay` 均基于估计的主机映射时间，不能解释为已测得的曝光/串口硬件延迟。
