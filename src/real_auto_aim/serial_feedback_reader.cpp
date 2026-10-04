@@ -65,6 +65,16 @@ std::optional<MatchedFeedback> SerialFeedbackReader::sample_at(Clock::time_point
     return buffer_.match(image_time, Clock::now());
 }
 
+std::optional<LatestGimbalMotion> SerialFeedbackReader::latest_motion()
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (failure_) std::rethrow_exception(failure_);
+    if (state_ != State::Running) {
+        throw std::runtime_error("Serial feedback reader is stopped");
+    }
+    return buffer_.latest_motion(Clock::now());
+}
+
 void SerialFeedbackReader::stop() noexcept
 {
     stop_requested_.store(true);

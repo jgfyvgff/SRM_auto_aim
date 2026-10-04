@@ -1,5 +1,6 @@
 #include "planner.hpp"
 
+#include <cmath>
 #include <vector>
 
 #include "tools/math_tools.hpp"
@@ -100,6 +101,70 @@ Plan Planner::plan(std::optional<Target> target, double bullet_speed)
   return plan(*target, bullet_speed);
 }
 
+Plan Planner::plan(Target target, double bullet_speed, const PlannerState & state)
+{
+  // 真机链路只接受调用方明确给出的有效弹速，避免原入口的 22 m/s 隐式回退进入控制准备。
+  if (bullet_speed < 10.0 || bullet_speed > 25.0 ||
+      !std::isfinite(bullet_speed) || !std::isfinite(state.yaw) ||
+      !std::isfinite(state.yaw_vel) || !std::isfinite(state.pitch) ||
+      !std::isfinite(state.pitch_vel)) {
+    return {false};
+  }
+
+  const auto armors = target.armor_xyza_list();
+  if (armors.empty()) return {false};
+  double min_dist = 1e10;
+  Eigen::Vector3d nearest_xyz = Eigen::Vector3d::Zero();
+  for (const auto & xyza : armors) {
+    const double dist = xyza.head<2>().norm();
+    if (dist < min_dist) {
+      min_dist = dist;
+      nearest_xyz = xyza.head<3>();
+    }
+  }
+  const auto flight = tools::Trajectory(bullet_speed, min_dist, nearest_xyz.z());
+  if (flight.unsolvable || !std::isfinite(flight.fly_time)) return {false};
+  target.predict(flight.fly_time);
+
+  try {
+    const double yaw0 = aim(target, bullet_speed)(0);
+    // 旧入口的参考轨迹以当前时刻为中点；本入口从当前时刻起算，x0 才能对应同一时刻。
+    const auto traj = get_trajectory(target, yaw0, bullet_speed, true);
+    if (!std::isfinite(yaw0) || !traj.allFinite()) return {false};
+    Eigen::Vector2d yaw_x0(tools::limit_rad(state.yaw - yaw0), state.yaw_vel);
+    Eigen::Vector2d pitch_x0(state.pitch, state.pitch_vel);
+    if (tiny_set_x0(yaw_solver_, yaw_x0) != 0) return {false};
+    yaw_solver_->work->Xref = traj.block(0, 0, 2, HORIZON);
+    const int yaw_status = tiny_solve(yaw_solver_);
+    if (tiny_set_x0(pitch_solver_, pitch_x0) != 0) return {false};
+    pitch_solver_->work->Xref = traj.block(2, 0, 2, HORIZON);
+    const int pitch_status = tiny_solve(pitch_solver_);
+
+    // 发送协议只有绝对角；第 1 个规划步是当前状态之后 10 ms 的角度诊断。
+    constexpr int next_step = 1;
+    Plan plan{};
+    plan.target_yaw = tools::limit_rad(traj(0, next_step) + yaw0);
+    plan.target_pitch = traj(2, next_step);
+    plan.yaw = tools::limit_rad(yaw_solver_->work->x(0, next_step) + yaw0);
+    plan.yaw_vel = yaw_solver_->work->x(1, next_step);
+    plan.yaw_acc = yaw_solver_->work->u(0, 0);
+    plan.pitch = pitch_solver_->work->x(0, next_step);
+    plan.pitch_vel = pitch_solver_->work->x(1, next_step);
+    plan.pitch_acc = pitch_solver_->work->u(0, 0);
+    plan.fire = false;
+    plan.diagnostic_valid = std::isfinite(plan.yaw) && std::isfinite(plan.pitch) &&
+                            std::isfinite(plan.yaw_vel) && std::isfinite(plan.pitch_vel) &&
+                            std::isfinite(plan.yaw_acc) && std::isfinite(plan.pitch_acc);
+    plan.solver_converged = yaw_status == 0 && pitch_status == 0;
+    // 未收敛的 TinyMPC 工作区仍可能有有限数值，只允许只读诊断使用。
+    plan.control = plan.diagnostic_valid && plan.solver_converged;
+    return plan;
+  } catch (const std::exception & e) {
+    tools::logger()->warn("Planner current-state solve failed: {}", e.what());
+    return {false};
+  }
+}
+
 void Planner::setup_yaw_solver(const std::string & config_path)
 {
   auto yaml = tools::load(config_path);
@@ -169,14 +234,16 @@ Eigen::Matrix<double, 2, 1> Planner::aim(const Target & target, double bullet_sp
   return {tools::limit_rad(azim + yaw_offset_), -bullet_traj.pitch - pitch_offset_};
 }
 
-Trajectory Planner::get_trajectory(Target & target, double yaw0, double bullet_speed)
+Trajectory Planner::get_trajectory(
+  Target & target, double yaw0, double bullet_speed, bool start_at_now)
 {
   Trajectory traj;
 
-  target.predict(-DT * (HALF_HORIZON + 1));
+  target.predict(-DT * (start_at_now ? 1 : HALF_HORIZON + 1));
   auto yaw_pitch_last = aim(target, bullet_speed);
 
-  target.predict(DT);  // [0] = -HALF_HORIZON * DT -> [HHALF_HORIZON] = 0
+  // 旧入口第 50 列对应当前时刻；实测初态入口第 0 列对应当前时刻。
+  target.predict(DT);
   auto yaw_pitch = aim(target, bullet_speed);
 
   for (int i = 0; i < HORIZON; i++) {

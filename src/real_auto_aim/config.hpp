@@ -81,6 +81,26 @@ inline RealConfig validate_real_config(const YAML::Node & yaml)
         !std::isfinite(gain) || gain < 0.0) {
         throw std::invalid_argument("Invalid camera exposure or gain");
     }
+    // 真机规划器的约束在设备启动前检查，避免非有限权重进入求解器。
+    const double planner_debug_speed = yaml["planner_debug_bullet_speed_mps"].as<double>();
+    const double fire_thresh = yaml["fire_thresh"].as<double>();
+    const double max_yaw_acc = yaml["max_yaw_acc"].as<double>();
+    const double max_pitch_acc = yaml["max_pitch_acc"].as<double>();
+    if (!std::isfinite(planner_debug_speed) || planner_debug_speed < 10.0 ||
+        planner_debug_speed > 25.0 || !std::isfinite(fire_thresh) ||
+        fire_thresh <= 0.0 || !std::isfinite(max_yaw_acc) || max_yaw_acc <= 0.0 ||
+        !std::isfinite(max_pitch_acc) || max_pitch_acc <= 0.0) {
+        throw std::invalid_argument("Invalid real Planner parameters");
+    }
+    for (const char * key : {"Q_yaw", "Q_pitch", "R_yaw", "R_pitch"}) {
+        const std::size_t size = key[0] == 'Q' ? 2 : 1;
+        const auto weights = check_vector(key, size);
+        for (double weight : weights) {
+            if (weight < 0.0) {
+                throw std::invalid_argument(std::string(key) + " must be non-negative");
+            }
+        }
+    }
     return {image_size[0], image_size[1],
             std::chrono::milliseconds(max_image_age_ms)};
 }

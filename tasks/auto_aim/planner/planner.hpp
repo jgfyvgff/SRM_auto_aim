@@ -28,6 +28,18 @@ struct Plan
   float pitch;
   float pitch_vel;
   float pitch_acc;
+  // 新真机只读入口可记录未收敛但有限的轨迹；只有收敛结果允许 control=true。
+  bool diagnostic_valid = false;
+  bool solver_converged = false;
+};
+
+// 云台当前状态属于 world 绝对角，单位 rad、rad/s；与轨迹参考共用坐标和符号约定。
+struct PlannerState
+{
+  double yaw = 0.0;
+  double yaw_vel = 0.0;
+  double pitch = 0.0;
+  double pitch_vel = 0.0;
 };
 
 class Planner
@@ -38,6 +50,8 @@ public:
 
   Plan plan(Target target, double bullet_speed);
   Plan plan(std::optional<Target> target, double bullet_speed);
+  // 真机诊断入口：target 应由调用方预测到当前计算时刻；首个规划点使用实测云台状态。
+  Plan plan(Target target, double bullet_speed, const PlannerState & state);
 
 private:
   double yaw_offset_;
@@ -51,7 +65,8 @@ private:
   void setup_pitch_solver(const std::string & config_path);
 
   Eigen::Matrix<double, 2, 1> aim(const Target & target, double bullet_speed);
-  Trajectory get_trajectory(Target & target, double yaw0, double bullet_speed);
+  Trajectory get_trajectory(
+    Target & target, double yaw0, double bullet_speed, bool start_at_now = false);
 };
 
 }  // namespace auto_aim

@@ -1,6 +1,7 @@
 #include "src/real_auto_aim/feedback_buffer.hpp"
 
 #include <iostream>
+#include <cmath>
 #include <stdexcept>
 
 namespace
@@ -26,6 +27,14 @@ int main()
     // 跨越 ±180° 时必须走短弧；中点朝向约为 180°。
     const Eigen::Vector3d forward = matched->gimbal_to_world * Eigen::Vector3d::UnitX();
     require(forward.x() < -0.99, "Yaw interpolation took the long arc");
+    const auto motion = buffer.latest_motion(t0 + 20ms);
+    require(motion.has_value(), "Fresh motion was rejected");
+    require(std::abs(motion->yaw_vel_rad_s - 17.4532925199433) < 0.001,
+            "Yaw velocity did not unwrap across 180 degrees");
+    require(std::abs(motion->yaw_rad + 170.0 * calibration::kRadiansPerDegree) < 0.001,
+            "Latest yaw was not converted to radians");
+    require(!buffer.latest_motion(t0 + 200ms).has_value(),
+            "Stale motion was accepted");
     require(!buffer.match(t0 + 10ms, t0 + 200ms).has_value(),
             "Stale feedback was accepted");
 

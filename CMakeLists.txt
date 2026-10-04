@@ -157,6 +157,10 @@ target_link_libraries(planner_test ${OpenCV_LIBS} fmt::fmt yaml-cpp auto_aim too
 add_executable(planner_test_offline tests/planner_test_offline.cpp)
 target_link_libraries(planner_test_offline ${OpenCV_LIBS} fmt::fmt yaml-cpp auto_aim tools io)
 
+add_executable(planner_state_test tests/planner_state_test.cpp)
+target_link_libraries(planner_state_test ${OpenCV_LIBS} fmt::fmt yaml-cpp auto_aim tools io)
+add_test(NAME planner_state_test COMMAND planner_state_test ${CMAKE_SOURCE_DIR}/configs/real_auto_aim.yaml)
+
 # 检查 ROS 环境
 find_package(ament_cmake QUIET)
 find_package(rclcpp QUIET)

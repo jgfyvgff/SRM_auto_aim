@@ -252,7 +252,12 @@ Tracker 使用。该映射仍带有未知的
 `ctest --test-dir build -R '^(device_clock_mapper|real_feedback_buffer|real_serial_feedback)_test$'`。
 
 真机只读自瞄入口 `standard_srm` 复用海康图像、串口反馈、YOLOv5、PnP、Tracker
-和 Aimer，但不创建 Shooter、也不发送串口控制帧。先运行无硬件配置检查：
+和 Aimer；同时用已有 Planner 计算只读轨迹，不创建 Shooter、也不发送串口控制帧。
+Planner 从串口缓存最新两帧的主机接收时间估计当前角速度，按当前云台姿态建立
+MPC 初始状态，并从当前时刻生成参考轨迹。协议没有真实采样时刻或速度，所以该估计
+不能视作硬件同步测量。弹速反馈为 0 时，Planner 使用配置中的
+`planner_debug_bullet_speed_mps`，日志明确标记 `diagnostic_nominal`；这种结果仅供
+只读对比。先运行无硬件配置检查：
 当前真机配置关闭固定俯仰角的 yaw 重投影优化，Tracker 使用 PnP 原始 yaw；
 仿真配置仍保留原有优化。倒装相机的模型角点可观察几何位置，但逐点同序
 重投影误差不能直接当作框体对齐误差。
@@ -298,6 +303,16 @@ python3 -m unittest tests/test_real_tracker_analyzer.py
 ```
 
 日志中的 `diagnostic_yaw/pitch` 只是 Aimer 计算结果，`NO_TX` 表示无控制输出。
+`planner_status=ok` 表示求解器收敛；`unconverged_diagnostic` 表示仅有有限的数值轨迹，
+此时 `planner_control=0`，不可用于控制。可比较 `planner_measured_*`、
+`planner_state_*`、`planner_target_*` 与 `planner_yaw_deg/pitch_deg`，并查看
+`planner_feedback_age_ms`、`planner_feedback_interval_ms`、`planner_ms`。
+云台静止且无法形成可靠差分速度时，Planner 使用图像时刻已匹配的串口 yaw/pitch，
+将角速度置零，并标记 `planner_state_source=matched_pose_zero_velocity`；该状态只能
+用于静止场景诊断，`planner_control` 保持为 0。存在有效差分速度时，状态来源标记为
+`latest_pose_extrapolated`。
+Planner 输出的是下一 10 ms 规划步的
+绝对角；当前串口协议没有速度、加速度字段，日志中的规划速度与加速度不会发送。
 `frame/ticks/tick_hz` 为 SDK 帧号、原始计数和相机报告的频率；`mapped_age` 与
 `mapping_delay` 均基于估计的主机映射时间，不能解释为已测得的曝光/串口硬件延迟。
 配置暂用 `handeye_real2.yaml` 外参、`intrinsics_real.yaml` 内参及固定蓝色敌方设置；

@@ -31,6 +31,9 @@ public:
     // 等待图像后的反馈；缺帧或过期返回空，后台串口错误重新抛给主线程。
     std::optional<MatchedFeedback> sample_at(Clock::time_point image_time);
 
+    // 规划诊断从同一有界缓存获取最新云台状态；不足两帧或反馈过期返回空。
+    std::optional<LatestGimbalMotion> latest_motion();
+
     // 由拥有者线程调用；重复停止安全。停止后不能再调用 sample_at。
     void stop() noexcept;
 

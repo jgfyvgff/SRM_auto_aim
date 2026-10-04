@@ -59,5 +59,13 @@ int main(int argc, char * argv[])
     bad["yaw_optimization_enabled"] = true;
     require_rejected(bad, "Real yaw optimization was enabled");
 
+    bad = YAML::Load(YAML::Dump(yaml));
+    bad["planner_debug_bullet_speed_mps"] = 0;
+    require_rejected(bad, "Invalid Planner diagnostic speed was accepted");
+
+    bad = YAML::Load(YAML::Dump(yaml));
+    bad["Q_yaw"] = YAML::Load("[1]");
+    require_rejected(bad, "Short Planner yaw weights were accepted");
+
     std::cout << "real_config_test passed\n";
 }

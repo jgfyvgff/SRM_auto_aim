@@ -25,11 +25,13 @@
 #include "src/real_auto_aim/debug_recorder.hpp"
 #include "src/real_auto_aim/serial_feedback_reader.hpp"
 #include "tasks/auto_aim/aimer.hpp"
+#include "tasks/auto_aim/planner/planner.hpp"
 #include "tasks/auto_aim/solver.hpp"
 #include "tasks/auto_aim/tracker.hpp"
 #include "tasks/auto_aim/yolo.hpp"
 #include "tools/exiter.hpp"
 #include "tools/logger.hpp"
+#include "tools/math_tools.hpp"
 
 namespace
 {
@@ -421,7 +423,10 @@ int main(int argc, char * argv[])
         if (config_path.empty() || port.empty()) {
             throw std::invalid_argument("Config path and serial port must not be empty");
         }
-        const auto config = real_auto_aim::validate_real_config(YAML::LoadFile(config_path));
+        const auto real_yaml = YAML::LoadFile(config_path);
+        const auto config = real_auto_aim::validate_real_config(real_yaml);
+        const double planner_debug_speed =
+            real_yaml["planner_debug_bullet_speed_mps"].as<double>();
         const double exposure_override = cli.get<double>("exposure-ms");
         const double gain_override = cli.get<double>("gain");
         const int max_frames = cli.get<int>("max-frames");
@@ -456,6 +461,7 @@ int main(int argc, char * argv[])
         auto_aim::Solver solver(config_path);
         auto_aim::Tracker tracker(config_path, solver);
         auto_aim::Aimer aimer(config_path);
+        auto_aim::Planner planner(config_path);
 
         // 本入口只有接收通道。下位机 mode/color 尚未确认映射，只按原始整数记录。
         // 缺姿态时不更新世界系 Tracker；弹速无效时不调用带旧默认值回退的 Aimer。
@@ -652,6 +658,76 @@ int main(int argc, char * argv[])
             const auto aimer_start = Clock::now();
             const auto diagnostic = aimer.aim(targets, image_timestamp, bullet_speed);
             const auto finished_at = Clock::now();
+
+            sample["planner_status"] = "no_tracking_target";
+            sample["planner_control"] = 0;
+            sample["planner_speed_source"] = nullptr;
+            sample["planner_yaw_deg"] = nullptr;
+            sample["planner_pitch_deg"] = nullptr;
+            const auto planner_start = Clock::now();
+            if (!targets.empty() && tracker.state() == "tracking") {
+                const auto motion = serial_feedback.latest_motion();
+                const bool measured_speed = bullet_speed >= 10.0 && bullet_speed <= 25.0;
+                // 无真实弹速时仅计算诊断轨迹；不能据此驱动云台或申请开火。
+                const double planning_speed = measured_speed ? bullet_speed : planner_debug_speed;
+                sample["planner_speed_source"] =
+                    measured_speed ? "feedback" : "diagnostic_nominal";
+                sample["planner_bullet_speed_mps"] = planning_speed;
+
+                auto_aim::PlannerState planner_state{
+                    feedback->feedback.yaw_deg * CV_PI / 180.0,
+                    0.0,
+                    feedback->feedback.pitch_deg * CV_PI / 180.0,
+                    0.0};
+                bool has_measured_velocity = false;
+                sample["planner_state_source"] = "matched_pose_zero_velocity";
+                sample["planner_measured_yaw_deg"] = feedback->feedback.yaw_deg;
+                sample["planner_measured_pitch_deg"] = feedback->feedback.pitch_deg;
+                sample["planner_measured_yaw_vel_rad_s"] = 0.0;
+                sample["planner_measured_pitch_vel_rad_s"] = 0.0;
+                if (motion) {
+                    // 串口只带主机收帧时间；将最近姿态按短时差分速度外推到规划时刻，
+                    // 与同一时刻的 Target 状态对齐，仍不等同于下位机真实采样时刻。
+                    const double motion_age_s =
+                        std::chrono::duration<double>(planner_start - motion->received_at).count();
+                    planner_state = {
+                        tools::limit_rad(
+                            motion->yaw_rad + motion_age_s * motion->yaw_vel_rad_s),
+                        motion->yaw_vel_rad_s,
+                        motion->pitch_rad + motion_age_s * motion->pitch_vel_rad_s,
+                        motion->pitch_vel_rad_s};
+                    has_measured_velocity = true;
+                    sample["planner_state_source"] = "latest_pose_extrapolated";
+                    sample["planner_feedback_age_ms"] =
+                        duration_ms(motion->received_at, planner_start);
+                    sample["planner_feedback_interval_ms"] = motion->interval_ms;
+                    sample["planner_measured_yaw_deg"] = motion->yaw_rad * 180.0 / CV_PI;
+                    sample["planner_measured_pitch_deg"] = motion->pitch_rad * 180.0 / CV_PI;
+                    sample["planner_measured_yaw_vel_rad_s"] = motion->yaw_vel_rad_s;
+                    sample["planner_measured_pitch_vel_rad_s"] = motion->pitch_vel_rad_s;
+                }
+                sample["planner_state_yaw_deg"] = planner_state.yaw * 180.0 / CV_PI;
+                sample["planner_state_pitch_deg"] = planner_state.pitch * 180.0 / CV_PI;
+                auto target = targets.front();
+                target.predict(planner_start);
+                const auto plan = planner.plan(target, planning_speed, planner_state);
+                sample["planner_status"] =
+                    !plan.diagnostic_valid ? "invalid" :
+                    plan.solver_converged ? "ok" : "unconverged_diagnostic";
+                sample["planner_control"] = plan.control && has_measured_velocity ? 1 : 0;
+                sample["planner_solver_converged"] = plan.solver_converged;
+                if (plan.diagnostic_valid) {
+                    sample["planner_target_yaw_deg"] = plan.target_yaw * 180.0 / CV_PI;
+                    sample["planner_target_pitch_deg"] = plan.target_pitch * 180.0 / CV_PI;
+                    sample["planner_yaw_deg"] = plan.yaw * 180.0 / CV_PI;
+                    sample["planner_pitch_deg"] = plan.pitch * 180.0 / CV_PI;
+                    sample["planner_yaw_vel_rad_s"] = plan.yaw_vel;
+                    sample["planner_pitch_vel_rad_s"] = plan.pitch_vel;
+                    sample["planner_yaw_acc_rad_s2"] = plan.yaw_acc;
+                    sample["planner_pitch_acc_rad_s2"] = plan.pitch_acc;
+                }
+            }
+            sample["planner_ms"] = duration_ms(planner_start, Clock::now());
 
             sample["event"] = "frame";
             sample["detected"] = detected;
