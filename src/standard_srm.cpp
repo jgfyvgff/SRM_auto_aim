@@ -10,6 +10,7 @@
 #include <sstream>
 #include <list>
 #include <memory>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -96,6 +97,163 @@ Json timing_json(const io::FrameTiming & timing, Clock::time_point now)
     return sample;
 }
 
+double mean_reprojection_error(
+    const std::vector<cv::Point2f> & observed,
+    const std::vector<cv::Point2f> & projected)
+{
+    if (observed.size() != 4 || projected.size() != observed.size()) return -1.0;
+
+    double error_sum = 0.0;
+    for (std::size_t index = 0; index < observed.size(); ++index) {
+        if (
+            !std::isfinite(observed[index].x) || !std::isfinite(observed[index].y) ||
+            !std::isfinite(projected[index].x) || !std::isfinite(projected[index].y)) {
+            return -1.0;
+        }
+        error_sum += cv::norm(observed[index] - projected[index]);
+    }
+    return error_sum / static_cast<double>(observed.size());
+}
+
+bool quad_center(const std::vector<cv::Point2f> & points, cv::Point2f & center)
+{
+    if (points.size() != 4) return false;
+    center = cv::Point2f(0.0F, 0.0F);
+    for (const auto & point : points) {
+        if (!std::isfinite(point.x) || !std::isfinite(point.y)) return false;
+        center += point;
+    }
+    center *= 0.25F;
+    return true;
+}
+
+double best_order_reprojection_error(
+    const std::vector<cv::Point2f> & observed,
+    const std::vector<cv::Point2f> & projected)
+{
+    cv::Point2f observed_center;
+    cv::Point2f projected_center;
+    if (
+        !quad_center(observed, observed_center) ||
+        !quad_center(projected, projected_center)) {
+        return -1.0;
+    }
+
+    double best_error = std::numeric_limits<double>::infinity();
+    // 仅改变四角点的比较顺序，不改变 PnP、Tracker 或实际装甲板姿态。
+    for (int direction = -1; direction <= 1; direction += 2) {
+        for (int shift = 0; shift < 4; ++shift) {
+            double error_sum = 0.0;
+            for (int index = 0; index < 4; ++index) {
+                const int projected_index = (shift + direction * index + 4) % 4;
+                error_sum += cv::norm(observed[index] - projected[projected_index]);
+            }
+            best_error = std::min(best_error, error_sum / 4.0);
+        }
+    }
+    return best_error;
+}
+
+void append_reprojection_json(
+    Json & sample,
+    const auto_aim::Solver & solver,
+    const std::list<auto_aim::Armor> & detected_armors,
+    const std::list<auto_aim::Target> & targets)
+{
+    Json pnp_errors = Json::array();
+    std::size_t detection_index = 0;
+    for (const auto & armor : detected_armors) {
+        const auto projected = solver.reproject_pnp(armor);
+        const double error = mean_reprojection_error(armor.points, projected);
+        Json item{
+            {"detection_index", detection_index},
+            {"pnp_reprojection_error_px", error >= 0.0 ? Json(error) : Json(nullptr)},
+        };
+        pnp_errors.push_back(item);
+        ++detection_index;
+    }
+    sample["pnp_reprojection_errors_px"] = pnp_errors;
+
+    // 当前模型误差取与 EKF 当前装甲板投影最近的检测框，避免双装甲板时比较错对象。
+    // 该值不是 Tracker 关联代价，而是用于隔离手眼、云台姿态和装甲板模型误差。
+    sample["current_model_reprojection_error_px"] = nullptr;
+    sample["current_model_reprojection_detection_index"] = nullptr;
+    sample["current_model_center_error_px"] = nullptr;
+    sample["current_model_center_dx_px"] = nullptr;
+    sample["current_model_center_dy_px"] = nullptr;
+    sample["current_model_center_detection_index"] = nullptr;
+    sample["current_model_index_error_at_center_match_px"] = nullptr;
+    sample["current_model_best_order_error_px"] = nullptr;
+    sample["current_model_observed_points_px"] = nullptr;
+    sample["current_model_projected_points_px"] = nullptr;
+    if (targets.empty()) return;
+
+    const auto & target = targets.front();
+    const auto target_armors = target.armor_xyza_list();
+    if (
+        target.last_id < 0 ||
+        static_cast<std::size_t>(target.last_id) >= target_armors.size()) {
+        return;
+    }
+
+    const auto & current = target_armors[static_cast<std::size_t>(target.last_id)];
+    const auto projected = solver.reproject_armor(
+        current.head(3), current[3], target.armor_type, target.name);
+    cv::Point2f projected_center;
+    if (!quad_center(projected, projected_center)) return;
+
+    double best_error = std::numeric_limits<double>::infinity();
+    double best_center_error = std::numeric_limits<double>::infinity();
+    cv::Point2f best_observed_center;
+    const auto_aim::Armor * center_match = nullptr;
+    std::size_t best_index = 0;
+    std::size_t best_center_index = 0;
+    std::size_t index = 0;
+    for (const auto & armor : detected_armors) {
+        const double error = mean_reprojection_error(armor.points, projected);
+        if (error >= 0.0 && error < best_error) {
+            best_error = error;
+            best_index = index;
+        }
+        cv::Point2f observed_center;
+        if (quad_center(armor.points, observed_center)) {
+            const double center_error = cv::norm(projected_center - observed_center);
+            if (center_error < best_center_error) {
+                best_center_error = center_error;
+                best_observed_center = observed_center;
+                best_center_index = index;
+                center_match = &armor;
+            }
+        }
+        ++index;
+    }
+    if (std::isfinite(best_error)) {
+        sample["current_model_reprojection_error_px"] = best_error;
+        sample["current_model_reprojection_detection_index"] = best_index;
+    }
+    if (center_match) {
+        // 中心匹配不依赖角点编号；dx/dy 定义为模型投影减检测角点中心。
+        sample["current_model_center_error_px"] = best_center_error;
+        sample["current_model_center_dx_px"] = projected_center.x - best_observed_center.x;
+        sample["current_model_center_dy_px"] = projected_center.y - best_observed_center.y;
+        sample["current_model_center_detection_index"] = best_center_index;
+        sample["current_model_index_error_at_center_match_px"] =
+            mean_reprojection_error(center_match->points, projected);
+        sample["current_model_best_order_error_px"] =
+            best_order_reprojection_error(center_match->points, projected);
+        sample["current_model_observed_points_px"] = Json::array();
+        sample["current_model_projected_points_px"] = Json::array();
+        for (int point_index = 0; point_index < 4; ++point_index) {
+            const auto & observed = center_match->points[point_index];
+            const auto & model = projected[point_index];
+            sample["current_model_observed_points_px"].push_back(
+                Json::array({observed.x, observed.y}));
+            sample["current_model_projected_points_px"].push_back(
+                Json::array({model.x, model.y}));
+        }
+    }
+}
+
 void append_target_json(Json & sample, const std::list<auto_aim::Target> & targets)
 {
     if (targets.empty()) {
@@ -130,6 +288,60 @@ void append_target_json(Json & sample, const std::list<auto_aim::Target> & targe
         sample["current_z"] = current[2];
         sample["current_yaw"] = current[3];
     }
+}
+
+void append_association_candidate_json(
+    Json & sample, const std::string & prefix,
+    const auto_aim::AssociationCandidateDebug & candidate)
+{
+    if (candidate.model_id < 0) return;
+    sample[prefix + "_id"] = candidate.model_id;
+    sample[prefix + "_gate_passed"] = candidate.gate_passed ? 1 : 0;
+    sample[prefix + "_accepted"] = candidate.accepted ? 1 : 0;
+    sample[prefix + "_angle_gate_passed"] = candidate.angle_gate_passed ? 1 : 0;
+    sample[prefix + "_score_gate_passed"] = candidate.score_gate_passed ? 1 : 0;
+    sample[prefix + "_position_gate_passed"] = candidate.position_gate_passed ? 1 : 0;
+    sample[prefix + "_distance_gate_passed"] = candidate.distance_gate_passed ? 1 : 0;
+    sample[prefix + "_mahalanobis_gate_passed"] =
+        candidate.mahalanobis_gate_passed ? 1 : 0;
+    sample[prefix + "_score"] = candidate.score;
+    sample[prefix + "_position_error"] = candidate.position_error;
+    sample[prefix + "_distance_error"] = candidate.distance_error;
+    sample[prefix + "_mahalanobis_distance"] = candidate.mahalanobis_distance;
+    sample[prefix + "_position_angle_error"] = candidate.position_angle_error;
+    sample[prefix + "_distance_angle_error"] = candidate.distance_angle_error;
+    sample[prefix + "_observed_x"] = candidate.observed_x;
+    sample[prefix + "_observed_y"] = candidate.observed_y;
+    sample[prefix + "_observed_z"] = candidate.observed_z;
+    sample[prefix + "_predicted_x"] = candidate.predicted_x;
+    sample[prefix + "_predicted_y"] = candidate.predicted_y;
+    sample[prefix + "_predicted_z"] = candidate.predicted_z;
+    sample[prefix + "_observed_distance"] = candidate.observed_distance;
+    sample[prefix + "_predicted_distance"] = candidate.predicted_distance;
+    sample[prefix + "_orientation_error"] = candidate.orientation_error;
+    sample[prefix + "_bearing_error"] = candidate.bearing_error;
+    sample[prefix + "_angle_error"] = candidate.angle_error;
+    sample[prefix + "_raw_yaw_prediction_error"] = candidate.raw_yaw_prediction_error;
+    sample[prefix + "_optimized_yaw_prediction_error"] =
+        candidate.optimized_yaw_prediction_error;
+    sample[prefix + "_raw_yaw"] = candidate.raw_yaw;
+    sample[prefix + "_optimized_yaw"] = candidate.optimized_yaw;
+    sample[prefix + "_yaw_correction"] = candidate.yaw_correction;
+    sample[prefix + "_image_x"] = candidate.image_x;
+    sample[prefix + "_image_y"] = candidate.image_y;
+}
+
+void append_association_json(Json & sample, const auto_aim::AssociationDebug & association)
+{
+    // 这些字段只记录关联决策的输入、门控和最终候选，不参与任何算法决策。
+    // 真机日志需要据此区分 PnP 误差、模型 ID 切换和 EKF 中心漂移。
+    sample["association_matching_detection_count"] =
+        association.matching_detection_count;
+    sample["association_gate_passed_count"] = association.gate_passed_count;
+    sample["association_candidate_count"] = association.candidate_count;
+    sample["association_accepted_count"] = association.accepted_count;
+    append_association_candidate_json(sample, "association_primary", association.candidates[0]);
+    append_association_candidate_json(sample, "association_secondary", association.candidates[1]);
 }
 
 void append_aim_json(Json & sample, const auto_aim::Aimer & aimer, const io::Command & command)
@@ -399,6 +611,8 @@ int main(int argc, char * argv[])
             auto armors = detector.detect(image);
             const auto detector_end = Clock::now();
             const auto detected = armors.size();
+            // Tracker 会原地过滤装甲板；诊断必须保留检测器原始结果，避免把过滤后的列表当作检测结果。
+            const auto detected_armors_for_diagnostic = armors;
             if (!armors.empty()) {
                 double confidence_sum = 0.0;
                 double confidence_max = 0.0;
@@ -416,7 +630,7 @@ int main(int argc, char * argv[])
             auto targets = tracker.track(armors, image_timestamp);
             const auto tracker_end = Clock::now();
             const double bullet_speed = feedback->feedback.bullet_speed_mps;
-            // if (!std::isfinite(bullet_speed) || bullet_speed < 14.0) {
+            // if (!std::isfinite(bullet_speed) || bullet_speed < 14.0) {//弹速小于0,不能正常绘制检测框
             //简单验证无弹速的aimmer
             if (!std::isfinite(bullet_speed)) {
                 sample["event"] = "skip";
@@ -427,6 +641,9 @@ int main(int argc, char * argv[])
                 sample["detector_ms"] = duration_ms(detector_start, detector_end);
                 sample["tracker_ms"] = duration_ms(detector_end, tracker_end);
                 append_target_json(sample, targets);
+                append_reprojection_json(
+                    sample, solver, detected_armors_for_diagnostic, targets);
+                append_association_json(sample, tracker.association_debug());
                 recorder.write(sample);
                 show_skip_frame(image, "invalid bullet speed");
                 log_skip("invalid bullet speed; Aimer default-speed fallback is disabled");
@@ -451,6 +668,9 @@ int main(int argc, char * argv[])
             sample["capture_to_detector_ms"] = duration_ms(image_timestamp, detector_start);
             sample["capture_to_aimer_ms"] = duration_ms(image_timestamp, finished_at);
             append_target_json(sample, targets);
+            append_reprojection_json(
+                sample, solver, detected_armors_for_diagnostic, targets);
+            append_association_json(sample, tracker.association_debug());
             append_aim_json(sample, aimer, diagnostic);
             recorder.write(sample);
 

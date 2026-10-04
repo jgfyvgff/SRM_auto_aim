@@ -51,6 +51,18 @@ class RealTrackerAnalyzerTest(unittest.TestCase):
         self.assertEqual(report["timestamp"]["sources"]["host_receive"], 1)
         self.assertTrue(any("主机收帧时间" in warning for warning in report["warnings"]))
 
+    def test_warns_about_estimated_device_clock(self):
+        report = analyze_records([
+            {
+                "event": "frame",
+                "device_ticks": 100,
+                "tick_hz": 100000000,
+                "timestamp_source": "estimated_device_clock",
+            }
+        ])
+        self.assertEqual(report["timestamp"]["sources"]["estimated_device_clock"], 1)
+        self.assertTrue(any("估计的设备时钟" in warning for warning in report["warnings"]))
+
     def test_detects_timestamp_regression(self):
         records = [
             {"event": "frame", "frame_id": 3, "device_ticks": 200, "tick_hz": 1000},

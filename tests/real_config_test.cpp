@@ -55,5 +55,9 @@ int main(int argc, char * argv[])
     bad["enemy_color"] = "unknown";
     require_rejected(bad, "Invalid enemy color was accepted");
 
+    bad = YAML::Load(YAML::Dump(yaml));
+    bad["yaw_optimization_enabled"] = true;
+    require_rejected(bad, "Real yaw optimization was enabled");
+
     std::cout << "real_config_test passed\n";
 }

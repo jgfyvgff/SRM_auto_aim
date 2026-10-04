@@ -32,6 +32,11 @@ inline RealConfig validate_real_config(const YAML::Node & yaml)
     if (color != "red" && color != "blue") {
         throw std::invalid_argument("Invalid enemy_color");
     }
+    // 真机入口必须显式关闭不适用于倒装相机的固定俯仰 yaw 优化。
+    if (!yaml["yaw_optimization_enabled"].IsDefined() ||
+        yaml["yaw_optimization_enabled"].as<bool>()) {
+        throw std::invalid_argument("Real auto-aim requires yaw optimization disabled");
+    }
 
     const auto image_size = yaml["image_size"].as<std::vector<int>>();
     if (image_size.size() != 2 || image_size[0] <= 0 || image_size[1] <= 0) {

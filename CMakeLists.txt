@@ -115,7 +115,8 @@ target_link_libraries(solver_gimbal_pose_test ${OpenCV_LIBS} fmt::fmt yaml-cpp t
 add_test(
     NAME solver_gimbal_pose_test
     COMMAND solver_gimbal_pose_test
-            ${PROJECT_SOURCE_DIR}/tests/fixtures/solver_gimbal_pose.yaml)
+            ${PROJECT_SOURCE_DIR}/tests/fixtures/solver_gimbal_pose.yaml
+            ${PROJECT_SOURCE_DIR}/configs/real_auto_aim.yaml)
 target_link_libraries(gimbal_pose_test serial_gimbal_pose)
 target_link_libraries(handeye_support_test handeye_support)
 enable_testing()

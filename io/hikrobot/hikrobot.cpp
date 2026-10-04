@@ -120,7 +120,8 @@ void HikRobot::capture_start()
   if (timestamp_frequency_hz == 0) {
     tools::logger()->warn(
       "HikRobot DeviceTimestampFrequency unavailable (SDK code {:#x}); "
-      "read-only timing will use host receive time; this is not exposure time", frequency_ret);
+      "read-only timing will estimate device clock from frame ticks and host receive intervals; "
+      "this is not exposure time", frequency_ret);
   } else {
     tools::logger()->info("HikRobot device timestamp frequency: {} Hz", timestamp_frequency_hz);
   }
@@ -135,7 +136,7 @@ void HikRobot::capture_start()
     tools::logger()->info("HikRobot's capture thread started.");
 
     capturing_ = true;
-    DeviceClockMapper clock_mapper(timestamp_frequency_hz);
+    DeviceClockMapper clock_mapper(timestamp_frequency_hz, true);
 
     MV_FRAME_OUT raw;//原始图像
     MV_CC_PIXEL_CONVERT_PARAM cvt_param;
@@ -161,15 +162,19 @@ void HikRobot::capture_start()
       FrameTiming timing;
       timing.host_received_at = received_at;
       timing.device_ticks = device_ticks;
-      timing.device_timestamp_hz = timestamp_frequency_hz;
+      timing.device_timestamp_hz = clock_mapper.frequency_hz();
       timing.frame_id = frame_info.nFrameNum;
-      if (timestamp_frequency_hz > 0) {
+      if (device_ticks > 0) {
         timing.mapped_capture_at = clock_mapper.observe(device_ticks, received_at);
+        timing.device_timestamp_hz = clock_mapper.frequency_hz();
         if (timing.mapped_capture_at) {
-          timing.timestamp_source = FrameTimestampSource::DeviceClock;
+          timing.timestamp_source = clock_mapper.using_estimated_frequency()
+            ? FrameTimestampSource::EstimatedDeviceClock
+            : FrameTimestampSource::DeviceClock;
         }
-      } else {
-        // USB 相机不提供设备时钟频率时，保留主机收帧时间供只读链路匹配串口姿态。
+      }
+      if (!timing.mapped_capture_at) {
+        // 估计时钟预热或重置期间仍允许只读链路运行，但明确标记为主机收帧时间。
         // 该时间点发生在 GetImageBuffer 返回之后，不等于相机曝光中点。
         timing.timestamp_source = FrameTimestampSource::HostReceive;
       }

@@ -14,6 +14,7 @@ enum class FrameTimestampSource
 {
   Unknown,
   DeviceClock,
+  EstimatedDeviceClock,
   HostReceive,
 };
 
@@ -22,6 +23,8 @@ inline const char * frame_timestamp_source_name(FrameTimestampSource source)
   switch (source) {
     case FrameTimestampSource::DeviceClock:
       return "device_clock";
+    case FrameTimestampSource::EstimatedDeviceClock:
+      return "estimated_device_clock";
     case FrameTimestampSource::HostReceive:
       return "host_receive";
     case FrameTimestampSource::Unknown:

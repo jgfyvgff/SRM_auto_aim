@@ -73,6 +73,8 @@ private:
   const std::vector<cv::Point3f> & armor_points(ArmorType type) const;
   // yaw 优化相对原始 PnP yaw 的最大允许修正，单位为 rad。
   double max_yaw_optimization_correction_;
+  // 倒装相机下固定俯仰、零滚转的简化模型不适合覆盖 PnP 原始 yaw。
+  bool yaw_optimization_enabled_;
 
   // 有预测姿态时，优化结果不能破坏与预测 yaw 的连续性。
   void optimize_yaw(

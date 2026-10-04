@@ -240,16 +240,22 @@ ctest --test-dir build --output-on-failure -R '^(gimbal_pose_test|handeye_suppor
 `DeviceTimestampFrequency` 节点、设备计数与主机帧间隔一致且完成 16 帧预热后，
 使用设备计数间隔与最短收帧延迟估计映射到主机 `steady_clock`，供反馈匹配和
 Tracker 使用。该映射仍带有未知的
-固定传输延迟，**不是硬件同步或精确曝光中点**。设备计数频率缺失时，USB 相机使用
-`GetImageBuffer()` 返回时刻作为只读链路时间，并在 JSONL 标记
-`timestamp_source=host_receive`；该时间不是曝光时刻。计数异常或设备时钟映射预热中仍跳过
-真机自瞄帧。串口协议不带下位机采样时刻，只能用完整反馈
+固定传输延迟，**不是硬件同步或精确曝光中点**。若频率节点缺失，程序在设备 tick
+与主机收帧时间连续覆盖至少 2 秒后估频，随后用最近
+5 秒样本每秒更新一次，并限制单次时间映射相位修正；成功后标记
+`timestamp_source=estimated_device_clock`。此估计用于避免早期短样本频偏随运行时间累积，
+仍不能视为真实曝光时刻，也不能消除固定 USB 传输延迟。预热或计数异常期间使用
+`GetImageBuffer()` 返回时刻，并在 JSONL 标记为 `host_receive`，供只读链路继续诊断。
+串口协议不带下位机采样时刻，只能用完整反馈
 到达主机的时间；同批反馈只保留最后一帧。预热和映射仅影响真机只读入口，旧相机
 `read()` 保持主机收帧时间供标定程序使用。无硬件测试：
 `ctest --test-dir build -R '^(device_clock_mapper|real_feedback_buffer|real_serial_feedback)_test$'`。
 
 真机只读自瞄入口 `standard_srm` 复用海康图像、串口反馈、YOLOv5、PnP、Tracker
 和 Aimer，但不创建 Shooter、也不发送串口控制帧。先运行无硬件配置检查：
+当前真机配置关闭固定俯仰角的 yaw 重投影优化，Tracker 使用 PnP 原始 yaw；
+仿真配置仍保留原有优化。倒装相机的模型角点可观察几何位置，但逐点同序
+重投影误差不能直接当作框体对齐误差。
 
 ```bash
 ./build/standard_srm configs/real_auto_aim.yaml --check-config=1

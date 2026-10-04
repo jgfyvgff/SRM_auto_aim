@@ -3,7 +3,8 @@
 pose_frame: gimbal
 image_size: [1440, 1080]
 max_image_age_ms: 200
-enemy_color: blue
+# enemy_color: blue
+enemy_color: red
 
 yolo_name: yolov5
 yolov5_model_path: assets/yolov5.xml
@@ -35,6 +36,8 @@ outpost_max_temp_lost_count: 75
 tracker_max_prediction_gap: 0.3
 # 不沿用 Daedalus 模型的装甲板半径约束。
 standard_geometry_constraint: false
+# 倒装相机不使用固定俯仰、零滚转的逐点 yaw 重投影优化。
+yaw_optimization_enabled: false
 
 # 零偏置仅用于读数诊断，未经实车射击校准。
 yaw_offset: 0

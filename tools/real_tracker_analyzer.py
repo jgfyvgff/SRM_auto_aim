@@ -69,6 +69,10 @@ def analyze_records(records, max_mapped_age_ms=200.0, max_mapping_delay_ms=100.0
         warnings.append(
             "部分帧使用主机收帧时间，不等于相机曝光时刻；当前结果仅用于只读链路验证"
         )
+    if timestamp_sources.get("estimated_device_clock", 0):
+        warnings.append(
+            "部分帧使用设备 tick 与主机收帧间隔估计的设备时钟，不能视为真实曝光时刻"
+        )
     tick_values = [record["device_ticks"] for record in timestamp_records]
     frame_values = [record["frame_id"] for record in timestamp_records if "frame_id" in record]
     tick_regressions = sum(

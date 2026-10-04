@@ -63,6 +63,9 @@ Solver::Solver(const std::string & config_path)
   max_yaw_optimization_correction_ = yaml["max_yaw_optimization_correction"].IsDefined()
                                        ? yaml["max_yaw_optimization_correction"].as<double>()
                                        : std::numeric_limits<double>::infinity();
+  yaw_optimization_enabled_ = yaml["yaw_optimization_enabled"].IsDefined()
+                                ? yaml["yaw_optimization_enabled"].as<bool>()
+                                : true;
   if (
     !std::isinf(max_yaw_optimization_correction_) &&
     (!std::isfinite(max_yaw_optimization_correction_) ||
@@ -234,6 +237,12 @@ void Solver::solve(
                     (armor.name == ArmorName::three || armor.name == ArmorName::four ||
                      armor.name == ArmorName::five);//判断是否为平衡步兵
   if (is_balance) return;
+
+  if (!yaw_optimization_enabled_) {
+    // PnP 已用完整姿态拟合角点；不要再用零滚转的简化模型改写倒装相机的 yaw。
+    armor.yaw_raw = armor.ypr_in_world[0];
+    return;
+  }
 
   const auto reference_yaw =
     predicted_armor ? std::optional<double>((*predicted_armor)[3]) : std::nullopt;
