@@ -3,7 +3,11 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdint>
+#include <filesystem>
+#include <iomanip>
 #include <iostream>
+#include <sstream>
 #include <list>
 #include <memory>
 #include <stdexcept>
@@ -37,7 +41,13 @@ const std::string kKeys =
     "{port|/dev/ttyACM0|USB CDC 串口设备}"
     "{check-config|false|只校验配置，不打开相机和串口}"
     "{show|false|显示实时调试窗口}"
-    "{debug-jsonl||保存逐帧真机诊断 JSONL}";
+    "{save-frame|/tmp/real_srm_frame.jpg|按 s 保存当前显示帧}"
+    "{debug-jsonl||保存逐帧真机诊断 JSONL}"
+    "{exposure-ms|0|临时覆盖 YAML 曝光时间，单位 ms，0 表示沿用 YAML}"
+    "{gain|-1|临时覆盖 YAML 增益，负数表示沿用 YAML}"
+    "{max-frames|0|采集指定数量的非空图像后退出，0 表示持续运行}"
+    "{raw-frame-dir||保存未旋转、未绘制的原始 BGR 图像}"
+    "{quality-metrics|false|将亮度、裁剪比例和清晰度写入 JSONL}";
 
 double duration_ms(Clock::time_point begin, Clock::time_point end)
 {
@@ -76,6 +86,7 @@ Json timing_json(const io::FrameTiming & timing, Clock::time_point now)
         {"frame_id", timing.frame_id},
         {"device_ticks", timing.device_ticks},
         {"tick_hz", timing.device_timestamp_hz},
+        {"timestamp_source", io::frame_timestamp_source_name(timing.timestamp_source)},
     };
     if (timing.mapped_capture_at) {
         sample["mapped_age_ms"] = duration_ms(*timing.mapped_capture_at, now);
@@ -141,6 +152,44 @@ void append_aim_json(Json & sample, const auto_aim::Aimer & aimer, const io::Com
     sample["future_z"] = future[2];
     sample["future_yaw"] = future[3];
 }
+
+void append_image_quality_json(Json & sample, const cv::Mat & image)
+{
+    if (image.empty()) return;
+
+    cv::Mat gray;
+    if (image.channels() == 3) {
+        cv::cvtColor(image, gray, cv::COLOR_BGR2GRAY);
+    } else if (image.channels() == 4) {
+        cv::cvtColor(image, gray, cv::COLOR_BGRA2GRAY);
+    } else {
+        gray = image;
+    }
+    if (gray.empty() || gray.depth() != CV_8U) return;
+
+    cv::Scalar mean;
+    cv::Scalar stddev;
+    cv::meanStdDev(gray, mean, stddev);
+    cv::Mat dark_mask;
+    cv::Mat bright_mask;
+    cv::inRange(gray, 0, 2, dark_mask);
+    cv::inRange(gray, 253, 255, bright_mask);
+
+    cv::Mat laplacian;
+    cv::Laplacian(gray, laplacian, CV_64F);
+    cv::Scalar lap_mean;
+    cv::Scalar lap_stddev;
+    cv::meanStdDev(laplacian, lap_mean, lap_stddev);
+
+    const double pixel_count = static_cast<double>(gray.total());
+    sample["image_mean_luma"] = mean[0];
+    sample["image_std_luma"] = stddev[0];
+    sample["image_dark_ratio"] =
+        pixel_count > 0.0 ? cv::countNonZero(dark_mask) / pixel_count : 0.0;
+    sample["image_bright_ratio"] =
+        pixel_count > 0.0 ? cv::countNonZero(bright_mask) / pixel_count : 0.0;
+    sample["image_laplacian_variance"] = lap_stddev[0] * lap_stddev[0];
+}
 }
 
 int main(int argc, char * argv[])
@@ -161,6 +210,18 @@ int main(int argc, char * argv[])
             throw std::invalid_argument("Config path and serial port must not be empty");
         }
         const auto config = real_auto_aim::validate_real_config(YAML::LoadFile(config_path));
+        const double exposure_override = cli.get<double>("exposure-ms");
+        const double gain_override = cli.get<double>("gain");
+        const int max_frames = cli.get<int>("max-frames");
+        if (!std::isfinite(exposure_override) || exposure_override < 0.0) {
+            throw std::invalid_argument("--exposure-ms must be finite and non-negative");
+        }
+        if (!std::isfinite(gain_override) || gain_override < -1.0) {
+            throw std::invalid_argument("--gain must be finite and >= -1");
+        }
+        if (max_frames < 0) {
+            throw std::invalid_argument("--max-frames must be non-negative");
+        }
         if (cli.get<bool>("check-config")) {
             std::cout << "Real read-only config OK: " << config.image_width << 'x'
                       << config.image_height << ", max_image_age="
@@ -170,8 +231,12 @@ int main(int argc, char * argv[])
 
         tools::Exiter exiter;
         const bool show = cli.get<bool>("show");
+        const bool quality_metrics = cli.get<bool>("quality-metrics");
         real_auto_aim::DebugRecorder recorder(cli.get<std::string>("debug-jsonl"));
-        io::Camera camera(config_path);
+        io::CameraSettingsOverride camera_overrides;
+        if (exposure_override > 0.0) camera_overrides.exposure_ms = exposure_override;
+        if (gain_override >= 0.0) camera_overrides.gain = gain_override;
+        io::Camera camera(config_path, camera_overrides);
         io::srm_auto_aim::SerialConfig serial_config{port, 20};
         auto transport = std::make_unique<io::srm_auto_aim::SrmAutoAimTransport>(serial_config);
         real_auto_aim::SerialFeedbackReader serial_feedback(std::move(transport));
@@ -184,6 +249,66 @@ int main(int argc, char * argv[])
         // 缺姿态时不更新世界系 Tracker；弹速无效时不调用带旧默认值回退的 Aimer。
         auto next_report = Clock::now();
         bool window_exit = false;
+        const auto save_frame_path = cli.get<std::string>("save-frame");
+        std::uint64_t saved_frame_count = 0;
+        std::uint64_t captured_frame_count = 0;
+        const auto raw_frame_dir = cli.get<std::string>("raw-frame-dir");
+        const auto save_raw_frame =
+            [&raw_frame_dir, &captured_frame_count](const cv::Mat & image) {
+                if (raw_frame_dir.empty() || image.empty()) return;
+                try {
+                    const std::filesystem::path output_dir(raw_frame_dir);
+                    std::filesystem::create_directories(output_dir);
+                    std::ostringstream filename;
+                    filename << "frame_" << std::setfill('0') << std::setw(6)
+                             << captured_frame_count << ".jpg";
+                    const auto output_path = output_dir / filename.str();
+                    if (!cv::imwrite(
+                          output_path.string(), image,
+                          {cv::IMWRITE_JPEG_QUALITY, 95})) {
+                        tools::logger()->warn(
+                          "Failed to save raw frame to {}", output_path.string());
+                    }
+                } catch (const std::exception & error) {
+                    tools::logger()->warn("Failed to save raw frame: {}", error.what());
+                }
+            };
+        const auto save_display_frame =
+            [&save_frame_path, &saved_frame_count](const cv::Mat & image) {
+                if (save_frame_path.empty() || image.empty()) return;
+                try {
+                    const std::filesystem::path base_path(save_frame_path);
+                    const auto parent_path = base_path.parent_path();
+                    if (!parent_path.empty()) {
+                        std::filesystem::create_directories(parent_path);
+                    }
+                    std::ostringstream numbered_name;
+                    numbered_name << base_path.stem().string() << "_"
+                                  << std::setfill('0') << std::setw(6)
+                                  << ++saved_frame_count
+                                  << base_path.extension().string();
+                    const auto output_path = parent_path / numbered_name.str();
+                    if (cv::imwrite(output_path.string(), image)) {
+                        tools::logger()->info(
+                            "Saved display frame to {}", output_path.string());
+                    } else {
+                        tools::logger()->warn(
+                            "Failed to save display frame to {}", output_path.string());
+                    }
+                } catch (const std::exception & error) {
+                    tools::logger()->warn("Failed to save display frame: {}", error.what());
+                }
+            };
+        // 保存的是已经旋转为正立并叠加诊断信息的显示帧，不改变算法使用的原始图像。
+        const auto handle_window_key =
+            [&window_exit, &save_display_frame](const cv::Mat & image) {
+                const int key = cv::waitKey(1) & 0xff;
+                if (key == 's' || key == 'S') {
+                    save_display_frame(image);
+                } else if (key == 27 || key == 'q' || key == 'Q') {
+                    window_exit = true;
+                }
+            };
         const auto log_skip = [&next_report](const char * reason) {
             const auto now = Clock::now();
             if (now >= next_report) {
@@ -191,16 +316,18 @@ int main(int argc, char * argv[])
                 next_report = now + std::chrono::seconds(1);
             }
         };
-        const auto show_skip_frame = [&window_exit, show](
+        const auto show_skip_frame = [show, &handle_window_key](
                                          const cv::Mat & image, const std::string & reason) {
             if (!show || image.empty()) return;
             cv::Mat visualization = image.clone();
+            cv::rotate(visualization, visualization, cv::ROTATE_180);
             draw_text(visualization, reason, 0, cv::Scalar(0, 255, 255));
             cv::imshow("standard_srm", visualization);
-            const int key = cv::waitKey(1) & 0xff;
-            if (key == 27 || key == 'q' || key == 'Q') window_exit = true;
+            handle_window_key(visualization);
         };
-        while (!exiter.exit() && !window_exit) {
+        while (
+            !exiter.exit() && !window_exit &&
+            (max_frames == 0 || captured_frame_count < static_cast<std::uint64_t>(max_frames))) {
             cv::Mat image;
             io::FrameTiming timing;
             camera.read_timed(image, timing);
@@ -208,19 +335,30 @@ int main(int argc, char * argv[])
                 log_skip("empty camera frame");
                 continue;
             }
+            ++captured_frame_count;
+            save_raw_frame(image);
             if (image.cols != config.image_width || image.rows != config.image_height) {
                 throw std::runtime_error("Camera frame size differs from calibration image_size");
             }
             const auto frame_read_at = Clock::now();
             auto sample = timing_json(timing, frame_read_at);
+            sample["captured_frame"] = captured_frame_count;
             sample["image_width"] = image.cols;
             sample["image_height"] = image.rows;
-            // 没有设备时标或无法确认计数频率时禁止把收帧时刻冒充曝光时刻。
-            if (!timing.mapped_capture_at) {
+            if (quality_metrics) append_image_quality_json(sample, image);
+            // 优先使用设备计数映射时间；USB 相机频率不可用时，退回主机收帧时间。
+            // 两者在诊断数据中通过 timestamp_source 区分，避免误认为曝光时刻。
+            std::optional<Clock::time_point> image_time;
+            if (timing.mapped_capture_at) {
+                image_time = timing.mapped_capture_at;
+            } else if (timing.timestamp_source == io::FrameTimestampSource::HostReceive) {
+                image_time = timing.host_received_at;
+            }
+            if (!image_time) {
                 const char * reason = timing.device_timestamp_hz == 0
-                    ? "camera timestamp frequency unavailable; no host fallback"
+                    ? "camera timestamp unavailable"
                     : timing.device_ticks == 0
-                        ? "camera frame has no device timestamp; no host fallback"
+                        ? "camera frame has no device timestamp"
                         : "camera timestamp mapping warming up or reset";
                 sample["event"] = "skip";
                 sample["skip_reason"] = reason;
@@ -229,10 +367,10 @@ int main(int argc, char * argv[])
                 log_skip(reason);
                 continue;
             }
-            const auto image_time = *timing.mapped_capture_at;
+            const auto image_timestamp = *image_time;
             const auto received_at = Clock::now();
-            if (image_time > received_at ||
-                received_at - image_time > config.max_image_age) {
+            if (image_timestamp > received_at ||
+                received_at - image_timestamp > config.max_image_age) {
                 sample["event"] = "skip";
                 sample["skip_reason"] = "camera frame timestamp is invalid or stale";
                 recorder.write(sample);
@@ -240,8 +378,13 @@ int main(int argc, char * argv[])
                 log_skip("camera frame timestamp is invalid or stale");
                 continue;
             }
-            sample["mapped_age_ms"] = duration_ms(image_time, received_at);
-            const auto feedback = serial_feedback.sample_at(image_time);
+            sample["image_age_ms"] = duration_ms(image_timestamp, received_at);
+            if (timing.mapped_capture_at) {
+                sample["mapped_age_ms"] = sample["image_age_ms"];
+                sample["mapping_delay_ms"] =
+                    duration_ms(*timing.mapped_capture_at, timing.host_received_at);
+            }
+            const auto feedback = serial_feedback.sample_at(image_timestamp);
             if (!feedback) {
                 sample["event"] = "skip";
                 sample["skip_reason"] = "no fresh feedback on both sides of image time";
@@ -256,10 +399,26 @@ int main(int argc, char * argv[])
             auto armors = detector.detect(image);
             const auto detector_end = Clock::now();
             const auto detected = armors.size();
-            auto targets = tracker.track(armors, image_time);
+            if (!armors.empty()) {
+                double confidence_sum = 0.0;
+                double confidence_max = 0.0;
+                for (const auto & armor : armors) {
+                    confidence_sum += armor.confidence;
+                    confidence_max = std::max(confidence_max, armor.confidence);
+                }
+                sample["mean_confidence"] =
+                    confidence_sum / static_cast<double>(armors.size());
+                sample["max_confidence"] = confidence_max;
+            } else {
+                sample["mean_confidence"] = 0.0;
+                sample["max_confidence"] = 0.0;
+            }
+            auto targets = tracker.track(armors, image_timestamp);
             const auto tracker_end = Clock::now();
             const double bullet_speed = feedback->feedback.bullet_speed_mps;
-            if (!std::isfinite(bullet_speed) || bullet_speed < 14.0) {
+            // if (!std::isfinite(bullet_speed) || bullet_speed < 14.0) {
+            //简单验证无弹速的aimmer
+            if (!std::isfinite(bullet_speed)) {
                 sample["event"] = "skip";
                 sample["skip_reason"] = "invalid bullet speed; Aimer default-speed fallback is disabled";
                 sample["detected"] = detected;
@@ -274,7 +433,7 @@ int main(int argc, char * argv[])
                 continue;
             }
             const auto aimer_start = Clock::now();
-            const auto diagnostic = aimer.aim(targets, image_time, bullet_speed);
+            const auto diagnostic = aimer.aim(targets, image_timestamp, bullet_speed);
             const auto finished_at = Clock::now();
 
             sample["event"] = "frame";
@@ -289,8 +448,8 @@ int main(int argc, char * argv[])
             sample["detector_ms"] = duration_ms(detector_start, detector_end);
             sample["tracker_ms"] = duration_ms(detector_end, tracker_end);
             sample["aimer_ms"] = duration_ms(aimer_start, finished_at);
-            sample["capture_to_detector_ms"] = duration_ms(image_time, detector_start);
-            sample["capture_to_aimer_ms"] = duration_ms(image_time, finished_at);
+            sample["capture_to_detector_ms"] = duration_ms(image_timestamp, detector_start);
+            sample["capture_to_aimer_ms"] = duration_ms(image_timestamp, finished_at);
             append_target_json(sample, targets);
             append_aim_json(sample, aimer, diagnostic);
             recorder.write(sample);
@@ -324,6 +483,7 @@ int main(int argc, char * argv[])
                             cv::Scalar(255, 0, 255), "future");
                     }
                 }
+                cv::rotate(visualization, visualization, cv::ROTATE_180);
                 draw_text(
                     visualization,
                     "frame=" + std::to_string(timing.frame_id) +
@@ -333,7 +493,7 @@ int main(int argc, char * argv[])
                 draw_text(
                     visualization,
                     "state=" + tracker.state() +
-                      " age=" + std::to_string(sample["mapped_age_ms"].get<double>()) +
+                      " age=" + std::to_string(sample["image_age_ms"].get<double>()) +
                       "ms bracket=" + std::to_string(feedback->bracket_ms) + "ms",
                     1, cv::Scalar(0, 255, 255));
                 draw_text(
@@ -343,21 +503,24 @@ int main(int argc, char * argv[])
                       " speed=" + std::to_string(bullet_speed),
                     2, cv::Scalar(0, 255, 255));
                 cv::imshow("standard_srm", visualization);
-                const int key = cv::waitKey(1) & 0xff;
-                if (key == 27 || key == 'q' || key == 'Q') window_exit = true;
+                handle_window_key(visualization);
             }
 
             if (finished_at >= next_report) {
-                const double image_age_ms =
-                    std::chrono::duration<double, std::milli>(finished_at - image_time).count();
-                const double mapping_delay_ms = std::chrono::duration<double, std::milli>(
-                    timing.host_received_at - image_time).count();
+                const double image_age_ms = std::chrono::duration<double, std::milli>(
+                    finished_at - image_timestamp).count();
+                const double mapping_delay_ms = timing.mapped_capture_at
+                    ? std::chrono::duration<double, std::milli>(
+                        timing.host_received_at - *timing.mapped_capture_at).count()
+                    : 0.0;
                 tools::logger()->info(
                     "[standard_srm/READ_ONLY] frame={} ticks={} tick_hz={} "
-                    "mapped_age={:.1f}ms mapping_delay={:.1f}ms bracket={:.1f}ms "
+                    "timestamp_source={} "
+                    "image_age={:.1f}ms mapping_delay={:.1f}ms bracket={:.1f}ms "
                     "detected={} targets={} tracker={} speed={:.2f}m/s mode={} color={} "
                     "aim_control={} diagnostic_yaw={:.2f}deg diagnostic_pitch={:.2f}deg NO_TX",
                     timing.frame_id, timing.device_ticks, timing.device_timestamp_hz,
+                    io::frame_timestamp_source_name(timing.timestamp_source),
                     image_age_ms, mapping_delay_ms, feedback->bracket_ms, detected, targets.size(),
                     tracker.state(), bullet_speed, feedback->feedback.mode,
                     feedback->feedback.color, diagnostic.control,
@@ -368,6 +531,11 @@ int main(int argc, char * argv[])
             // 故意不创建 Shooter，也不调用 SrmAutoAimTransport::send()。
         }
         if (show) cv::destroyWindow("standard_srm");
+        if (max_frames > 0) {
+            tools::logger()->info(
+              "[standard_srm/READ_ONLY] max-frames reached: {} frames (NO_TX)",
+              captured_frame_count);
+        }
         return 0;
     } catch (const std::exception & error) {
         std::cerr << "standard_srm failed: " << error.what() << '\n';

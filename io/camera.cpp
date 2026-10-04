@@ -1,5 +1,6 @@
 #include "camera.hpp"
 
+#include <cmath>
 #include <stdexcept>
 
 #include "hikrobot/hikrobot.hpp"
@@ -8,11 +9,17 @@
 
 namespace io
 {
-Camera::Camera(const std::string & config_path)
+Camera::Camera(
+  const std::string & config_path,
+  const CameraSettingsOverride & overrides)
 {
   auto yaml = tools::load(config_path);
   auto camera_name = tools::read<std::string>(yaml, "camera_name");
   auto exposure_ms = tools::read<double>(yaml, "exposure_ms");
+  if (overrides.exposure_ms) exposure_ms = *overrides.exposure_ms;
+  if (!std::isfinite(exposure_ms) || exposure_ms <= 0.0) {
+    throw std::invalid_argument("Camera exposure_ms must be finite and positive");
+  }
 
   if (camera_name == "mindvision") {
     auto gamma = tools::read<double>(yaml, "gamma");
@@ -22,6 +29,10 @@ Camera::Camera(const std::string & config_path)
 
   else if (camera_name == "hikrobot") {
     auto gain = tools::read<double>(yaml, "gain");
+    if (overrides.gain) gain = *overrides.gain;
+    if (!std::isfinite(gain) || gain < 0.0) {
+      throw std::invalid_argument("Camera gain must be finite and non-negative");
+    }
     auto vid_pid = tools::read<std::string>(yaml, "vid_pid");
     camera_ = std::make_unique<HikRobot>(exposure_ms, gain, vid_pid);
   }

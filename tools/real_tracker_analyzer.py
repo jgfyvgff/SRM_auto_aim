@@ -62,6 +62,13 @@ def analyze_records(records, max_mapped_age_ms=200.0, max_mapping_delay_ms=100.0
     warnings = []
 
     timestamp_records = [record for record in records if record.get("device_ticks", 0) > 0]
+    timestamp_sources = collections.Counter(
+        record.get("timestamp_source", "unknown") for record in records
+    )
+    if timestamp_sources.get("host_receive", 0):
+        warnings.append(
+            "部分帧使用主机收帧时间，不等于相机曝光时刻；当前结果仅用于只读链路验证"
+        )
     tick_values = [record["device_ticks"] for record in timestamp_records]
     frame_values = [record["frame_id"] for record in timestamp_records if "frame_id" in record]
     tick_regressions = sum(
@@ -101,6 +108,7 @@ def analyze_records(records, max_mapped_age_ms=200.0, max_mapping_delay_ms=100.0
         "skip_reasons": dict(reasons),
         "tick_hz": sorted({record.get("tick_hz") for record in timestamp_records}),
         "timestamp": {
+            "sources": dict(timestamp_sources),
             "tick_regressions": tick_regressions,
             "frame_regressions": frame_regressions,
             "mapped_age_ms": summarize(mapped_age),
@@ -143,6 +151,7 @@ def print_report(report):
         f"跳过帧: {report['skipped_frames']}"
     )
     print(f"设备频率: {report['tick_hz']}")
+    print(f"时间戳来源: {report['timestamp']['sources']}")
     timestamp = report["timestamp"]
     for key in ("mapped_age_ms", "mapping_delay_ms", "bracket_ms"):
         summary = timestamp[key]

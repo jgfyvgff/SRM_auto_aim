@@ -240,8 +240,10 @@ ctest --test-dir build --output-on-failure -R '^(gimbal_pose_test|handeye_suppor
 `DeviceTimestampFrequency` 节点、设备计数与主机帧间隔一致且完成 16 帧预热后，
 使用设备计数间隔与最短收帧延迟估计映射到主机 `steady_clock`，供反馈匹配和
 Tracker 使用。该映射仍带有未知的
-固定传输延迟，**不是硬件同步或精确曝光中点**；频率缺失、计数异常、预热中均跳过
-真机自瞄帧，不退回主机取帧时间。串口协议不带下位机采样时刻，只能用完整反馈
+固定传输延迟，**不是硬件同步或精确曝光中点**。设备计数频率缺失时，USB 相机使用
+`GetImageBuffer()` 返回时刻作为只读链路时间，并在 JSONL 标记
+`timestamp_source=host_receive`；该时间不是曝光时刻。计数异常或设备时钟映射预热中仍跳过
+真机自瞄帧。串口协议不带下位机采样时刻，只能用完整反馈
 到达主机的时间；同批反馈只保留最后一帧。预热和映射仅影响真机只读入口，旧相机
 `read()` 保持主机收帧时间供标定程序使用。无硬件测试：
 `ctest --test-dir build -R '^(device_clock_mapper|real_feedback_buffer|real_serial_feedback)_test$'`。
@@ -269,7 +271,9 @@ Tracker 使用。该映射仍带有未知的
 ```
 
 窗口中黄色为 YOLO 检测框，蓝色为当前 Tracker/EKF 装甲板投影，洋红色为 Aimer
-未来瞄准投影；按 `q` 或 `Esc` 退出。`--show=0`（默认）适用于无桌面环境。
+未来瞄准投影；按 `s` 保存当前正立显示帧，按 `q` 或 `Esc` 退出。默认保存到
+`/tmp/real_srm_frame.jpg`，也可以使用 `--save-frame=/path/to/frame.jpg` 指定路径。
+`--show=0`（默认）适用于无桌面环境。
 程序会同时记录成功帧和被跳过的帧，避免只分析检测成功样本。运行结束后在任意
 有 Python 的环境离线分析：
 
@@ -470,3 +474,20 @@ python3 -m unittest discover -s tests -p 'test_sim_tracker_analyzer.py'
 ## 许可证
 
 源代码中的上游部分遵循 MIT License，具体版权和许可条款见 `LICENSE`。模型文件和第三方组件可能具有独立许可证，见 `THIRD_PARTY_NOTICES.md`。
+
+### 真机曝光/增益自动扫参
+
+自动调参程序逐组启动 standard_srm，统计检测率、置信度、过曝/欠曝比例和图像清晰度。程序保持只读模式，不发送云台控制。
+
+命令：
+
+    python3 tools/real_exposure_gain_tuner.py \
+      --repo . \
+      --config configs/real_auto_aim.yaml \
+      --port /dev/ttyACM0 \
+      --exposures 1,2,3,4,5 \
+      --gains 0,6,12,18,24 \
+      --frames 120 \
+      --warmup-frames 20
+
+推荐值只写入 /tmp/real_exposure_gain_report.json，不会自动修改 YAML。确认后再把 exposure_ms 和 gain 写入配置。每组运行的 JSONL、日志默认保存在 /tmp/real_exposure_gain_tuner；需要保留原始图像时增加 --keep-frames。

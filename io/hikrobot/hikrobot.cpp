@@ -120,7 +120,7 @@ void HikRobot::capture_start()
   if (timestamp_frequency_hz == 0) {
     tools::logger()->warn(
       "HikRobot DeviceTimestampFrequency unavailable (SDK code {:#x}); "
-      "real auto-aim will reject unmapped frames", frequency_ret);
+      "read-only timing will use host receive time; this is not exposure time", frequency_ret);
   } else {
     tools::logger()->info("HikRobot device timestamp frequency: {} Hz", timestamp_frequency_hz);
   }
@@ -163,7 +163,16 @@ void HikRobot::capture_start()
       timing.device_ticks = device_ticks;
       timing.device_timestamp_hz = timestamp_frequency_hz;
       timing.frame_id = frame_info.nFrameNum;
-      timing.mapped_capture_at = clock_mapper.observe(device_ticks, received_at);
+      if (timestamp_frequency_hz > 0) {
+        timing.mapped_capture_at = clock_mapper.observe(device_ticks, received_at);
+        if (timing.mapped_capture_at) {
+          timing.timestamp_source = FrameTimestampSource::DeviceClock;
+        }
+      } else {
+        // USB 相机不提供设备时钟频率时，保留主机收帧时间供只读链路匹配串口姿态。
+        // 该时间点发生在 GetImageBuffer 返回之后，不等于相机曝光中点。
+        timing.timestamp_source = FrameTimestampSource::HostReceive;
+      }
       cv::Mat img(cv::Size(raw.stFrameInfo.nWidth, raw.stFrameInfo.nHeight), CV_8U, raw.pBufAddr);
       //转换OPENCV格式
 

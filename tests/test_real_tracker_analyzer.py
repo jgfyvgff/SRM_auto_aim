@@ -11,6 +11,7 @@ class RealTrackerAnalyzerTest(unittest.TestCase):
                 "frame_id": 1,
                 "device_ticks": 100,
                 "tick_hz": 1000,
+                "timestamp_source": "device_clock",
                 "mapped_age_ms": 20.0,
                 "mapping_delay_ms": 5.0,
                 "bracket_ms": 10.0,
@@ -26,6 +27,7 @@ class RealTrackerAnalyzerTest(unittest.TestCase):
                 "frame_id": 2,
                 "device_ticks": 110,
                 "tick_hz": 1000,
+                "timestamp_source": "device_clock",
                 "skip_reason": "no fresh feedback on both sides of image time",
             },
         ]
@@ -35,6 +37,19 @@ class RealTrackerAnalyzerTest(unittest.TestCase):
         self.assertEqual(report["timestamp"]["mapped_age_ms"]["p95"], 20.0)
         self.assertEqual(report["pipeline"]["detection_rate"], 1.0)
         self.assertIn("no fresh feedback on both sides of image time", report["skip_reasons"])
+        self.assertEqual(report["timestamp"]["sources"]["device_clock"], 2)
+
+    def test_warns_about_host_receive_timestamp(self):
+        report = analyze_records([
+            {
+                "event": "frame",
+                "device_ticks": 0,
+                "timestamp_source": "host_receive",
+                "mapped_age_ms": 10.0,
+            }
+        ])
+        self.assertEqual(report["timestamp"]["sources"]["host_receive"], 1)
+        self.assertTrue(any("主机收帧时间" in warning for warning in report["warnings"]))
 
     def test_detects_timestamp_regression(self):
         records = [
