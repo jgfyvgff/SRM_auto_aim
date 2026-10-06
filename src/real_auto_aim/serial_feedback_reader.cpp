@@ -33,7 +33,8 @@ void SerialFeedbackReader::receive_loop() noexcept
         auto next_tx = Clock::now();
         while (!stop_requested_.load()) {
             // 发送与接收必须由同一线程访问 transport，避免 USB CDC 读写交叉破坏协议状态。
-            // 命令邮箱只保留最新目标；没有新鲜目标时发送零命令，不复用陈旧角度。
+            // 普通跟踪命令过期后回退零命令；显式保持角度用于暂时无目标，
+            // 直到调用方清空或恢复普通跟踪，不能把过期的跟踪命令自动当保持命令。
             const auto before_io = Clock::now();
             if (enable_tx_ && before_io >= next_tx) {
                 io::srm_auto_aim::CommandFrame command{};
@@ -41,7 +42,7 @@ void SerialFeedbackReader::receive_loop() noexcept
                 {
                     std::lock_guard<std::mutex> lock(mutex_);
                     if (pending_command_ &&
-                        before_io - command_updated_at_ <= tx_ttl_) {
+                        (hold_command_ || before_io - command_updated_at_ <= tx_ttl_)) {
                         command = *pending_command_;
                         has_fresh_command = true;
                     }
@@ -128,6 +129,24 @@ void SerialFeedbackReader::set_command(const io::srm_auto_aim::CommandFrame & co
         throw std::runtime_error("Serial feedback reader is stopped");
     }
     pending_command_ = command;
+    hold_command_ = false;
+    command_updated_at_ = Clock::now();
+}
+
+void SerialFeedbackReader::set_hold_command(
+    const io::srm_auto_aim::CommandFrame & command)
+{
+    if (!std::isfinite(command.yaw_deg) || !std::isfinite(command.pitch_deg) ||
+        command.fire_flag != 0) {
+        throw std::invalid_argument("Only finite no-fire hold commands may be sent");
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (failure_) std::rethrow_exception(failure_);
+    if (state_ != State::Running) {
+        throw std::runtime_error("Serial feedback reader is stopped");
+    }
+    pending_command_ = command;
+    hold_command_ = true;
     command_updated_at_ = Clock::now();
 }
 
@@ -135,6 +154,7 @@ void SerialFeedbackReader::clear_command()
 {
     std::lock_guard<std::mutex> lock(mutex_);
     pending_command_.reset();
+    hold_command_ = false;
     command_updated_at_ = Clock::now();
 }
 

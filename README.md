@@ -334,9 +334,11 @@ Planner 输出的是下一 10 ms 规划步的
 
 启用上位机无开火控制时，`standard_srm` 会在 Planner 收敛后发送 MPC 角度；
 Planner 尚未收敛但轨迹有限时，会发送受限步进的目标角，先让云台接近目标。
-有效目标跨帧保留，避免视觉处理期间交替发送目标与零命令。短暂丢目标时最多保持
-100 ms；图像时间戳无效、串口反馈缺失或轨迹非法等硬故障会立即清空命令邮箱，
-随后发送 yaw=0、pitch=0、fire=0。
+有效目标跨帧保留，避免视觉处理期间交替发送目标与零命令。Tracker 不在 tracking
+状态时，正常有图像和新鲜反馈的帧会保持最后一次有效的云台目标角；首次跟踪前则
+保持当前反馈角，`fire_flag` 始终为 0。保持模式不受普通跟踪命令 100 ms TTL 限制，
+恢复 tracking 后重新使用正常的限幅 Planner 命令。图像时间戳无效、串口反馈缺失
+或轨迹非法等硬故障会立即清空命令邮箱，随后发送 yaw=0、pitch=0、fire=0。
 反馈弹速在 10–25 m/s 时使用实测值；若反馈为 0，可显式设置
 `--tx-use-nominal-speed=1`，让无开火控制计算使用配置中的名义弹速。有效反馈弹速
 始终优先，`fire_flag` 始终为 0。JSONL 的 `tx_speed_source` 会标明本帧来源。
@@ -344,7 +346,8 @@ Planner 尚未收敛但轨迹有限时，会发送受限步进的目标角，先
 `tx_wire_zero_frames` 是串口线程成功写入的累计帧数，不等于下位机执行回执。
 默认参数为 20 ms 发送周期、100 ms 命令有效期、yaw 每帧最多 2 deg、pitch 每帧最多 1 deg，
 可通过命令行覆盖。这里的 `tx_command_mode=acquire` 表示接近阶段，
-`tx_command_mode=tracking` 表示 Planner 已收敛后的跟踪阶段。
+`tx_command_mode=tracking` 表示 Planner 已收敛后的跟踪阶段；
+`hold_last_aim` 表示保持上次有效目标角，`hold_current` 表示首次跟踪前保持反馈角。
 
 首次只建议进行无开火短时测试：
 

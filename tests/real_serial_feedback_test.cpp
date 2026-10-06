@@ -298,6 +298,62 @@ void test_tx_is_no_fire_and_expires_to_zero()
     reader.stop();
     require(fake->close_count == 1, "TX transport was not closed exactly once");
 }
+
+void test_hold_survives_ttl_and_returns_to_normal_expiry()
+{
+    using namespace std::chrono_literals;
+    auto stream = std::make_unique<CapturingStream>();
+    auto * fake = stream.get();
+    auto transport = std::make_unique<SrmAutoAimTransport>(std::move(stream));
+    SerialFeedbackReader reader(
+        std::move(transport), 100ms, 10ms, true, 5ms, 20ms);
+
+    reader.set_hold_command({12.5F, -3.0F, 0});
+    // 检查超过普通命令 TTL 后真正写出的帧，而非只检查命令邮箱。
+    std::this_thread::sleep_for(30ms);
+    auto before_write = fake->write_count();
+    require(fake->wait_for_write_count(before_write + 1),
+            "Hold command was not sent after normal TTL");
+    io::srm_auto_aim::CommandFrame command;
+    require(io::srm_auto_aim::decode(fake->latest_write(), command),
+            "Hold command could not be decoded");
+    require(std::abs(command.yaw_deg - 12.5F) < 1e-4F &&
+                std::abs(command.pitch_deg + 3.0F) < 1e-4F && command.fire_flag == 0,
+            "Hold mode sent a reset or fire command after normal TTL");
+
+    reader.set_command({-4.0F, 1.0F, 0});
+    bool observed_normal = false;
+    const auto normal_deadline = Clock::now() + 500ms;
+    while (Clock::now() < normal_deadline) {
+        if (io::srm_auto_aim::decode(fake->latest_write(), command) &&
+            std::abs(command.yaw_deg + 4.0F) < 1e-4F &&
+            std::abs(command.pitch_deg - 1.0F) < 1e-4F && command.fire_flag == 0) {
+            observed_normal = true;
+            break;
+        }
+        std::this_thread::sleep_for(1ms);
+    }
+    require(observed_normal, "Normal command was not sent after hold mode");
+    std::this_thread::sleep_for(30ms);
+    before_write = fake->write_count();
+    require(fake->wait_for_write_count(before_write + 1),
+            "Normal command did not expire after hold mode");
+    require(io::srm_auto_aim::decode(fake->latest_write(), command) &&
+                command.yaw_deg == 0.0F && command.pitch_deg == 0.0F &&
+                command.fire_flag == 0,
+            "Normal command remained in hold mode after TTL");
+
+    reader.set_hold_command({12.5F, -3.0F, 0});
+    reader.clear_command();
+    before_write = fake->write_count();
+    require(fake->wait_for_write_count(before_write + 1),
+            "Clearing a hold command did not send a zero command");
+    require(io::srm_auto_aim::decode(fake->latest_write(), command) &&
+                command.yaw_deg == 0.0F && command.pitch_deg == 0.0F &&
+                command.fire_flag == 0,
+            "Cleared hold command was still active");
+    reader.stop();
+}
 }  // namespace
 
 int main()
@@ -305,5 +361,6 @@ int main()
     test_matching_and_stop();
     test_no_data_and_background_failure();
     test_tx_is_no_fire_and_expires_to_zero();
+    test_hold_survives_ttl_and_returns_to_normal_expiry();
     std::cout << "real_serial_feedback_test passed\n";
 }

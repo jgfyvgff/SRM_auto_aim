@@ -49,6 +49,10 @@ public:
     // 当发送未启用时仅记录请求，不触碰串口；调用方可用同一套代码做只读诊断。
     void set_command(const io::srm_auto_aim::CommandFrame & command);
 
+    // 暂时失去目标时保持最后的无开火角度；保持模式不受普通跟踪命令 TTL 限制。
+    // 仅调用 clear_command 或 stop 才会终止保持，不能用于真实开火。
+    void set_hold_command(const io::srm_auto_aim::CommandFrame & command);
+
     // 清除当前目标。发送模式下后台线程会按周期发零命令，尽快使视觉目标失效。
     void clear_command();
 
@@ -74,6 +78,7 @@ private:
     State state_ = State::Running;
     std::exception_ptr failure_;
     std::optional<io::srm_auto_aim::CommandFrame> pending_command_;
+    bool hold_command_ = false;
     Clock::time_point command_updated_at_ = Clock::now();
     TxStats tx_stats_;
     std::atomic<bool> stop_requested_{false};

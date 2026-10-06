@@ -11,6 +11,7 @@
 #include <list>
 #include <memory>
 #include <limits>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -503,6 +504,7 @@ int main(int argc, char * argv[])
         bool tx_command_sent = false;
         double tx_command_yaw_deg = 0.0;
         double tx_command_pitch_deg = 0.0;
+        std::optional<io::srm_auto_aim::CommandFrame> last_valid_aim_command;
         const auto save_frame_path = cli.get<std::string>("save-frame");
         std::uint64_t saved_frame_count = 0;
         std::uint64_t captured_frame_count = 0;
@@ -579,7 +581,9 @@ int main(int argc, char * argv[])
             cv::imshow("standard_srm", visualization);
             handle_window_key(visualization);
         };
-        const auto clear_tx_on_hard_failure = [&serial_feedback, enable_tx]() {
+        const auto clear_tx_on_hard_failure =
+            [&serial_feedback, enable_tx, &last_valid_aim_command]() {
+            last_valid_aim_command.reset();
             if (enable_tx) serial_feedback.clear_command();
         };
         const auto record_sample = [&recorder, &serial_feedback](Json & sample) {
@@ -592,8 +596,8 @@ int main(int argc, char * argv[])
         while (
             !exiter.exit() && !window_exit &&
             (max_frames == 0 || captured_frame_count < static_cast<std::uint64_t>(max_frames))) {
-            // 有效目标跨帧保留，避免视觉处理期间向下位机交替发送目标与零命令。
-            // 短暂丢目标由命令 TTL 限制；硬故障在对应路径立即清空邮箱。
+            // 普通跟踪目标受命令 TTL 限制；暂时丢失时显式保持最后有效角度。
+            // 图像或姿态等硬故障仍立即清空邮箱，避免继续复用旧目标。
             tx_command_mode = "none";
             tx_command_sent = false;
             tx_command_yaw_deg = 0.0;
@@ -850,15 +854,33 @@ int main(int argc, char * argv[])
                         requested_pitch - planner_state.pitch,
                         -max_pitch_step, max_pitch_step);
                     if (std::isfinite(command_yaw) && std::isfinite(command_pitch)) {
-                        serial_feedback.set_command({
+                        const io::srm_auto_aim::CommandFrame command{
                             static_cast<float>(command_yaw * 180.0 / CV_PI),
                             static_cast<float>(command_pitch * 180.0 / CV_PI),
-                            0});
+                            0};
+                        serial_feedback.set_command(command);
+                        last_valid_aim_command = command;
                         tx_command_sent = true;
                         tx_command_mode = plan.solver_converged ? "tracking" : "acquire";
                         tx_command_yaw_deg = command_yaw * 180.0 / CV_PI;
                         tx_command_pitch_deg = command_pitch * 180.0 / CV_PI;
                     }
+                }
+            } else if (enable_tx) {
+                // 未进入 tracking 时固定上次有效瞄准角；首次跟踪前保持当前反馈姿态。
+                // 保持模式只锁定角度，不外推丢失目标，也不允许开火。
+                const auto hold = last_valid_aim_command.value_or(
+                    io::srm_auto_aim::CommandFrame{
+                        feedback->feedback.yaw_deg, feedback->feedback.pitch_deg, 0});
+                if (std::isfinite(hold.yaw_deg) && std::isfinite(hold.pitch_deg)) {
+                    serial_feedback.set_hold_command(hold);
+                    tx_command_sent = true;
+                    tx_command_mode = last_valid_aim_command
+                        ? "hold_last_aim" : "hold_current";
+                    tx_command_yaw_deg = hold.yaw_deg;
+                    tx_command_pitch_deg = hold.pitch_deg;
+                } else {
+                    clear_tx_on_hard_failure();
                 }
             }
             sample["tx_command_sent"] = tx_command_sent;
