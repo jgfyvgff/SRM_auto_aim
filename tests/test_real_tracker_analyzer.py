@@ -1,3 +1,5 @@
+import contextlib
+import io
 import sys
 import unittest
 from pathlib import Path
@@ -5,7 +7,7 @@ from pathlib import Path
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPOSITORY_ROOT))
 
-from tools.real_tracker_analyzer import analyze_records
+from tools.real_tracker_analyzer import analyze_records, print_report
 
 
 class RealTrackerAnalyzerTest(unittest.TestCase):
@@ -416,6 +418,133 @@ class RealTrackerAnalyzerTest(unittest.TestCase):
         self.assertTrue(
             any("短盲区" in warning and "冻结帧" in warning for warning in report["warnings"])
         )
+
+    def test_gate_sweep_counts_recoverable_rejected_frames(self):
+        records = []
+        for position_error in (0.50, 0.70, 0.85, 1.30):
+            records.append({
+                "event": "frame", "tracker_state": "temp_lost", "detected": 1,
+                "association_candidate_count": 1, "association_accepted_count": 0,
+                "association_primary_gate_passed": 0,
+                "association_primary_position_gate_passed": 0,
+                "association_primary_distance_gate_passed": 1,
+                "association_primary_mahalanobis_gate_passed": 1,
+                "association_primary_score_gate_passed": 1,
+                "association_primary_angle_gate_passed": 1,
+                "association_primary_position_error": position_error,
+                "association_primary_distance_error": 0.10,
+            })
+        sweep = analyze_records(records)["gate_sweep"]
+        self.assertEqual(sweep["rejected_frames"], 4)
+        self.assertEqual(sweep["evaluable_frames"], 4)
+        # 恢复曲线必须随门限单调不减，0.45m 就是当前门限，恢复 0 帧。
+        self.assertEqual(sweep["position_recovery"][0.45], 0)
+        self.assertEqual(sweep["position_recovery"][0.60], 1)
+        self.assertEqual(sweep["position_recovery"][0.75], 2)
+        self.assertEqual(sweep["position_recovery"][0.90], 3)
+        self.assertEqual(sweep["position_recovery"][2.00], 4)
+        # distance 残差只有 0.10m：单看 distance 门限 4 帧全都"够近"，
+        # 所以恢复必须由 position 门限决定（联合门限才是真正生效的判据）。
+        self.assertEqual(sweep["distance_recovery"][0.45], 4)
+        self.assertEqual(sweep["joint_recovery"]["0.90/0.90"]["frames"], 3)
+
+    def test_gate_sweep_excludes_unrecoverable_rejections(self):
+        records = [
+            # 栽在 score 门限（多半是别的装甲板/别的机器人）：放宽绝对门限无效。
+            {"event": "frame", "tracker_state": "temp_lost", "detected": 1,
+             "association_candidate_count": 1, "association_accepted_count": 0,
+             "association_primary_gate_passed": 0,
+             "association_primary_position_gate_passed": 0,
+             "association_primary_distance_gate_passed": 1,
+             "association_primary_mahalanobis_gate_passed": 1,
+             "association_primary_score_gate_passed": 0,
+             "association_primary_angle_gate_passed": 1,
+             "association_primary_position_error": 0.50,
+             "association_primary_distance_error": 0.10},
+            # 门限全过却被 EKF 后验否决：放宽门限同样无效。
+            {"event": "frame", "tracker_state": "temp_lost", "detected": 1,
+             "association_candidate_count": 1, "association_accepted_count": 0,
+             "association_primary_gate_passed": 1,
+             "association_primary_position_error": 0.50,
+             "association_primary_distance_error": 0.10},
+            # 残差不是有限值：无法回放，必须单独计数而不是当成 0。
+            {"event": "frame", "tracker_state": "temp_lost", "detected": 1,
+             "association_candidate_count": 1, "association_accepted_count": 0,
+             "association_primary_gate_passed": 0,
+             "association_primary_position_gate_passed": 0,
+             "association_primary_distance_gate_passed": 1,
+             "association_primary_mahalanobis_gate_passed": 1,
+             "association_primary_score_gate_passed": 1,
+             "association_primary_angle_gate_passed": 1,
+             "association_primary_position_error": None,
+             "association_primary_distance_error": 0.10},
+        ]
+        report = analyze_records(records)
+        sweep = report["gate_sweep"]
+        self.assertEqual(sweep["evaluable_frames"], 0)
+        self.assertEqual(sweep["blocked_by_other_gates"], 1)
+        self.assertEqual(sweep["posterior_rejected_frames"], 1)
+        self.assertEqual(sweep["non_finite_frames"], 1)
+        self.assertFalse(
+            any("绝对位置/距离门限放宽" in warning for warning in report["warnings"])
+        )
+
+    def test_gate_sweep_warns_when_absolute_gate_is_the_bottleneck(self):
+        records = [
+            {"event": "frame", "tracker_state": "temp_lost", "detected": 1,
+             "association_candidate_count": 1, "association_accepted_count": 0,
+             "association_primary_gate_passed": 0,
+             "association_primary_position_gate_passed": 0,
+             "association_primary_distance_gate_passed": 0,
+             "association_primary_mahalanobis_gate_passed": 1,
+             "association_primary_score_gate_passed": 1,
+             "association_primary_angle_gate_passed": 1,
+             "association_primary_position_error": 0.60,
+             "association_primary_distance_error": 0.30}
+            for _ in range(8)
+        ]
+        report = analyze_records(records)
+        self.assertTrue(
+            any("绝对位置/距离门限放宽到 0.90m" in w for w in report["warnings"])
+        )
+
+
+
+
+    def test_reports_extrapolate_frames_from_temp_lost_follow(self):
+        records = [
+            {"event": "frame", "tracker_state": "temp_lost", "tx_command_mode": "extrapolate",
+             "tx_command_yaw_deg": 1.0, "tx_extrapolating": True},
+            {"event": "frame", "tracker_state": "tracking", "tx_command_mode": "tracking",
+             "tx_command_yaw_deg": 1.1},
+        ]
+        report = analyze_records(records)
+        self.assertEqual(report["jitter"]["extrapolate_frames"], 1)
+        # 外推帧是在跟随目标，不能再被算成保持帧。
+        self.assertEqual(report["jitter"]["hold_frames"], 0)
+
+    def test_print_report_renders_gate_sweep_table(self):
+        records = [
+            {"event": "frame", "tracker_state": "temp_lost", "detected": 1,
+             "association_candidate_count": 1, "association_accepted_count": 0,
+             "association_primary_gate_passed": 0,
+             "association_primary_position_gate_passed": 0,
+             "association_primary_distance_gate_passed": 0,
+             "association_primary_mahalanobis_gate_passed": 1,
+             "association_primary_score_gate_passed": 1,
+             "association_primary_angle_gate_passed": 1,
+             "association_primary_position_error": 0.60,
+             "association_primary_distance_error": 0.30}
+            for _ in range(4)
+        ]
+        report = analyze_records(records)
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            print_report(report)
+        text = buffer.getvalue()
+        self.assertIn("关联门限离线扫描", text)
+        self.assertIn("联合恢复网格", text)
+        self.assertIn("0.90/0.90m 同时放宽可救回 4 帧", text)
 
 
 if __name__ == "__main__":

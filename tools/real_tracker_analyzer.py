@@ -62,6 +62,17 @@ SHORT_BLIND_FRAMES = 2
 # 视野）"还是"混合段（检测时有时无，被段级成因一言以蔽之）"。
 LONGEST_RUN_REPORT = 3
 
+# 关联门限离线扫描的候选门限（单位 m，与 tracker.cpp 的绝对 position/distance 门限
+# 同量纲）。0.45 就是 tracker.cpp 的默认值（真机配置未覆盖），因此它是当前被拒帧的
+# 边界：真机日志里 accepted_position_error 的 max 恰好等于 0.45。
+GATE_SWEEP_THRESHOLDS = (0.45, 0.60, 0.75, 0.90, 1.20, 1.50, 2.00)
+
+# 联合放宽扫描中需要单独汇总的 (position, distance) 组合。
+GATE_SWEEP_JOINT = ((0.60, 0.60), (0.90, 0.90), (1.20, 1.20))
+
+# 把绝对门限放宽到 0.90m 就能救回这么多比例的被拒帧时，告警：说明门限是主因之一。
+GATE_SWEEP_WARN_RATIO = 0.25
+
 
 def percentile(values, ratio):
     ordered = sorted(values)
@@ -373,6 +384,99 @@ def association_report(records):
     }
 
 
+def gate_sweep_report(records, thresholds=GATE_SWEEP_THRESHOLDS):
+    """用真机日志离线回答"绝对门限放宽到多少能救回多少被拒帧"。
+
+    只做数学回放，不修改任何控制参数，也不需要重新上车：对每个被拒帧取主候选已
+    记录的 position_error/distance_error，并沿用该帧已记录的 angle/score/mahalanobis
+    结论——这三个门限不参与扫描，因为它们分别负责排除"别的装甲板"和"别的机器人"
+    （真机日志中约 548 帧栽在 score 门限，放宽绝对门限对它们无效）。
+
+    因此 recovered 是放宽后的上界：真正放宽后仍要通过 Target::update 的 EKF 后验检查，
+    且主候选只是每帧误差最小的那一个，不代表该帧检测到的一切都能被吸收。
+    """
+    rejected = [
+        record for record in records
+        if (record.get("association_candidate_count") or 0) > 0
+        and not (record.get("association_accepted_count") or 0)
+    ]
+    evaluable = []
+    posterior_rejected = 0
+    blocked_by_other_gates = 0
+    non_finite = 0
+    for record in rejected:
+        if tri_state(record.get("association_primary_gate_passed")) is True:
+            # 全部门限都过了却仍被拒，说明是 EKF 后验否决，放宽门限无法救回。
+            posterior_rejected += 1
+            continue
+        retained = (
+            record.get("association_primary_angle_gate_passed"),
+            record.get("association_primary_score_gate_passed"),
+            record.get("association_primary_mahalanobis_gate_passed"),
+        )
+        if any(tri_state(flag) is False for flag in retained):
+            blocked_by_other_gates += 1
+            continue
+        position_error = record.get("association_primary_position_error")
+        distance_error = record.get("association_primary_distance_error")
+        if not all(
+            isinstance(value, (int, float)) and math.isfinite(value)
+            for value in (position_error, distance_error)
+        ):
+            non_finite += 1
+            continue
+        evaluable.append((float(position_error), float(distance_error)))
+    grid = [
+        [
+            sum(
+                1 for position_error, distance_error in evaluable
+                if position_error <= position_threshold and distance_error <= distance_threshold
+            )
+            for distance_threshold in thresholds
+        ]
+        for position_threshold in thresholds
+    ]
+    joint = {
+        f"{position_threshold:.2f}/{distance_threshold:.2f}": {
+            "frames": sum(
+                1 for position_error, distance_error in evaluable
+                if position_error <= position_threshold and distance_error <= distance_threshold
+            ),
+            "ratio": (
+                sum(
+                    1 for position_error, distance_error in evaluable
+                    if position_error <= position_threshold and distance_error <= distance_threshold
+                ) / len(evaluable) if evaluable else 0.0
+            ),
+        }
+        for position_threshold, distance_threshold in GATE_SWEEP_JOINT
+    }
+    return {
+        "rejected_frames": len(rejected),
+        "evaluable_frames": len(evaluable),
+        "posterior_rejected_frames": posterior_rejected,
+        "blocked_by_other_gates": blocked_by_other_gates,
+        "non_finite_frames": non_finite,
+        "thresholds": list(thresholds),
+        "recovered_grid": grid,
+        "position_recovery": {
+            position_threshold: sum(
+                1 for position_error, _ in evaluable if position_error <= position_threshold
+            )
+            for position_threshold in thresholds
+        },
+        "distance_recovery": {
+            distance_threshold: sum(
+                1 for _, distance_error in evaluable if distance_error <= distance_threshold
+            )
+            for distance_threshold in thresholds
+        },
+        "evaluable_position_error": summarize([item[0] for item in evaluable]),
+        "evaluable_distance_error": summarize([item[1] for item in evaluable]),
+        "joint_recovery": joint,
+    }
+
+
 def change_count(records, key):
     """状态量逐帧变化次数；用于识别 Target 重建和装甲板 ID 跳变。"""
     values = [record.get(key) for record in records if isinstance(record.get(key), (int, float))]
@@ -423,10 +527,16 @@ def command_jitter_report(records):
                 resume_steps.append(delta)
         previous = (float(yaw), mode)
     hold_frames = sum(count for mode, count in modes.items() if str(mode).startswith("hold"))
+    # --tx-follow-temp-lost 生效时这些帧在 temp_lost 里仍然发了跟随指令：
+    # 对比 hold_ratio 与 resume_step_deg 即可判断"冻结→补跳"是否被摊平。
+    extrapolate_frames = sum(
+        1 for record in records if record.get("tx_extrapolating") is True
+    )
     return {
         "tx_command_mode_counts": dict(modes),
         "hold_frames": hold_frames,
         "hold_ratio": hold_frames / len(records) if records else 0.0,
+        "extrapolate_frames": extrapolate_frames,
         "command_yaw_step_deg": summarize(steps),
         "resume_step_deg": summarize(resume_steps),
         "generation_changes": change_count(records, "tracker_generation"),
@@ -533,6 +643,7 @@ def analyze_records(
     control_period_ms = statistics.fmean(periods) if periods else DEFAULT_FRAME_PERIOD_MS
     continuity = continuity_report(processed, control_period_ms)
     association = association_report(processed)
+    gate_sweep = gate_sweep_report(processed)
     jitter = command_jitter_report(processed)
     coverage = field_coverage(processed)
     missing_fields = [label for label, count in coverage.items() if not count] if processed else []
@@ -591,6 +702,17 @@ def analyze_records(
         warnings.append(
             f"{association['gate_passed_but_rejected_frames']} 帧的候选通过了关联门限，"
             "却被 Target::update 的 EKF 后验检查否决"
+        )
+    joint_090 = gate_sweep.get("joint_recovery", {}).get("0.90/0.90", {})
+    if (
+        gate_sweep.get("evaluable_frames")
+        and joint_090.get("ratio", 0.0) > GATE_SWEEP_WARN_RATIO
+    ):
+        warnings.append(
+            f"绝对位置/距离门限放宽到 0.90m 即可救回 {joint_090['frames']} 帧"
+            f"（占可回放被拒帧 {joint_090['ratio'] * 100:.0f}%）：当前 0.45m 门限对"
+            f"该距离上的 PnP 位置噪声偏紧，且它不看协方差（马氏门限几乎不触发）——"
+            "详见报告 gate_sweep"
         )
     radius_stdev = jitter.get("radius_stdev_within_generation")
     if radius_stdev is not None and radius_stdev > RADIUS_DRIFT_WARN_M:
@@ -666,6 +788,7 @@ def analyze_records(
         },
         "continuity": continuity,
         "association": association,
+        "gate_sweep": gate_sweep,
         "jitter": jitter,
         "coverage": coverage,
         "missing_fields": missing_fields,
@@ -801,9 +924,46 @@ def print_report(report):
                     f"    {key}: mean={summary['mean']:.3f} "
                     f"p95={summary['p95']:.3f} max={summary['max']:.3f}"
                 )
+    sweep = report.get("gate_sweep", {})
+    if sweep.get("evaluable_frames"):
+        print(
+            f"  关联门限离线扫描: 被拒 {sweep['rejected_frames']} 帧，可回放 "
+            f"{sweep['evaluable_frames']} 帧（后验拒绝 {sweep['posterior_rejected_frames']}、"
+            f"栽在 angle/score/马氏门限 {sweep['blocked_by_other_gates']}、"
+            f"残差非有限 {sweep['non_finite_frames']}）"
+        )
+        print(
+            "    仅放宽 position 门限的恢复帧数: "
+            + " ".join(
+                f"{threshold:.2f}m→{count}"
+                for threshold, count in sweep["position_recovery"].items()
+            )
+        )
+        print(
+            "    仅放宽 distance 门限的恢复帧数: "
+            + " ".join(
+                f"{threshold:.2f}m→{count}"
+                for threshold, count in sweep["distance_recovery"].items()
+            )
+        )
+        header = "".join(f"{threshold:>8.2f}" for threshold in sweep["thresholds"])
+        print("    联合恢复网格（行=position 门限，列=distance 门限）:")
+        print(f"    {'':>8}{header}")
+        for threshold, row in zip(sweep["thresholds"], sweep["recovered_grid"]):
+            print(f"    {threshold:>8.2f}" + "".join(f"{count:>8d}" for count in row))
+        for pair, summary in sweep.get("joint_recovery", {}).items():
+            print(
+                f"    {pair}m 同时放宽可救回 {summary['frames']} 帧"
+                f"（{summary['ratio'] * 100:.1f}%）"
+            )
     jitter = report.get("jitter", {})
     if jitter.get("tx_command_mode_counts"):
         print(f"  指令模式: {jitter['tx_command_mode_counts']}")
+    if jitter.get("extrapolate_frames"):
+        print(
+            f"  temp_lost 外推跟随帧: {jitter['extrapolate_frames']}"
+            "（--tx-follow-temp-lost 生效；这些帧的 hold/resume 跳变应明显减少）"
+        )
     for key in ("command_yaw_step_deg", "resume_step_deg"):
         summary = jitter.get(key)
         if summary and summary.get("count"):

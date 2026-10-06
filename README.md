@@ -298,7 +298,13 @@ python3 tools/real_tracker_analyzer.py \
 
 评估脚本会检查设备计数和帧号单调性、`mapped_age`、`mapping_delay`、串口匹配间隔、
 检测率、Tracker 状态、中心速度、预测时间、瞄准角以及 `skip_reason`。它只分析记录，
-不修改 Tracker 或 Aimer 参数。脚本测试：
+不修改 Tracker 或 Aimer 参数。报告还包含关联门限离线扫描（`gate_sweep`）：它只用
+被拒帧已记录的 `association_primary_position_error`/`distance_error` 做数学回放，
+并沿用这些帧 angle/score/马氏门限的既有结论，直接回答"绝对门限放宽到多少米能救回
+多少被拒帧"，因此选门限不必重新上车采集；被 EKF 后验否决、或栽在 angle/score/马氏
+门限的帧单独计数，不计入可恢复帧（放宽绝对门限对它们无效）。`tx_extrapolating`
+帧数不为 0 时说明 `temp_lost` 外推跟随已生效，可对比 `hold_ratio` 与
+`resume_step_deg` 判断"冻结→补跳"是否被摊平。脚本测试：
 
 ```bash
 python3 -m unittest tests/test_real_tracker_analyzer.py
@@ -342,6 +348,13 @@ Planner 尚未收敛但轨迹有限时，会发送受限步进的目标角，先
 反馈弹速在 10–25 m/s 时使用实测值；若反馈为 0，可显式设置
 `--tx-use-nominal-speed=1`，让无开火控制计算使用配置中的名义弹速。有效反馈弹速
 始终优先，`fire_flag` 始终为 0。JSONL 的 `tx_speed_source` 会标明本帧来源。
+默认情况下 `temp_lost` 帧只发送保持角：真机日志显示这会在每次漏检后形成"先冻结、
+恢复时一次性补跳"的循环（1852 次 / 245s ≈ 7.6 次/秒，恢复帧 yaw 跳变 p95 1.87°，
+而正常帧只有 0.45°）。`--tx-follow-temp-lost=1` 会在连续丢失帧数不超过
+`--tx-temp-lost-frames`（默认 5，≈100ms）时按预测状态继续发送受限步进跟随命令，
+把这个阶跃摊到数帧里；这些帧在 JSONL 中标记为 `tx_command_mode=extrapolate`、
+`tx_extrapolating=true`，`planner_control` 记 0，`fire_flag` 仍恒为 0。超出帧数
+上限、解算无效或进入 `lost` 时立即回到保持角。
 `tx_command_sent` 只表示命令进入邮箱；`tx_wire_target_frames` 和
 `tx_wire_zero_frames` 是串口线程成功写入的累计帧数，不等于下位机执行回执。
 默认参数为 20 ms 发送周期、100 ms 命令有效期、yaw 每帧最多 2 deg、pitch 每帧最多 1 deg，
