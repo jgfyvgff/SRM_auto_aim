@@ -327,5 +327,52 @@ class RealTrackerAnalyzerTest(unittest.TestCase):
         self.assertFalse(any("日志缺少" in warning for warning in report["warnings"]))
 
 
+    def test_weights_blind_causes_by_frames(self):
+        # 按段统计会被大量单帧漏检稀释：真正吃掉冻结时长的可能是少数长盲区。
+        records = [{"event": "frame", "tracker_state": "tracking", "detected": 1}]
+        records += [
+            {"event": "frame", "tracker_state": "temp_lost", "detected": 0} for _ in range(20)
+        ]
+        records += [{"event": "frame", "tracker_state": "tracking", "detected": 1}]
+        records += [
+            {"event": "frame", "tracker_state": "temp_lost", "detected": 1,
+             "association_candidate_count": 1, "association_accepted_count": 0,
+             "association_primary_gate_passed": 0,
+             "association_primary_position_gate_passed": 0}
+        ]
+        records += [{"event": "frame", "tracker_state": "tracking", "detected": 1}]
+        report = analyze_records(records)
+        continuity = report["continuity"]
+        self.assertEqual(continuity["run_causes"], {"no_detection": 1, "candidate_rejected": 1})
+        self.assertEqual(
+            continuity["frame_causes"], {"no_detection": 20, "candidate_rejected": 1}
+        )
+        self.assertEqual(continuity["cause_longest_frames"], {"no_detection": 20,
+                                                              "candidate_rejected": 1})
+        self.assertEqual(continuity["short_blind_runs"], 1)
+        self.assertEqual(continuity["short_blind_frames"], 1)
+        self.assertAlmostEqual(continuity["short_blind_ratio"], 1.0 / 21.0)
+        self.assertTrue(
+            any("冻结时长来自没有任何敌方装甲板检测" in w for w in report["warnings"])
+        )
+
+    def test_flags_short_blind_runs_as_minor(self):
+        records = []
+        for _ in range(3):
+            records.append({"event": "frame", "tracker_state": "tracking", "detected": 1})
+            records.append({"event": "frame", "tracker_state": "temp_lost", "detected": 0})
+        records.append({"event": "frame", "tracker_state": "tracking", "detected": 1})
+        records += [
+            {"event": "frame", "tracker_state": "lost", "detected": 0} for _ in range(20)
+        ]
+        records.append({"event": "frame", "tracker_state": "tracking", "detected": 1})
+        report = analyze_records(records)
+        self.assertEqual(report["continuity"]["short_blind_runs"], 3)
+        self.assertEqual(report["continuity"]["short_blind_frames"], 3)
+        self.assertTrue(
+            any("短盲区" in warning and "冻结帧" in warning for warning in report["warnings"])
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

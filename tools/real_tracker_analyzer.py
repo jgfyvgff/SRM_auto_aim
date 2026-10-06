@@ -55,6 +55,9 @@ FIELD_GROUPS = (
 # 缺这几组字段时主结论无法给出，必须告警；其余组只在覆盖行里按需展示。
 CRITICAL_FIELD_GROUPS = ("盲区与保持帧", "指令模式", "关联拒绝归因")
 
+# 长度不超过该值的盲区视为"单次漏检造成的短暂冻结"，与"目标真的不在视野"分开。
+SHORT_BLIND_FRAMES = 2
+
 
 def percentile(values, ratio):
     ordered = sorted(values)
@@ -234,13 +237,27 @@ def continuity_report(records, fallback_period_ms):
         runs.append(current)
 
     causes = collections.Counter()
+    cause_frames = collections.Counter()
+    cause_longest_frames = collections.Counter()
+    cause_longest_ms = {}
     longest_frames = 0
     longest_ms = 0.0
     for run in runs:
-        causes[blind_run_cause([tracked[index] for index in run])] += 1
+        frames = [tracked[index] for index in run]
+        cause = blind_run_cause(frames)
+        duration_ms = axis[run[-1]] - axis[run[0]] + fallback_period_ms
+        causes[cause] += 1
+        cause_frames[cause] += len(run)
+        if len(run) > cause_longest_frames[cause]:
+            cause_longest_frames[cause] = len(run)
+            cause_longest_ms[cause] = duration_ms
         longest_frames = max(longest_frames, len(run))
-        longest_ms = max(longest_ms, axis[run[-1]] - axis[run[0]] + fallback_period_ms)
+        longest_ms = max(longest_ms, duration_ms)
 
+    # 按段统计会被大量 1~2 帧的短盲区稀释：1853 段里可能只有几段是"目标真的不在
+    # 视野"，其余全是单帧漏检造成的短暂冻结。必须同时给出按帧加权的成因占比与
+    # 短盲区占比，否则无法判断该修检测器、门限，还是根本不用修。
+    short_runs = [run for run in runs if len(run) <= SHORT_BLIND_FRAMES]
     blind = [index for run in runs for index in run]
     return {
         "following_states": list(FOLLOWING_STATES),
@@ -259,6 +276,14 @@ def continuity_report(records, fallback_period_ms):
             1 for index in blind if (tracked[index].get("association_accepted_count") or 0) > 0
         ),
         "run_causes": dict(causes),
+        "frame_causes": dict(cause_frames),
+        "cause_longest_frames": dict(cause_longest_frames),
+        "cause_longest_ms": cause_longest_ms,
+        "short_blind_runs": len(short_runs),
+        "short_blind_frames": sum(len(run) for run in short_runs),
+        "short_blind_ratio": (
+            sum(len(run) for run in short_runs) / len(blind) if blind else 0.0
+        ),
     }
 
 
@@ -498,21 +523,35 @@ def analyze_records(
             f"最长 {continuity['longest_blind_frames']} 帧 / {continuity['longest_blind_ms']:.1f}ms："
             "非 tracking 帧只发送保持角，这段时间云台没有跟随目标"
         )
-    run_causes = continuity.get("run_causes", {})
-    total_runs = sum(run_causes.values())
-    if total_runs:
-        no_detection_share = run_causes.get("no_detection", 0) / total_runs
-        rejected_share = run_causes.get("candidate_rejected", 0) / total_runs
+    frame_causes = continuity.get("frame_causes", {})
+    total_blind = sum(frame_causes.values())
+    if total_blind:
+        no_detection_share = frame_causes.get("no_detection", 0) / total_blind
+        rejected_share = frame_causes.get("candidate_rejected", 0) / total_blind
         if no_detection_share > NO_DETECTION_RUN_SHARE:
             warnings.append(
-                f"{no_detection_share * 100:.0f}% 的盲区片段没有任何敌方装甲板检测"
-                "（detected==0）：瓶颈在检测器（min_confidence、曝光、焦距），"
+                f"{no_detection_share * 100:.0f}% 的冻结时长来自没有任何敌方装甲板检测"
+                "（detected==0）的帧：瓶颈在检测器（min_confidence、曝光、焦距），"
                 "而不是 Tracker 状态机或关联参数"
             )
         if rejected_share > CANDIDATE_REJECT_RUN_SHARE:
             warnings.append(
-                f"{rejected_share * 100:.0f}% 的盲区片段有检测但候选被全部拒绝："
+                f"{rejected_share * 100:.0f}% 的冻结时长来自有检测但候选被全部拒绝的帧："
                 "瓶颈在关联门限或 EKF 后验，需要确认门限是否随距离与协方差自适应"
+            )
+        no_detection_runs = continuity.get("run_causes", {}).get("no_detection", 0)
+        total_runs = sum(continuity.get("run_causes", {}).values())
+        if total_runs and no_detection_runs / total_runs > NO_DETECTION_RUN_SHARE:
+            warnings.append(
+                f"{no_detection_runs / total_runs * 100:.0f}% 的盲区段（{total_runs} 段）"
+                "完全没有检测：这些段里云台不动是目标真的不在视野，不是状态机缺陷"
+            )
+        short_ratio = continuity.get("short_blind_ratio", 0.0)
+        if continuity.get("short_blind_runs") and short_ratio < FREEZE_RATIO_WARNING:
+            warnings.append(
+                f"{continuity['short_blind_runs']} 段短盲区（≤{SHORT_BLIND_FRAMES} 帧）"
+                f"只占冻结帧的 {short_ratio * 100:.1f}%：主要冻结时长来自长盲区，"
+                "优先按上面的成因修根因，而不是只做短时外推"
             )
     if association.get("gate_passed_but_rejected_frames", 0):
         warnings.append(
@@ -677,11 +716,24 @@ def print_report(report):
             f"{name}={count}" for name, count in continuity["run_causes"].items()
         )
         print(
-            f"  盲区成因: {causes or '无'}"
+            f"  盲区成因(按段): {causes or '无'}"
             f"（其中有检测的盲区帧 {continuity['blind_frames_with_detection']}，"
             f"有候选 {continuity['blind_frames_with_candidate']}，"
             f"有确认观测 {continuity['blind_frames_accepted']}）"
         )
+        frame_causes = " ".join(
+            f"{name}={count}" for name, count in continuity.get("frame_causes", {}).items()
+        )
+        print(
+            f"  盲区成因(按帧权重): {frame_causes or '无'}；"
+            f"短盲区(≤{SHORT_BLIND_FRAMES}帧) {continuity.get('short_blind_runs', 0)} 段 "
+            f"只占冻结帧 {continuity.get('short_blind_ratio', 0.0) * 100:.1f}%"
+        )
+        longest = " ".join(
+            f"{name}={frames}帧/{continuity.get('cause_longest_ms', {}).get(name, 0.0):.0f}ms"
+            for name, frames in continuity.get("cause_longest_frames", {}).items()
+        )
+        print(f"  各成因最长段: {longest or '无'}")
     association = report.get("association", {})
     if association.get("candidate_frames"):
         print(
@@ -714,7 +766,8 @@ def print_report(report):
         if summary and summary.get("count"):
             print(
                 f"  {key}: mean={summary['mean']:.3f}° "
-                f"p95={summary['p95']:.3f}° max={summary['max']:.3f}°"
+                f"p95={summary['p95']:.3f}° max={summary['max']:.3f}° "
+                f"({summary['count']} 次)"
             )
     if jitter.get("generation_changes") or jitter.get("armor_id_switches"):
         print(
