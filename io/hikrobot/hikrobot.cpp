@@ -195,12 +195,15 @@ void HikRobot::capture_start()
       // ret = MV_CC_ConvertPixelType(handle_, &cvt_param);
       auto pixel_type = frame_info.enPixelType;
       cv::Mat dst_image;
+      // GenICam/GigE Vision 的 Bayer 命名与 OpenCV 相反：OpenCV 的两个字母取
+      // 「第二行第二、三列」，GenICam 取「第一行第一、二列」，因此必须交叉映射，
+      // 同名对同名会让 R/B 互换（曾使 imshow 与 YOLO 都看到反色图）。
       //Bayer格式转换映射表
       const static std::unordered_map<MvGvspPixelType, cv::ColorConversionCodes> type_map = {
-        {PixelType_Gvsp_BayerGR8, cv::COLOR_BayerGR2BGR},
-        {PixelType_Gvsp_BayerRG8, cv::COLOR_BayerRG2BGR},
-        {PixelType_Gvsp_BayerGB8, cv::COLOR_BayerGB2BGR},
-        {PixelType_Gvsp_BayerBG8, cv::COLOR_BayerBG2BGR}};
+        {PixelType_Gvsp_BayerGR8, cv::COLOR_BayerGB2BGR},
+        {PixelType_Gvsp_BayerRG8, cv::COLOR_BayerBG2BGR},
+        {PixelType_Gvsp_BayerGB8, cv::COLOR_BayerGR2BGR},
+        {PixelType_Gvsp_BayerBG8, cv::COLOR_BayerRG2BGR}};
       const auto conversion = type_map.find(pixel_type);
       if (conversion == type_map.end()) {
         tools::logger()->error(
