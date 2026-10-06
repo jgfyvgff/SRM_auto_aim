@@ -251,9 +251,11 @@ Tracker 使用。该映射仍带有未知的
 `read()` 保持主机收帧时间供标定程序使用。无硬件测试：
 `ctest --test-dir build -R '^(device_clock_mapper|real_feedback_buffer|real_serial_feedback)_test$'`。
 
-真机只读自瞄入口 `standard_srm` 复用海康图像、串口反馈、YOLOv5、PnP、Tracker
-和 Aimer；同时用已有 Planner 计算只读轨迹，不创建 Shooter、也不发送串口控制帧。
-Planner 从串口缓存最新两帧的主机接收时间估计当前角速度，按当前云台姿态建立
+真机自瞄入口 `standard_srm` 复用海康图像、串口反馈、YOLOv5、PnP、Tracker
+和 Aimer；默认只读，同时用已有 Planner 计算诊断轨迹，不发送串口控制帧。
+只有显式指定 `--enable-tx=1` 才会通过现有 USB CDC 协议发送 yaw/pitch，且
+`fire_flag` 永远固定为 0。本次只修改上位机仓库，不修改下位机固件。
+Planner 从串口缓存有效窗口内相距较远的两帧主机接收时间估计当前角速度，按当前云台姿态建立
 MPC 初始状态，并从当前时刻生成参考轨迹。协议没有真实采样时刻或速度，所以该估计
 不能视作硬件同步测量。弹速反馈为 0 时，Planner 使用配置中的
 `planner_debug_bullet_speed_mps`，日志明确标记 `diagnostic_nominal`；这种结果仅供
@@ -302,11 +304,20 @@ python3 tools/real_tracker_analyzer.py \
 python3 -m unittest tests/test_real_tracker_analyzer.py
 ```
 
-日志中的 `diagnostic_yaw/pitch` 只是 Aimer 计算结果，`NO_TX` 表示无控制输出。
+日志中的 `diagnostic_yaw/pitch` 只是 Aimer 计算结果；默认运行时 `tx_enabled=false`，
+无控制输出。启用发送后，应结合 `tx_command_sent` 和 `tx_command_mode` 判断上位机
+是否将无开火目标放入发送邮箱。
 `planner_status=ok` 表示求解器收敛；`unconverged_diagnostic` 表示仅有有限的数值轨迹，
 此时 `planner_control=0`，不可用于控制。可比较 `planner_measured_*`、
 `planner_state_*`、`planner_target_*` 与 `planner_yaw_deg/pitch_deg`，并查看
 `planner_feedback_age_ms`、`planner_feedback_interval_ms`、`planner_ms`。
+`planner_feedback_interval_ms` 是用于速度差分的收帧时间跨度，不是串口或相机硬件时间。
+另有 `planner_*_100ms_deg`（参考与解算后 100 ms 角度）、每轴
+`planner_{yaw,pitch}_solver_status`、`planner_{yaw,pitch}_solver_iterations` 和
+`planner_{yaw,pitch}_{primal,dual}_residual_max`；状态 0 表示该轴收敛，残差为
+TinyMPC 原始数值，不是角度误差。100 ms 角度只用于查看轨迹趋势，不是下发命令；
+`planner_control=0` 不代表接近阶段没有发送，接近阶段由 `tx_command_mode=acquire`
+单独标记。
 云台静止且无法形成可靠差分速度时，Planner 使用图像时刻已匹配的串口 yaw/pitch，
 将角速度置零，并标记 `planner_state_source=matched_pose_zero_velocity`；该状态只能
 用于静止场景诊断，`planner_control` 保持为 0。存在有效差分速度时，状态来源标记为
@@ -315,10 +326,44 @@ Planner 输出的是下一 10 ms 规划步的
 绝对角；当前串口协议没有速度、加速度字段，日志中的规划速度与加速度不会发送。
 `frame/ticks/tick_hz` 为 SDK 帧号、原始计数和相机报告的频率；`mapped_age` 与
 `mapping_delay` 均基于估计的主机映射时间，不能解释为已测得的曝光/串口硬件延迟。
-配置暂用 `handeye_real2.yaml` 外参、`intrinsics_real.yaml` 内参及固定蓝色敌方设置；
+配置暂用 `handeye_real2.yaml` 外参、`intrinsics_real.yaml` 内参；敌方颜色由
+`enemy_color` 配置决定。
 模式和颜色反馈只记录原始整数，不猜测协议映射。图像尺寸不符会直接报错；姿态缺失
 或图像过期时不更新 Tracker。当前海康 `Camera::read()` 在无图像时仍可能阻塞，
 该入口的退出有赖于相机持续返回图像，尚未完成硬件验收。
+
+启用上位机无开火控制时，`standard_srm` 会在 Planner 收敛后发送 MPC 角度；
+Planner 尚未收敛但轨迹有限时，会发送受限步进的目标角，先让云台接近目标。
+有效目标跨帧保留，避免视觉处理期间交替发送目标与零命令。短暂丢目标时最多保持
+100 ms；图像时间戳无效、串口反馈缺失或轨迹非法等硬故障会立即清空命令邮箱，
+随后发送 yaw=0、pitch=0、fire=0。
+反馈弹速在 10–25 m/s 时使用实测值；若反馈为 0，可显式设置
+`--tx-use-nominal-speed=1`，让无开火控制计算使用配置中的名义弹速。有效反馈弹速
+始终优先，`fire_flag` 始终为 0。JSONL 的 `tx_speed_source` 会标明本帧来源。
+`tx_command_sent` 只表示命令进入邮箱；`tx_wire_target_frames` 和
+`tx_wire_zero_frames` 是串口线程成功写入的累计帧数，不等于下位机执行回执。
+默认参数为 20 ms 发送周期、100 ms 命令有效期、yaw 每帧最多 2 deg、pitch 每帧最多 1 deg，
+可通过命令行覆盖。这里的 `tx_command_mode=acquire` 表示接近阶段，
+`tx_command_mode=tracking` 表示 Planner 已收敛后的跟踪阶段。
+
+首次只建议进行无开火短时测试：
+
+```bash
+./build/standard_srm configs/real_auto_aim.yaml \
+  --port=/dev/ttyACM0 \
+  --enable-tx=1 \
+  --tx-use-nominal-speed=1 \
+  --show=1 \
+  --debug-jsonl=/tmp/real_srm_tx_test.jsonl
+```
+
+下位机固件没有被本项目修改，也没有新增下位机超时失效机制。上位机正常退出时
+会尽力补发一次零命令；USB 断开、进程崩溃或 `kill -9` 时不能保证旧命令立即失效，
+因此测试时必须保持急停和断电条件可用。Fake 串口测试可用：
+
+```bash
+ctest --test-dir build -R '^real_serial_feedback_test$' --output-on-failure
+```
 
 ### MPC PlotJuggler 曲线
 
@@ -512,3 +557,21 @@ python3 -m unittest discover -s tests -p 'test_sim_tracker_analyzer.py'
       --warmup-frames 20
 
 推荐值只写入 /tmp/real_exposure_gain_report.json，不会自动修改 YAML。确认后再把 exposure_ms 和 gain 写入配置。每组运行的 JSONL、日志默认保存在 /tmp/real_exposure_gain_tuner；需要保留原始图像时增加 --keep-frames。
+
+4～5 米识别调参可使用有边界的自适应模式。先在同一距离、光照和目标运动条件下采 3×3 初始点，再用曝光对数与增益的二次响应曲面建议额外实测点；预测极值不直接作为推荐值。每个候选会重新启动相机并独立确认 3 次，推荐先比较三次平均检测率和最长连续漏检，再比较三次中最低的综合分数。初始点的最小/最大值就是搜索边界，模型不会外推；若最优值落在边界，需人工扩大范围重新采样。
+
+```bash
+python3 tools/real_exposure_gain_tuner.py \
+  --repo . --config configs/real_auto_aim.yaml --port /dev/ttyACM0 \
+  --exposures 6,7,8 --gains 8,12,16 \
+  --frames 240 --warmup-frames 40 \
+  --adaptive --adaptive-steps 8 --confirm-top 2 --confirm-runs 3 \
+  --artifacts /tmp/exposure_4to5m \
+  --output /tmp/exposure_4to5m_report.json
+```
+
+`--exposure-step-ms` 与 `--gain-step` 分别限定额外请求值的间隔（默认 0.1 ms、0.5）；它们不是已验证的相机硬件步长。每次执行会在 `--artifacts` 下创建独立 `session_*` 目录，避免重跑混用旧 JSONL。`predicted_optimum` 是曲面预测，`recommendation` 只来自有效的重复实测；退出码异常、超时或有效帧不足的记录不参与拟合和推荐。报告同时记录最长连续漏检帧数及装甲 PnP 重投影误差 P95；过曝/欠曝、清晰度仍是全图指标，不能当作灯条局部亮度。扫参不发送云台控制，也不会自动更新 YAML。
+
+曲面使用 `u = 2(ln(e)-ln(e_min))/(ln(e_max)-ln(e_min))-1` 和 `v = 2(g-g_min)/(g_max-g_min)-1`，拟合 `b0+b1*u+b2*u²+b3*v+b4*v²+b5*u*v`；某一维固定时省略对应项。报告给出系数和样本内拟合 RMSE，不能据此保证未测点的真实得分。确认样本若一次也未检出装甲板，不会产生推荐值。自适应模式还会拒绝覆盖已有的 `--output` 报告，重跑时请换新文件名。
+
+只改曝光/增益不需要重标内外参；改了镜头焦距、分辨率或相机安装几何时，按上方内参/手眼流程分别重标。相机参数最优值只对当次距离、目标速度和光照有效，正式采用前仍需检查原图和漏检情况。

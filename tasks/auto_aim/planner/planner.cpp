@@ -1,5 +1,6 @@
 #include "planner.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <vector>
 
@@ -142,13 +143,35 @@ Plan Planner::plan(Target target, double bullet_speed, const PlannerState & stat
 
     // 发送协议只有绝对角；第 1 个规划步是当前状态之后 10 ms 的角度诊断。
     constexpr int next_step = 1;
+    constexpr int diagnostic_step = 10;
     Plan plan{};
+    plan.yaw_solver_status = yaw_status;
+    plan.pitch_solver_status = pitch_status;
+    plan.yaw_solver_iterations = yaw_solver_->solution->iter;
+    plan.pitch_solver_iterations = pitch_solver_->solution->iter;
+    // TinyMPC 的状态/输入残差分别计算，记录较大者，便于定位未收敛的轴。
+    plan.yaw_primal_residual_max = std::max(
+        yaw_solver_->work->primal_residual_state,
+        yaw_solver_->work->primal_residual_input);
+    plan.yaw_dual_residual_max = std::max(
+        yaw_solver_->work->dual_residual_state,
+        yaw_solver_->work->dual_residual_input);
+    plan.pitch_primal_residual_max = std::max(
+        pitch_solver_->work->primal_residual_state,
+        pitch_solver_->work->primal_residual_input);
+    plan.pitch_dual_residual_max = std::max(
+        pitch_solver_->work->dual_residual_state,
+        pitch_solver_->work->dual_residual_input);
     plan.target_yaw = tools::limit_rad(traj(0, next_step) + yaw0);
     plan.target_pitch = traj(2, next_step);
+    plan.target_yaw_100ms = tools::limit_rad(traj(0, diagnostic_step) + yaw0);
+    plan.target_pitch_100ms = traj(2, diagnostic_step);
     plan.yaw = tools::limit_rad(yaw_solver_->work->x(0, next_step) + yaw0);
+    plan.yaw_100ms = tools::limit_rad(yaw_solver_->work->x(0, diagnostic_step) + yaw0);
     plan.yaw_vel = yaw_solver_->work->x(1, next_step);
     plan.yaw_acc = yaw_solver_->work->u(0, 0);
     plan.pitch = pitch_solver_->work->x(0, next_step);
+    plan.pitch_100ms = pitch_solver_->work->x(0, diagnostic_step);
     plan.pitch_vel = pitch_solver_->work->x(1, next_step);
     plan.pitch_acc = pitch_solver_->work->u(0, 0);
     plan.fire = false;
@@ -232,7 +255,7 @@ Eigen::Matrix<double, 2, 1> Planner::aim(const Target & target, double bullet_sp
   if (bullet_traj.unsolvable) throw std::runtime_error("Unsolvable bullet trajectory!");
 
   return {tools::limit_rad(azim + yaw_offset_), -bullet_traj.pitch - pitch_offset_};
-}
+}//得到目标的yaw和pitch角度，yaw为世界坐标系下的偏航角，pitch为世界坐标系下的俯仰角
 
 Trajectory Planner::get_trajectory(
   Target & target, double yaw0, double bullet_speed, bool start_at_now)

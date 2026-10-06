@@ -25,7 +25,7 @@ struct MatchedFeedback
     double bracket_ms = 0.0;
 };
 
-// 仅由连续两帧主机收帧时间估计角速度；协议不提供真实采样时刻或速度。
+// 仅由主机收帧时间窗口估计角速度；协议不提供真实采样时刻或速度。
 struct LatestGimbalMotion
 {
     Clock::time_point received_at;
@@ -100,7 +100,8 @@ public:
 
     std::size_t size() const { return samples_.size(); }
 
-    // 规划诊断使用最新反馈；过期或相邻收帧过近时不估计速度。
+    // 规划诊断使用最新反馈与有效窗口内最早反馈；避免串口突发包的相邻间隔过短。
+    // 跨窗口的旧反馈和不足 1 ms 的基线均不可用于速度估计。
     std::optional<LatestGimbalMotion> latest_motion(Clock::time_point now) const
     {
         if (samples_.size() < 2 || now < samples_.back().received_at ||
@@ -108,7 +109,13 @@ public:
             return std::nullopt;
         }
         const auto & latest = samples_.back();
-        const auto & previous = *std::prev(samples_.end(), 2);
+        auto previous_it = std::prev(samples_.end(), 2);
+        while (previous_it != samples_.begin()) {
+            const auto earlier = std::prev(previous_it);
+            if (latest.received_at - earlier->received_at > max_gap_) break;
+            previous_it = earlier;
+        }
+        const auto & previous = *previous_it;
         const auto interval = latest.received_at - previous.received_at;
         if (interval < std::chrono::milliseconds(1) || interval > max_gap_) {
             return std::nullopt;

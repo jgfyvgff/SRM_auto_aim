@@ -44,6 +44,12 @@ const std::string kKeys =
     "{port|/dev/ttyACM0|USB CDC 串口设备}"
     "{check-config|false|只校验配置，不打开相机和串口}"
     "{show|false|显示实时调试窗口}"
+    "{enable-tx|false|启用无开火 yaw/pitch 控制发送，默认关闭}"
+    "{tx-use-nominal-speed|false|弹速反馈无效时允许使用配置名义弹速，仅无开火}"
+    "{tx-period-ms|20|控制发送周期，单位 ms}"
+    "{tx-command-ttl-ms|100|命令有效期，单位 ms}"
+    "{tx-max-yaw-step-deg|2.0|每帧 yaw 最大变化量，单位 deg}"
+    "{tx-max-pitch-step-deg|1.0|每帧 pitch 最大变化量，单位 deg}"
     "{save-frame|/tmp/real_srm_frame.jpg|按 s 保存当前显示帧}"
     "{debug-jsonl||保存逐帧真机诊断 JSONL}"
     "{exposure-ms|0|临时覆盖 YAML 曝光时间，单位 ms，0 表示沿用 YAML}"
@@ -55,6 +61,12 @@ const std::string kKeys =
 double duration_ms(Clock::time_point begin, Clock::time_point end)
 {
     return std::chrono::duration<double, std::milli>(end - begin).count();
+}
+
+double step_angle_towards(double current, double target, double max_step)
+{
+    const double delta = tools::limit_rad(target - current);
+    return tools::limit_rad(current + std::clamp(delta, -max_step, max_step));
 }
 
 void draw_polygon(
@@ -427,6 +439,12 @@ int main(int argc, char * argv[])
         const auto config = real_auto_aim::validate_real_config(real_yaml);
         const double planner_debug_speed =
             real_yaml["planner_debug_bullet_speed_mps"].as<double>();
+        const bool enable_tx = cli.get<bool>("enable-tx");
+        const bool tx_use_nominal_speed = cli.get<bool>("tx-use-nominal-speed");
+        const int tx_period_ms = cli.get<int>("tx-period-ms");
+        const int tx_command_ttl_ms = cli.get<int>("tx-command-ttl-ms");
+        const double tx_max_yaw_step_deg = cli.get<double>("tx-max-yaw-step-deg");
+        const double tx_max_pitch_step_deg = cli.get<double>("tx-max-pitch-step-deg");
         const double exposure_override = cli.get<double>("exposure-ms");
         const double gain_override = cli.get<double>("gain");
         const int max_frames = cli.get<int>("max-frames");
@@ -438,6 +456,11 @@ int main(int argc, char * argv[])
         }
         if (max_frames < 0) {
             throw std::invalid_argument("--max-frames must be non-negative");
+        }
+        if (tx_period_ms <= 0 || tx_command_ttl_ms <= 0 ||
+            !std::isfinite(tx_max_yaw_step_deg) || tx_max_yaw_step_deg <= 0.0 ||
+            !std::isfinite(tx_max_pitch_step_deg) || tx_max_pitch_step_deg <= 0.0) {
+            throw std::invalid_argument("Invalid TX timing or step configuration");
         }
         if (cli.get<bool>("check-config")) {
             std::cout << "Real read-only config OK: " << config.image_width << 'x'
@@ -456,7 +479,16 @@ int main(int argc, char * argv[])
         io::Camera camera(config_path, camera_overrides);
         io::srm_auto_aim::SerialConfig serial_config{port, 20};
         auto transport = std::make_unique<io::srm_auto_aim::SrmAutoAimTransport>(serial_config);
-        real_auto_aim::SerialFeedbackReader serial_feedback(std::move(transport));
+        real_auto_aim::SerialFeedbackReader serial_feedback(
+            std::move(transport), std::chrono::milliseconds(100), std::chrono::milliseconds(30),
+            enable_tx, std::chrono::milliseconds(tx_period_ms),
+            std::chrono::milliseconds(tx_command_ttl_ms));
+        if (enable_tx) {
+            tools::logger()->warn(
+                "[standard_srm/TX] enabled: yaw/pitch only, fire_flag is forced to 0; "
+                "lower-controller timeout is not modified, nominal_speed={}",
+                tx_use_nominal_speed);
+        }
         auto_aim::YOLO detector(config_path, false);
         auto_aim::Solver solver(config_path);
         auto_aim::Tracker tracker(config_path, solver);
@@ -467,6 +499,10 @@ int main(int argc, char * argv[])
         // 缺姿态时不更新世界系 Tracker；弹速无效时不调用带旧默认值回退的 Aimer。
         auto next_report = Clock::now();
         bool window_exit = false;
+        std::string tx_command_mode = "none";
+        bool tx_command_sent = false;
+        double tx_command_yaw_deg = 0.0;
+        double tx_command_pitch_deg = 0.0;
         const auto save_frame_path = cli.get<std::string>("save-frame");
         std::uint64_t saved_frame_count = 0;
         std::uint64_t captured_frame_count = 0;
@@ -530,7 +566,7 @@ int main(int argc, char * argv[])
         const auto log_skip = [&next_report](const char * reason) {
             const auto now = Clock::now();
             if (now >= next_report) {
-                tools::logger()->warn("[standard_srm/READ_ONLY] {} (NO_TX)", reason);
+                tools::logger()->warn("[standard_srm] {}", reason);
                 next_report = now + std::chrono::seconds(1);
             }
         };
@@ -543,13 +579,30 @@ int main(int argc, char * argv[])
             cv::imshow("standard_srm", visualization);
             handle_window_key(visualization);
         };
+        const auto clear_tx_on_hard_failure = [&serial_feedback, enable_tx]() {
+            if (enable_tx) serial_feedback.clear_command();
+        };
+        const auto record_sample = [&recorder, &serial_feedback](Json & sample) {
+            // tx_command_sent 仅表示进入邮箱；这两个累计量来自串口线程成功写入。
+            const auto tx_stats = serial_feedback.tx_stats();
+            sample["tx_wire_target_frames"] = tx_stats.target_frames;
+            sample["tx_wire_zero_frames"] = tx_stats.zero_frames;
+            recorder.write(sample);
+        };
         while (
             !exiter.exit() && !window_exit &&
             (max_frames == 0 || captured_frame_count < static_cast<std::uint64_t>(max_frames))) {
+            // 有效目标跨帧保留，避免视觉处理期间向下位机交替发送目标与零命令。
+            // 短暂丢目标由命令 TTL 限制；硬故障在对应路径立即清空邮箱。
+            tx_command_mode = "none";
+            tx_command_sent = false;
+            tx_command_yaw_deg = 0.0;
+            tx_command_pitch_deg = 0.0;
             cv::Mat image;
             io::FrameTiming timing;
             camera.read_timed(image, timing);
             if (image.empty()) {
+                clear_tx_on_hard_failure();
                 log_skip("empty camera frame");
                 continue;
             }
@@ -563,6 +616,12 @@ int main(int argc, char * argv[])
             sample["captured_frame"] = captured_frame_count;
             sample["image_width"] = image.cols;
             sample["image_height"] = image.rows;
+            sample["tx_enabled"] = enable_tx;
+            sample["tx_speed_source"] = "unavailable";
+            sample["tx_command_sent"] = false;
+            sample["tx_command_mode"] = "none";
+            sample["tx_command_yaw_deg"] = nullptr;
+            sample["tx_command_pitch_deg"] = nullptr;
             if (quality_metrics) append_image_quality_json(sample, image);
             // 优先使用设备计数映射时间；USB 相机频率不可用时，退回主机收帧时间。
             // 两者在诊断数据中通过 timestamp_source 区分，避免误认为曝光时刻。
@@ -580,7 +639,8 @@ int main(int argc, char * argv[])
                         : "camera timestamp mapping warming up or reset";
                 sample["event"] = "skip";
                 sample["skip_reason"] = reason;
-                recorder.write(sample);
+                clear_tx_on_hard_failure();
+                record_sample(sample);
                 show_skip_frame(image, reason);
                 log_skip(reason);
                 continue;
@@ -591,7 +651,8 @@ int main(int argc, char * argv[])
                 received_at - image_timestamp > config.max_image_age) {
                 sample["event"] = "skip";
                 sample["skip_reason"] = "camera frame timestamp is invalid or stale";
-                recorder.write(sample);
+                clear_tx_on_hard_failure();
+                record_sample(sample);
                 show_skip_frame(image, "stale camera timestamp");
                 log_skip("camera frame timestamp is invalid or stale");
                 continue;
@@ -606,7 +667,8 @@ int main(int argc, char * argv[])
             if (!feedback) {
                 sample["event"] = "skip";
                 sample["skip_reason"] = "no fresh feedback on both sides of image time";
-                recorder.write(sample);
+                clear_tx_on_hard_failure();
+                record_sample(sample);
                 show_skip_frame(image, "waiting for serial feedback");
                 log_skip("no fresh feedback on both sides of image time");
                 continue;
@@ -636,6 +698,7 @@ int main(int argc, char * argv[])
             auto targets = tracker.track(armors, image_timestamp);
             const auto tracker_end = Clock::now();
             const double bullet_speed = feedback->feedback.bullet_speed_mps;
+            const bool measured_speed = bullet_speed >= 10.0 && bullet_speed <= 25.0;
             // if (!std::isfinite(bullet_speed) || bullet_speed < 14.0) {//弹速小于0,不能正常绘制检测框
             //简单验证无弹速的aimmer
             if (!std::isfinite(bullet_speed)) {
@@ -650,13 +713,18 @@ int main(int argc, char * argv[])
                 append_reprojection_json(
                     sample, solver, detected_armors_for_diagnostic, targets);
                 append_association_json(sample, tracker.association_debug());
-                recorder.write(sample);
+                clear_tx_on_hard_failure();
+                record_sample(sample);
                 show_skip_frame(image, "invalid bullet speed");
                 log_skip("invalid bullet speed; Aimer default-speed fallback is disabled");
                 continue;
             }
             const auto aimer_start = Clock::now();
-            const auto diagnostic = aimer.aim(targets, image_timestamp, bullet_speed);
+            // 名义弹速只在显式无开火测试中替代 0 弹速，避免 Aimer/Planner 因飞行时间无效
+            // 产生不可解释的诊断；真实弹速存在时始终优先使用反馈值。
+            const double aimer_speed =
+                !measured_speed && tx_use_nominal_speed ? planner_debug_speed : bullet_speed;
+            const auto diagnostic = aimer.aim(targets, image_timestamp, aimer_speed);
             const auto finished_at = Clock::now();
 
             sample["planner_status"] = "no_tracking_target";
@@ -667,12 +735,14 @@ int main(int argc, char * argv[])
             const auto planner_start = Clock::now();
             if (!targets.empty() && tracker.state() == "tracking") {
                 const auto motion = serial_feedback.latest_motion();
-                const bool measured_speed = bullet_speed >= 10.0 && bullet_speed <= 25.0;
                 // 无真实弹速时仅计算诊断轨迹；不能据此驱动云台或申请开火。
                 const double planning_speed = measured_speed ? bullet_speed : planner_debug_speed;
                 sample["planner_speed_source"] =
                     measured_speed ? "feedback" : "diagnostic_nominal";
                 sample["planner_bullet_speed_mps"] = planning_speed;
+                sample["tx_speed_source"] =
+                    measured_speed ? "feedback" :
+                    (tx_use_nominal_speed ? "diagnostic_nominal" : "unavailable");
 
                 auto_aim::PlannerState planner_state{
                     feedback->feedback.yaw_deg * CV_PI / 180.0,
@@ -711,11 +781,18 @@ int main(int argc, char * argv[])
                 auto target = targets.front();
                 target.predict(planner_start);
                 const auto plan = planner.plan(target, planning_speed, planner_state);
+                if (!plan.diagnostic_valid || (!measured_speed && !tx_use_nominal_speed)) {
+                    clear_tx_on_hard_failure();
+                }
                 sample["planner_status"] =
                     !plan.diagnostic_valid ? "invalid" :
                     plan.solver_converged ? "ok" : "unconverged_diagnostic";
                 sample["planner_control"] = plan.control && has_measured_velocity ? 1 : 0;
                 sample["planner_solver_converged"] = plan.solver_converged;
+                sample["planner_yaw_solver_status"] = plan.yaw_solver_status;
+                sample["planner_pitch_solver_status"] = plan.pitch_solver_status;
+                sample["planner_yaw_solver_iterations"] = plan.yaw_solver_iterations;
+                sample["planner_pitch_solver_iterations"] = plan.pitch_solver_iterations;
                 if (plan.diagnostic_valid) {
                     sample["planner_target_yaw_deg"] = plan.target_yaw * 180.0 / CV_PI;
                     sample["planner_target_pitch_deg"] = plan.target_pitch * 180.0 / CV_PI;
@@ -725,7 +802,70 @@ int main(int argc, char * argv[])
                     sample["planner_pitch_vel_rad_s"] = plan.pitch_vel;
                     sample["planner_yaw_acc_rad_s2"] = plan.yaw_acc;
                     sample["planner_pitch_acc_rad_s2"] = plan.pitch_acc;
+                    // 额外诊断值不参与 control 门控；非有限值单独写 null，避免污染 JSONL。
+                    if (std::isfinite(plan.target_yaw_100ms) &&
+                        std::isfinite(plan.target_pitch_100ms) &&
+                        std::isfinite(plan.yaw_100ms) && std::isfinite(plan.pitch_100ms)) {
+                        sample["planner_target_yaw_100ms_deg"] =
+                            plan.target_yaw_100ms * 180.0 / CV_PI;
+                        sample["planner_target_pitch_100ms_deg"] =
+                            plan.target_pitch_100ms * 180.0 / CV_PI;
+                        sample["planner_yaw_100ms_deg"] = plan.yaw_100ms * 180.0 / CV_PI;
+                        sample["planner_pitch_100ms_deg"] = plan.pitch_100ms * 180.0 / CV_PI;
+                    } else {
+                        sample["planner_target_yaw_100ms_deg"] = nullptr;
+                        sample["planner_target_pitch_100ms_deg"] = nullptr;
+                        sample["planner_yaw_100ms_deg"] = nullptr;
+                        sample["planner_pitch_100ms_deg"] = nullptr;
+                    }
+                    sample["planner_yaw_primal_residual_max"] =
+                        std::isfinite(plan.yaw_primal_residual_max) ?
+                        Json(plan.yaw_primal_residual_max) : Json(nullptr);
+                    sample["planner_yaw_dual_residual_max"] =
+                        std::isfinite(plan.yaw_dual_residual_max) ?
+                        Json(plan.yaw_dual_residual_max) : Json(nullptr);
+                    sample["planner_pitch_primal_residual_max"] =
+                        std::isfinite(plan.pitch_primal_residual_max) ?
+                        Json(plan.pitch_primal_residual_max) : Json(nullptr);
+                    sample["planner_pitch_dual_residual_max"] =
+                        std::isfinite(plan.pitch_dual_residual_max) ?
+                        Json(plan.pitch_dual_residual_max) : Json(nullptr);
                 }
+
+                // 发送分为两个阶段：MPC 收敛后跟踪 MPC 输出；未收敛但轨迹有限时，
+                // 先用几何目标让云台接近。每帧步进限制用于避免把大角度误差一次性
+                // 变成突发目标；它不改变 Planner 的诊断结果，也绝不申请开火。
+                const bool tx_ready = enable_tx && (measured_speed || tx_use_nominal_speed) &&
+                                      has_measured_velocity && plan.diagnostic_valid;
+                if (tx_ready) {
+                    const double requested_yaw =
+                        plan.solver_converged ? plan.yaw : plan.target_yaw;
+                    const double requested_pitch =
+                        plan.solver_converged ? plan.pitch : plan.target_pitch;
+                    const double max_yaw_step = tx_max_yaw_step_deg * CV_PI / 180.0;
+                    const double max_pitch_step = tx_max_pitch_step_deg * CV_PI / 180.0;
+                    const double command_yaw = step_angle_towards(
+                        planner_state.yaw, requested_yaw, max_yaw_step);
+                    const double command_pitch = planner_state.pitch + std::clamp(
+                        requested_pitch - planner_state.pitch,
+                        -max_pitch_step, max_pitch_step);
+                    if (std::isfinite(command_yaw) && std::isfinite(command_pitch)) {
+                        serial_feedback.set_command({
+                            static_cast<float>(command_yaw * 180.0 / CV_PI),
+                            static_cast<float>(command_pitch * 180.0 / CV_PI),
+                            0});
+                        tx_command_sent = true;
+                        tx_command_mode = plan.solver_converged ? "tracking" : "acquire";
+                        tx_command_yaw_deg = command_yaw * 180.0 / CV_PI;
+                        tx_command_pitch_deg = command_pitch * 180.0 / CV_PI;
+                    }
+                }
+            }
+            sample["tx_command_sent"] = tx_command_sent;
+            sample["tx_command_mode"] = tx_command_mode;
+            if (tx_command_sent) {
+                sample["tx_command_yaw_deg"] = tx_command_yaw_deg;
+                sample["tx_command_pitch_deg"] = tx_command_pitch_deg;
             }
             sample["planner_ms"] = duration_ms(planner_start, Clock::now());
 
@@ -748,7 +888,7 @@ int main(int argc, char * argv[])
                 sample, solver, detected_armors_for_diagnostic, targets);
             append_association_json(sample, tracker.association_debug());
             append_aim_json(sample, aimer, diagnostic);
-            recorder.write(sample);
+            record_sample(sample);
 
             if (show) {
                 cv::Mat visualization = image.clone();
@@ -810,27 +950,28 @@ int main(int argc, char * argv[])
                         timing.host_received_at - *timing.mapped_capture_at).count()
                     : 0.0;
                 tools::logger()->info(
-                    "[standard_srm/READ_ONLY] frame={} ticks={} tick_hz={} "
+                    "[standard_srm] frame={} ticks={} tick_hz={} "
                     "timestamp_source={} "
                     "image_age={:.1f}ms mapping_delay={:.1f}ms bracket={:.1f}ms "
                     "detected={} targets={} tracker={} speed={:.2f}m/s mode={} color={} "
-                    "aim_control={} diagnostic_yaw={:.2f}deg diagnostic_pitch={:.2f}deg NO_TX",
+                    "aim_control={} diagnostic_yaw={:.2f}deg diagnostic_pitch={:.2f}deg "
+                    "tx_enabled={} tx_sent={} tx_mode={} tx_yaw={:.2f}deg tx_pitch={:.2f}deg",
                     timing.frame_id, timing.device_ticks, timing.device_timestamp_hz,
                     io::frame_timestamp_source_name(timing.timestamp_source),
                     image_age_ms, mapping_delay_ms, feedback->bracket_ms, detected, targets.size(),
                     tracker.state(), bullet_speed, feedback->feedback.mode,
                     feedback->feedback.color, diagnostic.control,
                     diagnostic.yaw * 180.0 / CV_PI,
-                    diagnostic.pitch * 180.0 / CV_PI);
+                    diagnostic.pitch * 180.0 / CV_PI, enable_tx, tx_command_sent,
+                    tx_command_mode, tx_command_yaw_deg, tx_command_pitch_deg);
                 next_report = finished_at + std::chrono::seconds(1);
             }
-            // 故意不创建 Shooter，也不调用 SrmAutoAimTransport::send()。
         }
         if (show) cv::destroyWindow("standard_srm");
         if (max_frames > 0) {
             tools::logger()->info(
-              "[standard_srm/READ_ONLY] max-frames reached: {} frames (NO_TX)",
-              captured_frame_count);
+              "[standard_srm] max-frames reached: {} frames tx_enabled={}",
+              captured_frame_count, enable_tx);
         }
         return 0;
     } catch (const std::exception & error) {

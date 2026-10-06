@@ -1,5 +1,6 @@
 #include "src/real_auto_aim/serial_feedback_reader.hpp"
 
+#include <cmath>
 #include <stdexcept>
 #include <utility>
 
@@ -8,11 +9,16 @@ namespace real_auto_aim
 SerialFeedbackReader::SerialFeedbackReader(
     std::unique_ptr<io::srm_auto_aim::SrmAutoAimTransport> transport,
     std::chrono::milliseconds max_gap,
-    std::chrono::milliseconds wait_after_image)
+    std::chrono::milliseconds wait_after_image,
+    bool enable_tx,
+    std::chrono::milliseconds tx_period,
+    std::chrono::milliseconds tx_ttl)
     : transport_(std::move(transport)), buffer_(256, max_gap),
-      wait_after_image_(wait_after_image)
+      wait_after_image_(wait_after_image), enable_tx_(enable_tx),
+      tx_period_(tx_period), tx_ttl_(tx_ttl)
 {
-    if (!transport_ || wait_after_image_.count() <= 0) {
+    if (!transport_ || wait_after_image_.count() <= 0 || tx_period_.count() <= 0 ||
+        tx_ttl_.count() <= 0) {
         throw std::invalid_argument("Invalid serial feedback reader configuration");
     }
     // 全部共享成员构造完成后启动线程，避免线程访问半初始化的对象。
@@ -24,7 +30,34 @@ SerialFeedbackReader::~SerialFeedbackReader() { stop(); }
 void SerialFeedbackReader::receive_loop() noexcept
 {
     try {
+        auto next_tx = Clock::now();
         while (!stop_requested_.load()) {
+            // 发送与接收必须由同一线程访问 transport，避免 USB CDC 读写交叉破坏协议状态。
+            // 命令邮箱只保留最新目标；没有新鲜目标时发送零命令，不复用陈旧角度。
+            const auto before_io = Clock::now();
+            if (enable_tx_ && before_io >= next_tx) {
+                io::srm_auto_aim::CommandFrame command{};
+                bool has_fresh_command = false;
+                {
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    if (pending_command_ &&
+                        before_io - command_updated_at_ <= tx_ttl_) {
+                        command = *pending_command_;
+                        has_fresh_command = true;
+                    }
+                }
+                transport_->send(command);
+                {
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    if (has_fresh_command) {
+                        ++tx_stats_.target_frames;
+                    } else {
+                        ++tx_stats_.zero_frames;
+                    }
+                }
+                next_tx = before_io + tx_period_;
+            }
+
             const auto frames = transport_->poll_feedback();
             const auto received_at = Clock::now();
             if (frames.empty()) {
@@ -40,6 +73,14 @@ void SerialFeedbackReader::receive_loop() noexcept
                 buffer_.push(received_at, frames.back());
             }
             changed_.notify_all();
+        }
+
+        // 正常停止前再发一次零命令。它不能覆盖 SIGKILL、USB 拔出等异常终止，
+        // 但可以避免普通退出路径把最后一个非零视觉目标留在下位机缓存中。
+        if (enable_tx_) {
+            transport_->send(io::srm_auto_aim::CommandFrame{});
+            std::lock_guard<std::mutex> lock(mutex_);
+            ++tx_stats_.zero_frames;
         }
     } catch (...) {
         // 后台错误必须传给采集线程，不能继续使用最后一次有效反馈。
@@ -73,6 +114,34 @@ std::optional<LatestGimbalMotion> SerialFeedbackReader::latest_motion()
         throw std::runtime_error("Serial feedback reader is stopped");
     }
     return buffer_.latest_motion(Clock::now());
+}
+
+void SerialFeedbackReader::set_command(const io::srm_auto_aim::CommandFrame & command)
+{
+    if (!std::isfinite(command.yaw_deg) || !std::isfinite(command.pitch_deg) ||
+        command.fire_flag != 0) {
+        throw std::invalid_argument("Only finite no-fire commands may be sent");
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (failure_) std::rethrow_exception(failure_);
+    if (state_ != State::Running) {
+        throw std::runtime_error("Serial feedback reader is stopped");
+    }
+    pending_command_ = command;
+    command_updated_at_ = Clock::now();
+}
+
+void SerialFeedbackReader::clear_command()
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    pending_command_.reset();
+    command_updated_at_ = Clock::now();
+}
+
+TxStats SerialFeedbackReader::tx_stats()
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    return tx_stats_;
 }
 
 void SerialFeedbackReader::stop() noexcept

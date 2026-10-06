@@ -28,6 +28,19 @@ struct Plan
   float pitch;
   float pitch_vel;
   float pitch_acc;
+  // 100 ms 轨迹仅用于只读对比；角度单位 rad，求解残差使用 TinyMPC 原始单位。
+  float target_yaw_100ms = 0.0F;
+  float target_pitch_100ms = 0.0F;
+  float yaw_100ms = 0.0F;
+  float pitch_100ms = 0.0F;
+  int yaw_solver_status = -1;
+  int pitch_solver_status = -1;
+  int yaw_solver_iterations = 0;
+  int pitch_solver_iterations = 0;
+  double yaw_primal_residual_max = 0.0;
+  double yaw_dual_residual_max = 0.0;
+  double pitch_primal_residual_max = 0.0;
+  double pitch_dual_residual_max = 0.0;
   // 新真机只读入口可记录未收敛但有限的轨迹；只有收敛结果允许 control=true。
   bool diagnostic_valid = false;
   bool solver_converged = false;

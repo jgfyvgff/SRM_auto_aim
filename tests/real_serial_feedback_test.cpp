@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
@@ -10,6 +11,8 @@
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#include <thread>
+#include <vector>
 
 namespace
 {
@@ -110,6 +113,55 @@ public:
     void close() noexcept override {}
 };
 
+class CapturingStream final : public io::srm_auto_aim::ByteStream
+{
+public:
+    std::size_t read(std::uint8_t *, std::size_t) override { return 0; }
+
+    std::size_t write(const std::uint8_t * data, std::size_t size) override
+    {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            writes_.emplace_back(data, data + size);
+        }
+        changed_.notify_all();
+        return size;
+    }
+
+    void close() noexcept override
+    {
+        ++close_count;
+        changed_.notify_all();
+    }
+
+    bool wait_for_write_count(std::size_t count)
+    {
+        std::unique_lock<std::mutex> lock(mutex_);
+        return changed_.wait_for(lock, std::chrono::seconds(1), [this, count] {
+            return writes_.size() >= count;
+        });
+    }
+
+    std::size_t write_count()
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return writes_.size();
+    }
+
+    Bytes latest_write()
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return writes_.empty() ? Bytes{} : writes_.back();
+    }
+
+    std::atomic<int> close_count{0};
+
+private:
+    std::mutex mutex_;
+    std::condition_variable changed_;
+    std::vector<Bytes> writes_;
+};
+
 class FailingStream final : public io::srm_auto_aim::ByteStream
 {
 public:
@@ -176,11 +228,82 @@ void test_no_data_and_background_failure()
         reader.stop();
     }
 }
+
+void test_tx_is_no_fire_and_expires_to_zero()
+{
+    using namespace std::chrono_literals;
+    auto stream = std::make_unique<CapturingStream>();
+    auto * fake = stream.get();
+    auto transport = std::make_unique<SrmAutoAimTransport>(std::move(stream));
+    SerialFeedbackReader reader(
+        std::move(transport), 100ms, 10ms, true, 5ms, 20ms);
+
+    reader.set_command({12.5F, -3.0F, 0});
+    require(fake->wait_for_write_count(1), "TX worker did not write a command");
+
+    bool observed_command = false;
+    const auto command_deadline = Clock::now() + 500ms;
+    while (Clock::now() < command_deadline) {
+        auto bytes = fake->latest_write();
+        io::srm_auto_aim::CommandFrame command;
+        if (io::srm_auto_aim::decode(bytes, command) &&
+            std::abs(command.yaw_deg - 12.5F) < 1e-4F &&
+            std::abs(command.pitch_deg + 3.0F) < 1e-4F) {
+            require(command.fire_flag == 0, "TX worker sent a fire command");
+            observed_command = true;
+            break;
+        }
+        std::this_thread::sleep_for(1ms);
+    }
+    require(observed_command, "Requested TX command was not observed");
+
+    // 不主动清除，验证命令超过 TTL 后后台线程会自动退回零命令。
+    std::this_thread::sleep_for(30ms);
+    const auto writes_before_expiry = fake->write_count();
+    require(
+        fake->wait_for_write_count(writes_before_expiry + 1),
+        "TX worker did not continue after command expiry");
+
+    bool observed_zero = false;
+    const auto zero_deadline = Clock::now() + 500ms;
+    while (Clock::now() < zero_deadline) {
+        auto bytes = fake->latest_write();
+        io::srm_auto_aim::CommandFrame command;
+        if (io::srm_auto_aim::decode(bytes, command) && command.yaw_deg == 0.0F &&
+            command.pitch_deg == 0.0F && command.fire_flag == 0) {
+            observed_zero = true;
+            break;
+        }
+        std::this_thread::sleep_for(1ms);
+    }
+    require(observed_zero, "Cleared TX command did not become a zero command");
+    const auto tx_stats = reader.tx_stats();
+    require(tx_stats.target_frames > 0, "Successful target writes were not counted");
+    require(tx_stats.zero_frames > 0, "Successful zero writes were not counted");
+
+    reader.set_command({12.5F, -3.0F, 0});
+    const auto second_command_deadline = Clock::now() + 500ms;
+    while (Clock::now() < second_command_deadline) {
+        auto bytes = fake->latest_write();
+        io::srm_auto_aim::CommandFrame command;
+        if (io::srm_auto_aim::decode(bytes, command) &&
+            std::abs(command.yaw_deg - 12.5F) < 1e-4F &&
+            std::abs(command.pitch_deg + 3.0F) < 1e-4F) {
+            break;
+        }
+        std::this_thread::sleep_for(1ms);
+    }
+    reader.clear_command();
+
+    reader.stop();
+    require(fake->close_count == 1, "TX transport was not closed exactly once");
+}
 }  // namespace
 
 int main()
 {
     test_matching_and_stop();
     test_no_data_and_background_failure();
+    test_tx_is_no_fire_and_expires_to_zero();
     std::cout << "real_serial_feedback_test passed\n";
 }

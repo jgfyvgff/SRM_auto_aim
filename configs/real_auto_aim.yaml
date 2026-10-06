@@ -3,13 +3,12 @@
 pose_frame: gimbal
 image_size: [1440, 1080]
 max_image_age_ms: 200
-# enemy_color: blue
-enemy_color: red
+enemy_color: blue
 
 yolo_name: yolov5
 yolov5_model_path: assets/yolov5.xml
 classify_model: assets/tiny_resnet.onnx
-device: CPU
+device: GPU
 min_confidence: 0.8
 use_traditional: false
 use_roi: false

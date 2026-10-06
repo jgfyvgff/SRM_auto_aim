@@ -43,5 +43,20 @@ int main()
     require(buffer.size() == 3, "Buffer exceeded capacity");
     require(!buffer.match(t0 + 10ms, t0 + 60ms).has_value(),
             "Evicted feedback was still matched");
+
+    FeedbackBuffer bursty(8, 100ms);
+    bursty.push(t0, {0.0F, 0.0F, 0.0F, 0, 3, 20.0F});
+    bursty.push(t0 + 40ms, {4.0F, 0.0F, 0.0F, 0, 3, 20.0F});
+    bursty.push(t0 + 40ms + 500us, {4.05F, 0.0F, 0.0F, 0, 3, 20.0F});
+    // 串口突发包中最近两帧仅隔 0.5 ms，速度应使用窗口内的较长基线。
+    const auto burst_motion = bursty.latest_motion(t0 + 40ms + 500us);
+    require(burst_motion.has_value(), "Burst feedback lost usable motion baseline");
+    require(std::abs(burst_motion->interval_ms - 40.5) < 0.01,
+            "Burst motion did not use oldest fresh feedback");
+    require(std::abs(burst_motion->yaw_vel_rad_s -
+                     4.05 * calibration::kRadiansPerDegree / 0.0405) < 0.01,
+            "Burst motion angular velocity used a short interval");
+    require(!bursty.latest_motion(t0 + 200ms).has_value(),
+            "Stale burst motion was accepted");
     std::cout << "real_feedback_buffer_test passed\n";
 }
