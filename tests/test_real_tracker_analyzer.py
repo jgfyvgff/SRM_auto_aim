@@ -1,4 +1,9 @@
+import sys
 import unittest
+from pathlib import Path
+
+REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPOSITORY_ROOT))
 
 from tools.real_tracker_analyzer import analyze_records
 
@@ -148,6 +153,150 @@ class RealTrackerAnalyzerTest(unittest.TestCase):
         report = analyze_records(records)
         self.assertLess(report["timestamp"]["bracket_lattice_share"], 0.60)
         self.assertFalse(any("字节时间格点" in warning for warning in report["warnings"]))
+
+
+    def test_reports_blind_gap_and_freeze_ratio(self):
+        # 非 tracking 帧只发保持角：这些帧的占比就是云台停止跟随的占比。
+        # 两个 temp_lost 帧都没有检测，说明盲区来自检测器而不是关联。
+        records = []
+        for index in range(3):
+            records.append(
+                {
+                    "event": "frame",
+                    "device_ticks": 100 + 10 * index,
+                    "tick_hz": 1000,
+                    "detected": 1,
+                    "tracker_state": "tracking",
+                    "tx_command_mode": "tracking",
+                    "tx_command_yaw_deg": 1.0,
+                }
+            )
+        for index in range(3, 5):
+            records.append(
+                {
+                    "event": "frame",
+                    "device_ticks": 100 + 10 * index,
+                    "tick_hz": 1000,
+                    "detected": 0,
+                    "tracker_state": "temp_lost",
+                    "tx_command_mode": "hold_last_aim",
+                    "tx_command_yaw_deg": 1.0,
+                }
+            )
+        records.append(
+            {
+                "event": "frame",
+                "device_ticks": 150,
+                "tick_hz": 1000,
+                "detected": 1,
+                "tracker_state": "tracking",
+                "tx_command_mode": "tracking",
+                "tx_command_yaw_deg": 1.0,
+            }
+        )
+        report = analyze_records(records)
+        continuity = report["continuity"]
+        self.assertEqual(continuity["blind_frames"], 2)
+        self.assertAlmostEqual(continuity["blind_ratio"], 2.0 / 6.0)
+        self.assertEqual(continuity["blind_runs"], 1)
+        self.assertEqual(continuity["longest_blind_frames"], 2)
+        # 两帧盲区（10ms 间隔）+ 一个兜底周期 = 20ms
+        self.assertAlmostEqual(continuity["longest_blind_ms"], 20.0)
+        self.assertEqual(continuity["blind_frames_with_detection"], 0)
+        self.assertEqual(continuity["run_causes"], {"no_detection": 1})
+        self.assertTrue(any("云台保持帧占比" in warning for warning in report["warnings"]))
+        self.assertTrue(any("没有任何敌方装甲板检测" in warning for warning in report["warnings"]))
+
+    def test_classifies_blind_gap_causes(self):
+        records = [
+            {"event": "frame", "tracker_state": "temp_lost", "detected": 1,
+             "association_matching_detection_count": 1, "association_candidate_count": 0},
+            {"event": "frame", "tracker_state": "tracking", "detected": 1},
+            {"event": "frame", "tracker_state": "temp_lost", "detected": 1,
+             "association_matching_detection_count": 1, "association_candidate_count": 1,
+             "association_accepted_count": 0, "association_primary_gate_passed": 0,
+             "association_primary_position_gate_passed": 0},
+            {"event": "frame", "tracker_state": "tracking", "detected": 1},
+        ]
+        report = analyze_records(records)
+        self.assertEqual(
+            report["continuity"]["run_causes"],
+            {"detection_not_associated": 1, "candidate_rejected": 1},
+        )
+        self.assertEqual(report["continuity"]["blind_frames_with_detection"], 2)
+        self.assertTrue(any("候选被全部拒绝" in warning for warning in report["warnings"]))
+        self.assertFalse(any("没有任何敌方装甲板检测" in warning for warning in report["warnings"]))
+
+
+    def test_reports_gate_and_posterior_rejection(self):
+        records = [
+            {"event": "frame", "tracker_state": "temp_lost", "detected": 1,
+             "association_candidate_count": 1, "association_accepted_count": 0,
+             "association_primary_gate_passed": 1,
+             "association_primary_position_error": 0.5,
+             "association_primary_mahalanobis_distance": 4.0},
+            {"event": "frame", "tracker_state": "temp_lost", "detected": 1,
+             "association_candidate_count": 1, "association_accepted_count": 0,
+             "association_primary_gate_passed": 0,
+             "association_primary_position_gate_passed": 0,
+             "association_primary_distance_gate_passed": 1,
+             "association_primary_mahalanobis_gate_passed": 1,
+             "association_primary_score_gate_passed": 1,
+             "association_primary_position_error": 0.9},
+        ]
+        report = analyze_records(records)
+        association = report["association"]
+        self.assertEqual(association["candidate_frames"], 2)
+        self.assertEqual(association["accepted_frames"], 0)
+        self.assertEqual(association["rejected_frames"], 2)
+        self.assertEqual(association["gate_passed_but_rejected_frames"], 1)
+        self.assertEqual(association["failing_gates"], {"position": 1})
+        self.assertAlmostEqual(association["rejected_position_error"]["max"], 0.9)
+        self.assertTrue(any("EKF 后验检查否决" in warning for warning in report["warnings"]))
+
+    def test_reports_command_mode_and_resume_step(self):
+        records = [
+            {"event": "frame", "tracker_state": "tracking", "tx_command_mode": "tracking",
+             "tx_command_yaw_deg": 10.0},
+            {"event": "frame", "tracker_state": "temp_lost", "tx_command_mode": "hold_last_aim",
+             "tx_command_yaw_deg": 10.0},
+            {"event": "frame", "tracker_state": "tracking", "tx_command_mode": "tracking",
+             "tx_command_yaw_deg": 12.0},
+        ]
+        report = analyze_records(records)
+        jitter = report["jitter"]
+        self.assertEqual(jitter["tx_command_mode_counts"], {"tracking": 2, "hold_last_aim": 1})
+        self.assertEqual(jitter["hold_frames"], 1)
+        self.assertAlmostEqual(jitter["hold_ratio"], 1.0 / 3.0)
+        self.assertEqual(jitter["resume_step_deg"]["count"], 1)
+        self.assertAlmostEqual(jitter["resume_step_deg"]["max"], 2.0)
+        self.assertTrue(any("保持→跟随切换" in warning for warning in report["warnings"]))
+
+    def test_reports_within_generation_radius_drift(self):
+        # 跨世代重建会掩盖漂移，只有同一世代内的波动才是抖动来源。
+        records = [
+            {"event": "frame", "tracker_state": "tracking", "tracker_generation": 1,
+             "radius": 0.1 if index % 2 == 0 else 0.3}
+            for index in range(11)
+        ]
+        records += [
+            {"event": "frame", "tracker_state": "tracking", "tracker_generation": 2, "radius": 0.5}
+            for _ in range(3)
+        ]
+        report = analyze_records(records)
+        stdev = report["jitter"]["radius_stdev_within_generation"]
+        self.assertIsNotNone(stdev)
+        self.assertGreater(stdev, 0.05)
+        self.assertTrue(any("radius 波动" in warning for warning in report["warnings"]))
+
+    def test_ignores_records_without_tracker_fields(self):
+        report = analyze_records(
+            [{"event": "frame", "device_ticks": 100, "tick_hz": 1000, "bracket_ms": 8.0}]
+        )
+        self.assertEqual(report["continuity"], {})
+        self.assertEqual(report["jitter"]["tx_command_mode_counts"], {})
+        self.assertEqual(report["association"]["candidate_frames"], 0)
+        self.assertFalse(any("云台保持帧占比" in warning for warning in report["warnings"]))
 
 
 if __name__ == "__main__":
