@@ -9,6 +9,10 @@ import statistics
 from pathlib import Path
 
 
+# 反馈样本到达间隔低于该值即视为串口到达节律异常（正常约等于下位机反馈周期）。
+SHORT_BRACKET_MS = 20.0
+
+
 def percentile(values, ratio):
     ordered = sorted(values)
     if not ordered:
@@ -61,6 +65,44 @@ def frame_periods(records):
     return periods
 
 
+def wire_command_rate(records):
+    """用串口线程的累计量估算真正上线发送的控制指令率。
+
+    tx_command_sent 只表示指令进入邮箱，不代表写入串口；只有
+    tx_wire_target_frames/tx_wire_zero_frames 由串口线程累加，
+    所以控制指令周期必须看这两个量，不能拿主循环周期代替。
+    """
+    points = []
+    for record in records:
+        hz = record.get("tick_hz")
+        ticks = record.get("device_ticks")
+        target = record.get("tx_wire_target_frames")
+        zero = record.get("tx_wire_zero_frames")
+        if not hz or not isinstance(ticks, (int, float)):
+            continue
+        if not isinstance(target, (int, float)) or not isinstance(zero, (int, float)):
+            continue
+        points.append((ticks / hz, target + zero))
+    if len(points) < 2:
+        return None
+    span = points[-1][0] - points[0][0]
+    sent = points[-1][1] - points[0][1]
+    if span <= 0.0 or sent <= 0:
+        return None
+    return {
+        "frames": int(sent),
+        "span_s": span,
+        "hz": sent / span,
+        "period_ms": 1000.0 * span / sent,
+    }
+
+
+def short_interval_ratio(values, threshold_ms):
+    if not values:
+        return None
+    return sum(value < threshold_ms for value in values) / len(values)
+
+
 def load_records(path):
     records = []
     invalid = 0
@@ -78,7 +120,17 @@ def load_records(path):
     return records, invalid
 
 
-def analyze_records(records, max_mapped_age_ms=200.0, max_mapping_delay_ms=100.0):
+def analyze_records(
+    records,
+    max_mapped_age_ms=200.0,
+    max_mapping_delay_ms=100.0,
+    max_short_bracket_ratio=0.10,
+):
+    """汇总逐帧诊断记录。
+
+    SHORT_BRACKET_MS 之前的到达间隔视为串口到达节律异常：下位机反馈周期
+    约等于 bracket 的常规值，正常只有极少数样本会被拆批推送。
+    """
     processed = [record for record in records if record.get("event") == "frame"]
     skipped = [record for record in records if record.get("event") == "skip"]
     reasons = collections.Counter(record.get("skip_reason", "unknown") for record in skipped)
@@ -112,6 +164,9 @@ def analyze_records(records, max_mapped_age_ms=200.0, max_mapping_delay_ms=100.0
     mapped_age = finite_values(processed, "mapped_age_ms")
     mapping_delay = finite_values(processed, "mapping_delay_ms")
     periods = frame_periods(processed)
+    brackets = finite_values(processed, "bracket_ms")
+    short_bracket_ratio = short_interval_ratio(brackets, SHORT_BRACKET_MS)
+    wire_command = wire_command_rate(processed)
     if mapped_age and percentile(mapped_age, 0.95) > max_mapped_age_ms:
         warnings.append(
             f"mapped_age P95={percentile(mapped_age, 0.95):.1f}ms 超过 {max_mapped_age_ms:.1f}ms"
@@ -125,6 +180,13 @@ def analyze_records(records, max_mapped_age_ms=200.0, max_mapping_delay_ms=100.0
         warnings.append("没有成功处理的 frame 记录")
     if reasons:
         warnings.append("存在被跳过的帧，需结合 skip_reason 判断原因")
+    if short_bracket_ratio is not None and short_bracket_ratio > max_short_bracket_ratio:
+        warnings.append(
+            f"反馈样本到达间隔 <{SHORT_BRACKET_MS:.0f}ms 占比 "
+            f"{short_bracket_ratio * 100:.1f}%，超过 "
+            f"{max_short_bracket_ratio * 100:.1f}%：串口到达节律偏离下位机反馈周期，"
+            "姿态插值的时间基准需要重新确认"
+        )
 
     detections = finite_values(processed, "detected")
     targets = finite_values(processed, "targets")
@@ -141,9 +203,17 @@ def analyze_records(records, max_mapped_age_ms=200.0, max_mapping_delay_ms=100.0
             "frame_regressions": frame_regressions,
             "mapped_age_ms": summarize(mapped_age),
             "mapping_delay_ms": summarize(mapping_delay),
-            "bracket_ms": summarize(finite_values(processed, "bracket_ms")),
+            "bracket_ms": summarize(brackets),
+            "bracket_short_ms": SHORT_BRACKET_MS,
+            "bracket_short_ratio": short_bracket_ratio,
             "period_ms": summarize(periods),
             "effective_hz": 1000.0 / statistics.fmean(periods) if periods else None,
+        },
+        "control": {
+            "wire_command": wire_command,
+            "mailbox_frames": sum(
+                1 for record in processed if record.get("tx_command_sent") is True
+            ),
         },
         "pipeline": {
             "detection_rate": sum(value > 0 for value in detections) / len(detections)
@@ -196,7 +266,20 @@ def print_report(report):
                 f"p95={summary['p95']:.2f}ms"
             )
     if timestamp.get("effective_hz"):
-        print(f"  链路实际帧率: {timestamp['effective_hz']:.1f}Hz （由相机 tick 间隔换算）")
+        print(f"  视觉链路帧率: {timestamp['effective_hz']:.1f}Hz （由相机 tick 间隔换算，不是控制指令周期）")
+    if timestamp.get("bracket_short_ratio") is not None:
+        print(
+            f"  反馈到达间隔 <{timestamp['bracket_short_ms']:.0f}ms 占比: "
+            f"{timestamp['bracket_short_ratio'] * 100:.1f}%"
+        )
+    control = report.get("control", {})
+    wire = control.get("wire_command")
+    if wire:
+        print(
+            f"  控制指令上线率: {wire['hz']:.1f}Hz "
+            f"（{wire['period_ms']:.2f}ms/次，{wire['frames']} 次 / {wire['span_s']:.1f}s，"
+            "来自串口线程 tx_wire_* 累计量）"
+        )
     pipeline = report["pipeline"]
     print(
         f"检测率={pipeline['detection_rate']:.3f} 目标率={pipeline['target_rate']:.3f} "
@@ -231,9 +314,20 @@ def main():
     parser.add_argument("--output", help="可选 JSON 报告路径")
     parser.add_argument("--max-mapped-age-ms", type=float, default=200.0)
     parser.add_argument("--max-mapping-delay-ms", type=float, default=100.0)
+    parser.add_argument(
+        "--max-short-bracket-ratio",
+        type=float,
+        default=0.10,
+        help=f"反馈到达间隔小于 {SHORT_BRACKET_MS:.0f}ms 的允许占比",
+    )
     args = parser.parse_args()
     records, invalid = load_records(args.input)
-    report = analyze_records(records, args.max_mapped_age_ms, args.max_mapping_delay_ms)
+    report = analyze_records(
+        records,
+        args.max_mapped_age_ms,
+        args.max_mapping_delay_ms,
+        args.max_short_bracket_ratio,
+    )
     report["invalid_lines"] = invalid
     print_report(report)
     if args.output:

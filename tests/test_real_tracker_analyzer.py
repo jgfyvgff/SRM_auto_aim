@@ -74,5 +74,57 @@ class RealTrackerAnalyzerTest(unittest.TestCase):
         self.assertTrue(report["warnings"])
 
 
+    def test_reports_wire_command_rate_from_serial_thread_counters(self):
+        records = [
+            {
+                "event": "frame",
+                "device_ticks": 100,
+                "tick_hz": 1000,
+                "tx_wire_target_frames": 10,
+                "tx_wire_zero_frames": 0,
+                "tx_command_sent": True,
+            },
+            {
+                "event": "frame",
+                "device_ticks": 1100,
+                "tick_hz": 1000,
+                "tx_wire_target_frames": 40,
+                "tx_wire_zero_frames": 10,
+                "tx_command_sent": True,
+            },
+        ]
+        report = analyze_records(records)
+        wire = report["control"]["wire_command"]
+        self.assertEqual(wire["frames"], 40)
+        self.assertAlmostEqual(wire["hz"], 40.0)
+        self.assertAlmostEqual(wire["period_ms"], 25.0)
+        self.assertEqual(report["control"]["mailbox_frames"], 2)
+
+    def test_ignores_mailbox_flag_without_wire_counters(self):
+        report = analyze_records([
+            {"event": "frame", "device_ticks": 100, "tick_hz": 1000, "tx_command_sent": True}
+        ])
+        self.assertIsNone(report["control"]["wire_command"])
+        self.assertEqual(report["control"]["mailbox_frames"], 1)
+
+    def test_warns_about_bursty_feedback_arrival(self):
+        records = [
+            {"event": "frame", "device_ticks": 100 + 10 * i, "tick_hz": 1000, "bracket_ms": value}
+            for i, value in enumerate([24.0, 7.3, 24.0, 7.3])
+        ]
+        report = analyze_records(records)
+        self.assertAlmostEqual(report["timestamp"]["bracket_short_ratio"], 0.5)
+        self.assertTrue(any("串口到达节律" in warning for warning in report["warnings"]))
+
+    def test_accepts_regular_feedback_arrival(self):
+        records = [
+            {"event": "frame", "device_ticks": 100 + 10 * i, "tick_hz": 1000, "bracket_ms": 24.0}
+            for i in range(20)
+        ] + [{"event": "frame", "device_ticks": 400, "tick_hz": 1000, "bracket_ms": 7.3}]
+        report = analyze_records(records)
+        self.assertLess(report["timestamp"]["bracket_short_ratio"], 0.10)
+        self.assertFalse(any("串口到达节律" in warning for warning in report["warnings"]))
+
+
 if __name__ == "__main__":
     unittest.main()
