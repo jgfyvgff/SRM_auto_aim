@@ -9,6 +9,19 @@ import statistics
 from pathlib import Path
 
 
+# 反馈样本到达间隔低于该值即视为"采样变密"（只作指标，单独不能判定异常）。
+SHORT_BRACKET_MS = 20.0
+
+# 串口库按标称波特率换算"字节时间"；USB CDC 不设波特率，库保持默认 9600（8N1），
+# 即 1.0417ms。采样间隔若大量落在这个格点上，说明 read() 在按字节时间等待凑满读缓冲，
+# 采样节律被读路径节流，而不是由下位机反馈率决定。
+BYTE_TIME_MS = 1000.0 / (9600.0 / 10.0)
+
+# 判定读路径节流还要求平均插值区间明显长于单帧量级：修复后间隔会落到
+# 2 个字节时间（读满 64 字节）附近，格点占比同样很高，但采样率已经恢复正常。
+THROTTLED_BRACKET_MS = 5.0
+
+
 def percentile(values, ratio):
     ordered = sorted(values)
     if not ordered:
@@ -38,6 +51,81 @@ def summarize(values):
     }
 
 
+def frame_periods(records):
+    """用设备 tick 计算相邻成功帧的间隔，得到链路真实控制周期。
+
+    相机的帧号会持续前进，但容量 1 丢旧帧队列只保留最新图像，因此
+    tick 间隔反映的是主循环周期，不是相机帧率。tick_hz 缺失（回退到
+    主机收帧时间）或 tick 回退的样本无法换算，直接跳过。
+    """
+    periods = []
+    previous = None
+    for record in records:
+        hz = record.get("tick_hz")
+        ticks = record.get("device_ticks")
+        if not hz or not isinstance(ticks, (int, float)):
+            previous = None
+            continue
+        if previous is not None:
+            delta = ticks - previous[1]
+            if delta > 0:
+                periods.append(delta / hz * 1000.0)
+        previous = (hz, ticks)
+    return periods
+
+
+def wire_command_rate(records):
+    """用串口线程的累计量估算真正上线发送的控制指令率。
+
+    tx_command_sent 只表示指令进入邮箱，不代表写入串口；只有
+    tx_wire_target_frames/tx_wire_zero_frames 由串口线程累加，
+    所以控制指令周期必须看这两个量，不能拿主循环周期代替。
+    """
+    points = []
+    for record in records:
+        hz = record.get("tick_hz")
+        ticks = record.get("device_ticks")
+        target = record.get("tx_wire_target_frames")
+        zero = record.get("tx_wire_zero_frames")
+        if not hz or not isinstance(ticks, (int, float)):
+            continue
+        if not isinstance(target, (int, float)) or not isinstance(zero, (int, float)):
+            continue
+        points.append((ticks / hz, target + zero))
+    if len(points) < 2:
+        return None
+    span = points[-1][0] - points[0][0]
+    sent = points[-1][1] - points[0][1]
+    if span <= 0.0 or sent <= 0:
+        return None
+    return {
+        "frames": int(sent),
+        "span_s": span,
+        "hz": sent / span,
+        "period_ms": 1000.0 * span / sent,
+    }
+
+
+def short_interval_ratio(values, threshold_ms):
+    if not values:
+        return None
+    return sum(value < threshold_ms for value in values) / len(values)
+
+
+def byte_time_lattice_share(values, tolerance=0.15):
+    """落在串口库"字节时间"整数倍附近的采样间隔占比。
+
+    与按字节时间等待凑满读缓冲的 read() 相比，随机分布的期望占比约为
+    2 * tolerance / 1.0，因此显著高于该值即说明读路径在节流采样。
+    """
+    if not values:
+        return None
+    return sum(
+        abs(value / BYTE_TIME_MS - round(value / BYTE_TIME_MS)) <= tolerance
+        for value in values
+    ) / len(values)
+
+
 def load_records(path):
     records = []
     invalid = 0
@@ -55,7 +143,19 @@ def load_records(path):
     return records, invalid
 
 
-def analyze_records(records, max_mapped_age_ms=200.0, max_mapping_delay_ms=100.0):
+def analyze_records(
+    records,
+    max_mapped_age_ms=200.0,
+    max_mapping_delay_ms=100.0,
+    max_lattice_share=0.60,
+    throttle_bracket_ms=THROTTLED_BRACKET_MS,
+):
+    """汇总逐帧诊断记录。
+
+    bracket_ms 是姿态插值所用两侧反馈样本的接收间隔，它由串口读路径决定，
+    不必然等于下位机反馈周期：间隔偏短说明样本变密；间隔既落在串口库字节时间
+    格点上、平均值又远超单帧量级时，说明 read() 在等待凑满读缓冲，采样被节流。
+    """
     processed = [record for record in records if record.get("event") == "frame"]
     skipped = [record for record in records if record.get("event") == "skip"]
     reasons = collections.Counter(record.get("skip_reason", "unknown") for record in skipped)
@@ -88,6 +188,12 @@ def analyze_records(records, max_mapped_age_ms=200.0, max_mapping_delay_ms=100.0
 
     mapped_age = finite_values(processed, "mapped_age_ms")
     mapping_delay = finite_values(processed, "mapping_delay_ms")
+    periods = frame_periods(processed)
+    brackets = finite_values(processed, "bracket_ms")
+    short_bracket_ratio = short_interval_ratio(brackets, SHORT_BRACKET_MS)
+    lattice_share = byte_time_lattice_share(brackets)
+    bracket_mean_ms = statistics.fmean(brackets) if brackets else None
+    wire_command = wire_command_rate(processed)
     if mapped_age and percentile(mapped_age, 0.95) > max_mapped_age_ms:
         warnings.append(
             f"mapped_age P95={percentile(mapped_age, 0.95):.1f}ms 超过 {max_mapped_age_ms:.1f}ms"
@@ -101,6 +207,18 @@ def analyze_records(records, max_mapped_age_ms=200.0, max_mapping_delay_ms=100.0
         warnings.append("没有成功处理的 frame 记录")
     if reasons:
         warnings.append("存在被跳过的帧，需结合 skip_reason 判断原因")
+    if (
+        lattice_share is not None
+        and lattice_share > max_lattice_share
+        and bracket_mean_ms is not None
+        and bracket_mean_ms > throttle_bracket_ms
+    ):
+        warnings.append(
+            f"姿态插值区间平均 {bracket_mean_ms:.1f}ms（超过 {throttle_bracket_ms:.1f}ms），"
+            f"且 {lattice_share * 100:.1f}% 的到达间隔落在串口库 {BYTE_TIME_MS:.4f}ms "
+            "字节时间格点上（随机分布约 30%）：read() 正在按标称波特率等待凑满读缓冲，"
+            "串口采样被读路径节流，采样率与插值区间由主机读路径决定，而不是下位机反馈率"
+        )
 
     detections = finite_values(processed, "detected")
     targets = finite_values(processed, "targets")
@@ -117,7 +235,19 @@ def analyze_records(records, max_mapped_age_ms=200.0, max_mapping_delay_ms=100.0
             "frame_regressions": frame_regressions,
             "mapped_age_ms": summarize(mapped_age),
             "mapping_delay_ms": summarize(mapping_delay),
-            "bracket_ms": summarize(finite_values(processed, "bracket_ms")),
+            "bracket_ms": summarize(brackets),
+            "bracket_short_ms": SHORT_BRACKET_MS,
+            "bracket_short_ratio": short_bracket_ratio,
+            "bracket_byte_time_ms": BYTE_TIME_MS,
+            "bracket_lattice_share": lattice_share,
+            "period_ms": summarize(periods),
+            "effective_hz": 1000.0 / statistics.fmean(periods) if periods else None,
+        },
+        "control": {
+            "wire_command": wire_command,
+            "mailbox_frames": sum(
+                1 for record in processed if record.get("tx_command_sent") is True
+            ),
         },
         "pipeline": {
             "detection_rate": sum(value > 0 for value in detections) / len(detections)
@@ -127,6 +257,11 @@ def analyze_records(records, max_mapped_age_ms=200.0, max_mapping_delay_ms=100.0
             "detector_ms": summarize(finite_values(processed, "detector_ms")),
             "tracker_ms": summarize(finite_values(processed, "tracker_ms")),
             "aimer_ms": summarize(finite_values(processed, "aimer_ms")),
+            "feedback_wait_ms": summarize(finite_values(processed, "feedback_wait_ms")),
+            "capture_to_detector_ms": summarize(
+                finite_values(processed, "capture_to_detector_ms")
+            ),
+            "capture_to_aimer_ms": summarize(finite_values(processed, "capture_to_aimer_ms")),
             "state_counts": dict(state_counts),
         },
         "tracker": {
@@ -157,19 +292,53 @@ def print_report(report):
     print(f"设备频率: {report['tick_hz']}")
     print(f"时间戳来源: {report['timestamp']['sources']}")
     timestamp = report["timestamp"]
-    for key in ("mapped_age_ms", "mapping_delay_ms", "bracket_ms"):
+    for key in ("mapped_age_ms", "mapping_delay_ms", "bracket_ms", "period_ms"):
         summary = timestamp[key]
         if summary.get("count"):
             print(
                 f"  {key}: mean={summary['mean']:.2f}ms "
                 f"p95={summary['p95']:.2f}ms"
             )
+    if timestamp.get("effective_hz"):
+        print(f"  视觉链路帧率: {timestamp['effective_hz']:.1f}Hz （由相机 tick 间隔换算，不是控制指令周期）")
+    if timestamp.get("bracket_short_ratio") is not None:
+        print(
+            f"  反馈到达间隔 <{timestamp['bracket_short_ms']:.0f}ms 占比: "
+            f"{timestamp['bracket_short_ratio'] * 100:.1f}%"
+        )
+    if timestamp.get("bracket_lattice_share") is not None:
+        print(
+            f"  反馈到达间隔格点占比: {timestamp['bracket_lattice_share'] * 100:.1f}% "
+            f"（串口库字节时间 {timestamp['bracket_byte_time_ms']:.4f}ms，随机分布约 30%）"
+        )
+    control = report.get("control", {})
+    wire = control.get("wire_command")
+    if wire:
+        print(
+            f"  控制指令上线率: {wire['hz']:.1f}Hz "
+            f"（{wire['period_ms']:.2f}ms/次，{wire['frames']} 次 / {wire['span_s']:.1f}s，"
+            "来自串口线程 tx_wire_* 累计量）"
+        )
     pipeline = report["pipeline"]
     print(
         f"检测率={pipeline['detection_rate']:.3f} 目标率={pipeline['target_rate']:.3f} "
         f"Tracker状态={pipeline['state_counts']}"
     )
     print("跳过原因:", report["skip_reasons"] or "无")
+    for key in (
+        "detector_ms",
+        "tracker_ms",
+        "aimer_ms",
+        "feedback_wait_ms",
+        "capture_to_detector_ms",
+        "capture_to_aimer_ms",
+    ):
+        summary = pipeline.get(key)
+        if summary and summary.get("count"):
+            print(
+                f"  {key}: mean={summary['mean']:.2f}ms "
+                f"p95={summary['p95']:.2f}ms max={summary['max']:.2f}ms"
+            )
     print("[诊断]")
     if report["warnings"]:
         for warning in report["warnings"]:
@@ -184,9 +353,27 @@ def main():
     parser.add_argument("--output", help="可选 JSON 报告路径")
     parser.add_argument("--max-mapped-age-ms", type=float, default=200.0)
     parser.add_argument("--max-mapping-delay-ms", type=float, default=100.0)
+    parser.add_argument(
+        "--max-lattice-share",
+        type=float,
+        default=0.60,
+        help=f"反馈到达间隔落在 {BYTE_TIME_MS:.4f}ms 字节时间格点上的允许占比",
+    )
+    parser.add_argument(
+        "--throttle-bracket-ms",
+        type=float,
+        default=THROTTLED_BRACKET_MS,
+        help="判定串口读路径节流的平均插值区间门限",
+    )
     args = parser.parse_args()
     records, invalid = load_records(args.input)
-    report = analyze_records(records, args.max_mapped_age_ms, args.max_mapping_delay_ms)
+    report = analyze_records(
+        records,
+        args.max_mapped_age_ms,
+        args.max_mapping_delay_ms,
+        args.max_lattice_share,
+        args.throttle_bracket_ms,
+    )
     report["invalid_lines"] = invalid
     print_report(report)
     if args.output:

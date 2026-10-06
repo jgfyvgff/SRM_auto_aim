@@ -74,5 +74,81 @@ class RealTrackerAnalyzerTest(unittest.TestCase):
         self.assertTrue(report["warnings"])
 
 
+    def test_reports_wire_command_rate_from_serial_thread_counters(self):
+        records = [
+            {
+                "event": "frame",
+                "device_ticks": 100,
+                "tick_hz": 1000,
+                "tx_wire_target_frames": 10,
+                "tx_wire_zero_frames": 0,
+                "tx_command_sent": True,
+            },
+            {
+                "event": "frame",
+                "device_ticks": 1100,
+                "tick_hz": 1000,
+                "tx_wire_target_frames": 40,
+                "tx_wire_zero_frames": 10,
+                "tx_command_sent": True,
+            },
+        ]
+        report = analyze_records(records)
+        wire = report["control"]["wire_command"]
+        self.assertEqual(wire["frames"], 40)
+        self.assertAlmostEqual(wire["hz"], 40.0)
+        self.assertAlmostEqual(wire["period_ms"], 25.0)
+        self.assertEqual(report["control"]["mailbox_frames"], 2)
+
+    def test_ignores_mailbox_flag_without_wire_counters(self):
+        report = analyze_records([
+            {"event": "frame", "device_ticks": 100, "tick_hz": 1000, "tx_command_sent": True}
+        ])
+        self.assertIsNone(report["control"]["wire_command"])
+        self.assertEqual(report["control"]["mailbox_frames"], 1)
+
+    def test_warns_about_read_path_throttling(self):
+        records = [
+            {"event": "frame", "device_ticks": 100 + 10 * i, "tick_hz": 1000, "bracket_ms": value}
+            for i, value in enumerate([24.0, 7.3, 24.0, 7.3])
+        ]
+        report = analyze_records(records)
+        self.assertAlmostEqual(report["timestamp"]["bracket_short_ratio"], 0.5)
+        self.assertTrue(any("读路径节流" in warning for warning in report["warnings"]))
+
+    def test_accepts_fast_feedback_after_read_fix(self):
+        # 读路径修好后样本间隔会落到单帧量级（这里取 1 个字节时间）：
+        # 即使格点占比和 <20ms 占比都是 100%，也不应报读路径节流。
+        records = [
+            {"event": "frame", "device_ticks": 100 + 10 * i, "tick_hz": 1000, "bracket_ms": 1.0417}
+            for i in range(21)
+        ]
+        report = analyze_records(records)
+        self.assertEqual(report["timestamp"]["bracket_short_ratio"], 1.0)
+        self.assertAlmostEqual(report["timestamp"]["bracket_lattice_share"], 1.0)
+        self.assertFalse(any("读路径节流" in warning for warning in report["warnings"]))
+
+
+    def test_detects_serial_byte_time_lattice(self):
+        # 23.96ms = 23 × 1.0417ms（USB CDC 下库默认 9600 波特率的字节时间）
+        records = [
+            {"event": "frame", "device_ticks": 100 + 10 * i, "tick_hz": 1000, "bracket_ms": 23.96}
+            for i in range(20)
+        ]
+        report = analyze_records(records)
+        self.assertAlmostEqual(report["timestamp"]["bracket_lattice_share"], 1.0)
+        self.assertAlmostEqual(report["timestamp"]["bracket_byte_time_ms"], 1.0417, places=3)
+        self.assertTrue(any("字节时间格点" in warning for warning in report["warnings"]))
+
+    def test_accepts_off_lattice_arrival_intervals(self):
+        records = [
+            {"event": "frame", "device_ticks": 100 + 10 * i, "tick_hz": 1000, "bracket_ms": value}
+            for i, value in enumerate([8.0, 19.0, 3.0, 11.0])
+        ]
+        report = analyze_records(records)
+        self.assertLess(report["timestamp"]["bracket_lattice_share"], 0.60)
+        self.assertFalse(any("字节时间格点" in warning for warning in report["warnings"]))
+
+
 if __name__ == "__main__":
     unittest.main()

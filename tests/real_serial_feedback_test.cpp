@@ -176,6 +176,47 @@ public:
     void close() noexcept override {}
 };
 
+// 读阻塞成本固定的假流：无反馈，只用来观察发送节拍。
+// 7ms 读 + 2ms 空等使循环粒度约 9ms，与 20ms 发送周期错位：若发送时刻写成
+// "本次读之后再加一个周期"，每个周期都会带上一个相位（约 27ms/次），
+// 40 个周期累计漂移约 280ms，足以被下面的判据抓住。
+class SlowReadStream final : public io::srm_auto_aim::ByteStream
+{
+public:
+    static constexpr std::chrono::milliseconds kReadCost{7};
+
+    std::size_t read(std::uint8_t *, std::size_t) override
+    {
+        std::this_thread::sleep_for(kReadCost);
+        return 0;
+    }
+
+    std::size_t write(const std::uint8_t *, std::size_t size) override
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        write_times_.push_back(Clock::now());
+        return size;
+    }
+
+    void close() noexcept override {}
+
+    std::size_t write_count()
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return write_times_.size();
+    }
+
+    Clock::time_point write_time(std::size_t index)
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return write_times_.at(index);
+    }
+
+private:
+    std::mutex mutex_;
+    std::vector<Clock::time_point> write_times_;
+};
+
 void test_matching_and_stop()
 {
     using namespace std::chrono_literals;
@@ -354,6 +395,33 @@ void test_hold_survives_ttl_and_returns_to_normal_expiry()
             "Cleared hold command was still active");
     reader.stop();
 }
+
+// 发送周期必须跟绝对时间表对齐，不能把每次串口读的耗时相位逐周期累加到间隔里。
+void test_tx_period_does_not_accumulate_read_phase()
+{
+    using namespace std::chrono_literals;
+    auto stream = std::make_unique<SlowReadStream>();
+    auto * fake = stream.get();
+    auto transport = std::make_unique<SrmAutoAimTransport>(std::move(stream));
+    // 空命令邮箱同样按周期发送零命令，节拍测量不依赖视觉命令是否新鲜。
+    SerialFeedbackReader reader(std::move(transport), 100ms, 10ms, true, 20ms, 100ms);
+
+    constexpr std::size_t kSends = 41;
+    const auto deadline = Clock::now() + 3s;
+    while (fake->write_count() < kSends && Clock::now() < deadline) {
+        std::this_thread::sleep_for(1ms);
+    }
+    const auto sends = fake->write_count();
+    require(sends >= kSends, "TX worker did not keep sending on the requested period");
+
+    const auto span = fake->write_time(sends - 1) - fake->write_time(0);
+    const auto intervals = static_cast<std::chrono::milliseconds::rep>(sends - 1);
+    const auto nominal = std::chrono::milliseconds(intervals * 20);
+    // 允许首末两次发送各自被循环粒度推迟一次，但不得逐周期累加读的相位。
+    require(span <= nominal + 25ms,
+            "TX period accumulated read phase instead of following an absolute schedule");
+    reader.stop();
+}
 }  // namespace
 
 int main()
@@ -362,5 +430,6 @@ int main()
     test_no_data_and_background_failure();
     test_tx_is_no_fire_and_expires_to_zero();
     test_hold_survives_ttl_and_returns_to_normal_expiry();
+    test_tx_period_does_not_accumulate_read_phase();
     std::cout << "real_serial_feedback_test passed\n";
 }

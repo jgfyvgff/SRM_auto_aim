@@ -56,7 +56,13 @@ void SerialFeedbackReader::receive_loop() noexcept
                         ++tx_stats_.zero_frames;
                     }
                 }
-                next_tx = before_io + tx_period_;
+                // 发送节拍对齐绝对时间表，而不是"本次发送时刻 + 周期"：后者会把每次串口读
+                // 的相位误差逐周期累加，实测把 20ms 周期拖成 21.4ms。但线程被长期拖住后
+                // 也不能连发补偿，落后超过一个周期就按当前时刻重新对齐。
+                next_tx += tx_period_;
+                if (before_io - next_tx > tx_period_) {
+                    next_tx = before_io + tx_period_;
+                }
             }
 
             const auto frames = transport_->poll_feedback();
