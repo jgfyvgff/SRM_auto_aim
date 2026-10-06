@@ -107,23 +107,26 @@ class RealTrackerAnalyzerTest(unittest.TestCase):
         self.assertIsNone(report["control"]["wire_command"])
         self.assertEqual(report["control"]["mailbox_frames"], 1)
 
-    def test_warns_about_bursty_feedback_arrival(self):
+    def test_warns_about_read_path_throttling(self):
         records = [
             {"event": "frame", "device_ticks": 100 + 10 * i, "tick_hz": 1000, "bracket_ms": value}
             for i, value in enumerate([24.0, 7.3, 24.0, 7.3])
         ]
         report = analyze_records(records)
         self.assertAlmostEqual(report["timestamp"]["bracket_short_ratio"], 0.5)
-        self.assertTrue(any("串口采样节律" in warning for warning in report["warnings"]))
+        self.assertTrue(any("读路径节流" in warning for warning in report["warnings"]))
 
-    def test_accepts_regular_feedback_arrival(self):
+    def test_accepts_fast_feedback_after_read_fix(self):
+        # 读路径修好后样本间隔会落到单帧量级（这里取 1 个字节时间）：
+        # 即使格点占比和 <20ms 占比都是 100%，也不应报读路径节流。
         records = [
-            {"event": "frame", "device_ticks": 100 + 10 * i, "tick_hz": 1000, "bracket_ms": 24.0}
-            for i in range(20)
-        ] + [{"event": "frame", "device_ticks": 400, "tick_hz": 1000, "bracket_ms": 7.3}]
+            {"event": "frame", "device_ticks": 100 + 10 * i, "tick_hz": 1000, "bracket_ms": 1.0417}
+            for i in range(21)
+        ]
         report = analyze_records(records)
-        self.assertLess(report["timestamp"]["bracket_short_ratio"], 0.10)
-        self.assertFalse(any("串口采样节律" in warning for warning in report["warnings"]))
+        self.assertEqual(report["timestamp"]["bracket_short_ratio"], 1.0)
+        self.assertAlmostEqual(report["timestamp"]["bracket_lattice_share"], 1.0)
+        self.assertFalse(any("读路径节流" in warning for warning in report["warnings"]))
 
 
     def test_detects_serial_byte_time_lattice(self):

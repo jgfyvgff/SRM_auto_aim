@@ -9,13 +9,17 @@ import statistics
 from pathlib import Path
 
 
-# 反馈样本到达间隔低于该值即视为串口到达节律异常（正常约等于下位机反馈周期）。
+# 反馈样本到达间隔低于该值即视为"采样变密"（只作指标，单独不能判定异常）。
 SHORT_BRACKET_MS = 20.0
 
 # 串口库按标称波特率换算"字节时间"；USB CDC 不设波特率，库保持默认 9600（8N1），
 # 即 1.0417ms。采样间隔若大量落在这个格点上，说明 read() 在按字节时间等待凑满读缓冲，
 # 采样节律被读路径节流，而不是由下位机反馈率决定。
 BYTE_TIME_MS = 1000.0 / (9600.0 / 10.0)
+
+# 判定读路径节流还要求平均插值区间明显长于单帧量级：修复后间隔会落到
+# 2 个字节时间（读满 64 字节）附近，格点占比同样很高，但采样率已经恢复正常。
+THROTTLED_BRACKET_MS = 5.0
 
 
 def percentile(values, ratio):
@@ -143,14 +147,14 @@ def analyze_records(
     records,
     max_mapped_age_ms=200.0,
     max_mapping_delay_ms=100.0,
-    max_short_bracket_ratio=0.10,
     max_lattice_share=0.60,
+    throttle_bracket_ms=THROTTLED_BRACKET_MS,
 ):
     """汇总逐帧诊断记录。
 
     bracket_ms 是姿态插值所用两侧反馈样本的接收间隔，它由串口读路径决定，
-    不必然等于下位机反馈周期：间隔偏短说明样本变密，间隔落在串口库字节时间
-    格点上说明 read() 在等待凑满读缓冲，采样被读路径节流。
+    不必然等于下位机反馈周期：间隔偏短说明样本变密；间隔既落在串口库字节时间
+    格点上、平均值又远超单帧量级时，说明 read() 在等待凑满读缓冲，采样被节流。
     """
     processed = [record for record in records if record.get("event") == "frame"]
     skipped = [record for record in records if record.get("event") == "skip"]
@@ -188,6 +192,7 @@ def analyze_records(
     brackets = finite_values(processed, "bracket_ms")
     short_bracket_ratio = short_interval_ratio(brackets, SHORT_BRACKET_MS)
     lattice_share = byte_time_lattice_share(brackets)
+    bracket_mean_ms = statistics.fmean(brackets) if brackets else None
     wire_command = wire_command_rate(processed)
     if mapped_age and percentile(mapped_age, 0.95) > max_mapped_age_ms:
         warnings.append(
@@ -202,19 +207,17 @@ def analyze_records(
         warnings.append("没有成功处理的 frame 记录")
     if reasons:
         warnings.append("存在被跳过的帧，需结合 skip_reason 判断原因")
-    if short_bracket_ratio is not None and short_bracket_ratio > max_short_bracket_ratio:
+    if (
+        lattice_share is not None
+        and lattice_share > max_lattice_share
+        and bracket_mean_ms is not None
+        and bracket_mean_ms > throttle_bracket_ms
+    ):
         warnings.append(
-            f"反馈样本到达间隔 <{SHORT_BRACKET_MS:.0f}ms 占比 "
-            f"{short_bracket_ratio * 100:.1f}%，超过 "
-            f"{max_short_bracket_ratio * 100:.1f}%：串口采样节律偏离下位机反馈周期，"
-            "姿态插值区间随之改变"
-        )
-    if lattice_share is not None and lattice_share > max_lattice_share:
-        warnings.append(
-            f"反馈样本到达间隔有 {lattice_share * 100:.1f}% 落在串口库 "
-            f"{BYTE_TIME_MS:.4f}ms 字节时间格点上（随机分布约 30%）："
-            "read() 正在按标称波特率等待凑满读缓冲，串口采样被读路径节流，"
-            "姿态样本数与插值区间由主机读路径决定，而不是下位机反馈率"
+            f"姿态插值区间平均 {bracket_mean_ms:.1f}ms（超过 {throttle_bracket_ms:.1f}ms），"
+            f"且 {lattice_share * 100:.1f}% 的到达间隔落在串口库 {BYTE_TIME_MS:.4f}ms "
+            "字节时间格点上（随机分布约 30%）：read() 正在按标称波特率等待凑满读缓冲，"
+            "串口采样被读路径节流，采样率与插值区间由主机读路径决定，而不是下位机反馈率"
         )
 
     detections = finite_values(processed, "detected")
@@ -351,16 +354,16 @@ def main():
     parser.add_argument("--max-mapped-age-ms", type=float, default=200.0)
     parser.add_argument("--max-mapping-delay-ms", type=float, default=100.0)
     parser.add_argument(
-        "--max-short-bracket-ratio",
-        type=float,
-        default=0.10,
-        help=f"反馈到达间隔小于 {SHORT_BRACKET_MS:.0f}ms 的允许占比",
-    )
-    parser.add_argument(
         "--max-lattice-share",
         type=float,
         default=0.60,
         help=f"反馈到达间隔落在 {BYTE_TIME_MS:.4f}ms 字节时间格点上的允许占比",
+    )
+    parser.add_argument(
+        "--throttle-bracket-ms",
+        type=float,
+        default=THROTTLED_BRACKET_MS,
+        help="判定串口读路径节流的平均插值区间门限",
     )
     args = parser.parse_args()
     records, invalid = load_records(args.input)
@@ -368,8 +371,8 @@ def main():
         records,
         args.max_mapped_age_ms,
         args.max_mapping_delay_ms,
-        args.max_short_bracket_ratio,
         args.max_lattice_share,
+        args.throttle_bracket_ms,
     )
     report["invalid_lines"] = invalid
     print_report(report)
