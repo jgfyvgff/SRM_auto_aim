@@ -41,6 +41,20 @@ RADIUS_DRIFT_WARN_M = 0.05
 # 保持→跟随切换那一帧的 yaw 跳变超过该值即存在可见追赶。
 RESUME_STEP_WARN_DEG = 1.0
 
+# 诊断字段分组：日志缺少整组字段时，对应统计必然为空。必须显式报告字段覆盖，
+# 否则"字段缺失"会被误读成"没有这个问题"（旧日志尤其容易踩）。
+FIELD_GROUPS = (
+    ("tracker_state", "盲区与保持帧"),
+    ("tx_command_mode", "指令模式"),
+    ("tx_command_yaw_deg", "指令步进与恢复跳变"),
+    ("association_candidate_count", "关联拒绝归因"),
+    ("tracker_generation", "世代内波动"),
+    ("radius", "半径漂移"),
+)
+
+# 缺这几组字段时主结论无法给出，必须告警；其余组只在覆盖行里按需展示。
+CRITICAL_FIELD_GROUPS = ("盲区与保持帧", "指令模式", "关联拒绝归因")
+
 
 def percentile(values, ratio):
     ordered = sorted(values)
@@ -144,6 +158,18 @@ def byte_time_lattice_share(values, tolerance=0.15):
         abs(value / BYTE_TIME_MS - round(value / BYTE_TIME_MS)) <= tolerance
         for value in values
     ) / len(values)
+
+
+def field_coverage(records):
+    """统计各组诊断字段在成功帧里的出现次数。
+
+    旧日志（早于字段落地）缺少整组字段时，对应统计会全部为空。若不显式报告
+    覆盖，空段落会被误读成"该问题不存在"，因此字段覆盖必须和结论一起给出。
+    """
+    return {
+        label: sum(1 for record in records if key in record)
+        for key, label in FIELD_GROUPS
+    }
 
 
 def frame_time_axis_ms(records, fallback_ms):
@@ -456,6 +482,15 @@ def analyze_records(
     continuity = continuity_report(processed, control_period_ms)
     association = association_report(processed)
     jitter = command_jitter_report(processed)
+    coverage = field_coverage(processed)
+    missing_fields = [label for label, count in coverage.items() if not count] if processed else []
+    missing_critical = [label for label in missing_fields if label in CRITICAL_FIELD_GROUPS]
+    if missing_critical:
+        warnings.append(
+            "日志缺少 " + "、".join(missing_critical) + " 字段：对应统计为空，"
+            "不代表没有该问题；需要用带这些字段的版本（standard_srm 的 "
+            "tx_command_mode / association_*）重新采集"
+        )
     if continuity.get("blind_ratio", 0.0) > FREEZE_RATIO_WARNING:
         warnings.append(
             f"云台保持帧占比 {continuity['blind_ratio'] * 100:.1f}% "
@@ -559,6 +594,8 @@ def analyze_records(
         "continuity": continuity,
         "association": association,
         "jitter": jitter,
+        "coverage": coverage,
+        "missing_fields": missing_fields,
         "warnings": warnings,
     }
     return report
@@ -606,6 +643,15 @@ def print_report(report):
         f"Tracker状态={pipeline['state_counts']}"
     )
     print("跳过原因:", report["skip_reasons"] or "无")
+    coverage = report.get("coverage", {})
+    if coverage:
+        print(
+            "  诊断字段覆盖: "
+            + " ".join(f"{label}={count}" for label, count in coverage.items())
+        )
+    missing_fields = report.get("missing_fields", [])
+    if missing_fields:
+        print("  缺失字段: " + "、".join(missing_fields) + "（对应统计为空，不代表没有问题）")
     for key in (
         "detector_ms",
         "tracker_ms",

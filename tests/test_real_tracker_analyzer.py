@@ -299,5 +299,33 @@ class RealTrackerAnalyzerTest(unittest.TestCase):
         self.assertFalse(any("云台保持帧占比" in warning for warning in report["warnings"]))
 
 
+    def test_reports_missing_diagnostic_fields(self):
+        # 旧日志缺整组字段时必须显式提示，避免空段落被误读成"没有问题"。
+        records = [
+            {"event": "frame", "tracker_state": "tracking", "detected": 1}
+            for _ in range(3)
+        ]
+        report = analyze_records(records)
+        coverage = report["coverage"]
+        self.assertEqual(coverage["盲区与保持帧"], 3)
+        self.assertEqual(coverage["指令模式"], 0)
+        self.assertEqual(coverage["关联拒绝归因"], 0)
+        self.assertIn("指令模式", report["missing_fields"])
+        self.assertIn("关联拒绝归因", report["missing_fields"])
+        self.assertTrue(
+            any("日志缺少" in warning and "指令模式" in warning for warning in report["warnings"])
+        )
+
+    def test_reports_full_coverage_for_new_logs(self):
+        records = [
+            {"event": "frame", "tracker_state": "tracking", "tx_command_mode": "tracking",
+             "tx_command_yaw_deg": 1.0, "association_candidate_count": 1,
+             "tracker_generation": 1, "radius": 0.2}
+        ]
+        report = analyze_records(records)
+        self.assertEqual(report["missing_fields"], [])
+        self.assertFalse(any("日志缺少" in warning for warning in report["warnings"]))
+
+
 if __name__ == "__main__":
     unittest.main()
