@@ -841,7 +841,7 @@ int main(int argc, char * argv[])
                 // 变成突发目标；它不改变 Planner 的诊断结果，也绝不申请开火。
                 const bool tx_ready = enable_tx && (measured_speed || tx_use_nominal_speed) &&
                                       has_measured_velocity && plan.diagnostic_valid;
-                if (tx_ready) {
+                if(tx_ready){                      
                     const double requested_yaw =
                         plan.solver_converged ? plan.yaw : plan.target_yaw;
                     const double requested_pitch =

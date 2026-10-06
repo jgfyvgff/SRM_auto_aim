@@ -36,7 +36,7 @@ Tracker::Tracker(const std::string & config_path, Solver & solver)
                                     ? yaml["standard_geometry_constraint"].as<bool>()
                                     : false;
   standard_radius_ =
-    yaml["standard_radius"].IsDefined() ? yaml["standard_radius"].as<double>() : 0.2;
+    yaml["standard_radius"].IsDefined() ? yaml["standard_radius"].as<double>() : 0.18;
   standard_radius_variance_ = yaml["standard_radius_variance"].IsDefined()
                                 ? yaml["standard_radius_variance"].as<double>()
                                 : 1.0;
@@ -370,7 +370,7 @@ bool Tracker::set_target(std::list<Armor> & armors, std::chrono::steady_clock::t
 
   if (is_balance) {
     Eigen::VectorXd P0_dig{{1, 64, 1, 64, 1, 64, 0.4, 100, 1, 1, 1}};
-    target_ = Target(armor, t, 0.2, 2, P0_dig);//参数分别为装甲板、时间戳、旋转半径、装甲板数量、初始协方差矩阵
+    target_ = Target(armor, t, 0.18, 2, P0_dig);//参数分别为装甲板、时间戳、旋转半径、装甲板数量、初始协方差矩阵
   }
 
   else if (armor.name == ArmorName::outpost) {
@@ -387,13 +387,13 @@ bool Tracker::set_target(std::list<Armor> & armors, std::chrono::steady_clock::t
     // 单块静止装甲板无法同时观测车辆中心和半径，因此使用已知机械尺寸
     // 约束 r、两组半径差和高度差，避免半径向发散下限塌缩。
     Eigen::VectorXd P0_dig{
-      {1, 64, 1, 64, 1, 64, 0.4, 100, standard_radius_variance_,
+      {1, 64, 1, 64, 1, 64, 0.4, 0.1, standard_radius_variance_,
        standard_radius_delta_variance_, standard_height_delta_variance_}};
-    target_ = Target(armor, t, standard_radius_, 4, P0_dig);
+    target_ = Target(armor, t, 0.18, 4, P0_dig);
     if (standard_geometry_constraint_) {
       // 仿真车辆尺寸已知时固定 r 和 l，避免单块装甲观测把半径压到发散下限。
       target_.set_geometry_constraint(
-        standard_radius_, 0.0, standard_radius_variance_,
+        0.18, 0.0, standard_radius_variance_,
         standard_radius_delta_variance_);
     }
   }
@@ -401,7 +401,7 @@ bool Tracker::set_target(std::list<Armor> & armors, std::chrono::steady_clock::t
   else {
     // 其他车型保持上游原有行为，后续应按实际机械尺寸分别标定。
     Eigen::VectorXd P0_dig{{1, 64, 1, 64, 1, 64, 0.4, 100, 1, 1, 1}};
-    target_ = Target(armor, t, 0.2, 4, P0_dig);
+    target_ = Target(armor, t, 0.18, 4, P0_dig);
   }
 
   target_.set_measurement_bearing_variance(measurement_bearing_variance_);
