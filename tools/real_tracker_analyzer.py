@@ -12,6 +12,11 @@ from pathlib import Path
 # 反馈样本到达间隔低于该值即视为串口到达节律异常（正常约等于下位机反馈周期）。
 SHORT_BRACKET_MS = 20.0
 
+# 串口库按标称波特率换算"字节时间"；USB CDC 不设波特率，库保持默认 9600（8N1），
+# 即 1.0417ms。采样间隔若大量落在这个格点上，说明 read() 在按字节时间等待凑满读缓冲，
+# 采样节律被读路径节流，而不是由下位机反馈率决定。
+BYTE_TIME_MS = 1000.0 / (9600.0 / 10.0)
+
 
 def percentile(values, ratio):
     ordered = sorted(values)
@@ -103,6 +108,20 @@ def short_interval_ratio(values, threshold_ms):
     return sum(value < threshold_ms for value in values) / len(values)
 
 
+def byte_time_lattice_share(values, tolerance=0.15):
+    """落在串口库"字节时间"整数倍附近的采样间隔占比。
+
+    与按字节时间等待凑满读缓冲的 read() 相比，随机分布的期望占比约为
+    2 * tolerance / 1.0，因此显著高于该值即说明读路径在节流采样。
+    """
+    if not values:
+        return None
+    return sum(
+        abs(value / BYTE_TIME_MS - round(value / BYTE_TIME_MS)) <= tolerance
+        for value in values
+    ) / len(values)
+
+
 def load_records(path):
     records = []
     invalid = 0
@@ -125,11 +144,13 @@ def analyze_records(
     max_mapped_age_ms=200.0,
     max_mapping_delay_ms=100.0,
     max_short_bracket_ratio=0.10,
+    max_lattice_share=0.60,
 ):
     """汇总逐帧诊断记录。
 
-    SHORT_BRACKET_MS 之前的到达间隔视为串口到达节律异常：下位机反馈周期
-    约等于 bracket 的常规值，正常只有极少数样本会被拆批推送。
+    bracket_ms 是姿态插值所用两侧反馈样本的接收间隔，它由串口读路径决定，
+    不必然等于下位机反馈周期：间隔偏短说明样本变密，间隔落在串口库字节时间
+    格点上说明 read() 在等待凑满读缓冲，采样被读路径节流。
     """
     processed = [record for record in records if record.get("event") == "frame"]
     skipped = [record for record in records if record.get("event") == "skip"]
@@ -166,6 +187,7 @@ def analyze_records(
     periods = frame_periods(processed)
     brackets = finite_values(processed, "bracket_ms")
     short_bracket_ratio = short_interval_ratio(brackets, SHORT_BRACKET_MS)
+    lattice_share = byte_time_lattice_share(brackets)
     wire_command = wire_command_rate(processed)
     if mapped_age and percentile(mapped_age, 0.95) > max_mapped_age_ms:
         warnings.append(
@@ -184,8 +206,15 @@ def analyze_records(
         warnings.append(
             f"反馈样本到达间隔 <{SHORT_BRACKET_MS:.0f}ms 占比 "
             f"{short_bracket_ratio * 100:.1f}%，超过 "
-            f"{max_short_bracket_ratio * 100:.1f}%：串口到达节律偏离下位机反馈周期，"
-            "姿态插值的时间基准需要重新确认"
+            f"{max_short_bracket_ratio * 100:.1f}%：串口采样节律偏离下位机反馈周期，"
+            "姿态插值区间随之改变"
+        )
+    if lattice_share is not None and lattice_share > max_lattice_share:
+        warnings.append(
+            f"反馈样本到达间隔有 {lattice_share * 100:.1f}% 落在串口库 "
+            f"{BYTE_TIME_MS:.4f}ms 字节时间格点上（随机分布约 30%）："
+            "read() 正在按标称波特率等待凑满读缓冲，串口采样被读路径节流，"
+            "姿态样本数与插值区间由主机读路径决定，而不是下位机反馈率"
         )
 
     detections = finite_values(processed, "detected")
@@ -206,6 +235,8 @@ def analyze_records(
             "bracket_ms": summarize(brackets),
             "bracket_short_ms": SHORT_BRACKET_MS,
             "bracket_short_ratio": short_bracket_ratio,
+            "bracket_byte_time_ms": BYTE_TIME_MS,
+            "bracket_lattice_share": lattice_share,
             "period_ms": summarize(periods),
             "effective_hz": 1000.0 / statistics.fmean(periods) if periods else None,
         },
@@ -272,6 +303,11 @@ def print_report(report):
             f"  反馈到达间隔 <{timestamp['bracket_short_ms']:.0f}ms 占比: "
             f"{timestamp['bracket_short_ratio'] * 100:.1f}%"
         )
+    if timestamp.get("bracket_lattice_share") is not None:
+        print(
+            f"  反馈到达间隔格点占比: {timestamp['bracket_lattice_share'] * 100:.1f}% "
+            f"（串口库字节时间 {timestamp['bracket_byte_time_ms']:.4f}ms，随机分布约 30%）"
+        )
     control = report.get("control", {})
     wire = control.get("wire_command")
     if wire:
@@ -320,6 +356,12 @@ def main():
         default=0.10,
         help=f"反馈到达间隔小于 {SHORT_BRACKET_MS:.0f}ms 的允许占比",
     )
+    parser.add_argument(
+        "--max-lattice-share",
+        type=float,
+        default=0.60,
+        help=f"反馈到达间隔落在 {BYTE_TIME_MS:.4f}ms 字节时间格点上的允许占比",
+    )
     args = parser.parse_args()
     records, invalid = load_records(args.input)
     report = analyze_records(
@@ -327,6 +369,7 @@ def main():
         args.max_mapped_age_ms,
         args.max_mapping_delay_ms,
         args.max_short_bracket_ratio,
+        args.max_lattice_share,
     )
     report["invalid_lines"] = invalid
     print_report(report)

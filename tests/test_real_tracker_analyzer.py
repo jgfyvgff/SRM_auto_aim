@@ -114,7 +114,7 @@ class RealTrackerAnalyzerTest(unittest.TestCase):
         ]
         report = analyze_records(records)
         self.assertAlmostEqual(report["timestamp"]["bracket_short_ratio"], 0.5)
-        self.assertTrue(any("串口到达节律" in warning for warning in report["warnings"]))
+        self.assertTrue(any("串口采样节律" in warning for warning in report["warnings"]))
 
     def test_accepts_regular_feedback_arrival(self):
         records = [
@@ -123,7 +123,28 @@ class RealTrackerAnalyzerTest(unittest.TestCase):
         ] + [{"event": "frame", "device_ticks": 400, "tick_hz": 1000, "bracket_ms": 7.3}]
         report = analyze_records(records)
         self.assertLess(report["timestamp"]["bracket_short_ratio"], 0.10)
-        self.assertFalse(any("串口到达节律" in warning for warning in report["warnings"]))
+        self.assertFalse(any("串口采样节律" in warning for warning in report["warnings"]))
+
+
+    def test_detects_serial_byte_time_lattice(self):
+        # 23.96ms = 23 × 1.0417ms（USB CDC 下库默认 9600 波特率的字节时间）
+        records = [
+            {"event": "frame", "device_ticks": 100 + 10 * i, "tick_hz": 1000, "bracket_ms": 23.96}
+            for i in range(20)
+        ]
+        report = analyze_records(records)
+        self.assertAlmostEqual(report["timestamp"]["bracket_lattice_share"], 1.0)
+        self.assertAlmostEqual(report["timestamp"]["bracket_byte_time_ms"], 1.0417, places=3)
+        self.assertTrue(any("字节时间格点" in warning for warning in report["warnings"]))
+
+    def test_accepts_off_lattice_arrival_intervals(self):
+        records = [
+            {"event": "frame", "device_ticks": 100 + 10 * i, "tick_hz": 1000, "bracket_ms": value}
+            for i, value in enumerate([8.0, 19.0, 3.0, 11.0])
+        ]
+        report = analyze_records(records)
+        self.assertLess(report["timestamp"]["bracket_lattice_share"], 0.60)
+        self.assertFalse(any("字节时间格点" in warning for warning in report["warnings"]))
 
 
 if __name__ == "__main__":

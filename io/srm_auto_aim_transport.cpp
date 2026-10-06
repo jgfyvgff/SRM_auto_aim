@@ -20,7 +20,14 @@ public:
     }
 
     // USB CDC 不使用 UART 波特率；serial 库仍需要先创建对象，超时由这里配置。
-    serial::Timeout timeout = serial::Timeout::simpleTimeout(config.timeout_ms);
+    // inter_byte_timeout 不能取 Timeout::max()：库在该值下会走"定长多字节读"分支，
+    // 按标称波特率 sleep 等待凑满整个读缓冲。USB CDC 下波特率保持库默认 9600，
+    // 一个"字节时间"= 1.0417ms，于是 read(64) 被拖成该值的整数倍（实测 bracket_ms
+    // 92% 落在 1.0417ms 格点上，k=23/7），串口线程只能拿到 42~58Hz 姿态样本。
+    // 给出有限的字节间隔超时后，read 拿到数据即返回，读写等待仍受 timeout_ms 限制。
+    constexpr std::uint32_t kReadInterByteTimeoutMs = 2;
+    serial::Timeout timeout(
+      kReadInterByteTimeoutMs, config.timeout_ms, 0, config.timeout_ms, 0);
     serial_.setTimeout(timeout);
     serial_.setPort(config.device);
     serial_.open();

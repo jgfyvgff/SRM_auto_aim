@@ -38,6 +38,7 @@ public:
   explicit SrmAutoAimTransport(std::unique_ptr<ByteStream> stream);
 
   // USB CDC 不依赖传统波特率；timeout_ms 仅用于限制一次读写等待时间。
+  // 读路径不会等待凑满读缓冲：拿到数据即返回，采样节律由下位机反馈率决定。
   explicit SrmAutoAimTransport(const SerialConfig & config);
 
   ~SrmAutoAimTransport();
