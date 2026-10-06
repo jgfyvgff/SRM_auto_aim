@@ -667,18 +667,10 @@ int main(int argc, char * argv[])
                 sample["mapping_delay_ms"] =
                     duration_ms(*timing.mapped_capture_at, timing.host_received_at);
             }
-            const auto feedback = serial_feedback.sample_at(image_timestamp);
-            if (!feedback) {
-                sample["event"] = "skip";
-                sample["skip_reason"] = "no fresh feedback on both sides of image time";
-                clear_tx_on_hard_failure();
-                record_sample(sample);
-                show_skip_frame(image, "waiting for serial feedback");
-                log_skip("no fresh feedback on both sides of image time");
-                continue;
-            }
-
-            solver.set_gimbal_to_world(feedback->gimbal_to_world);
+            // 检测只依赖图像，不依赖云台姿态，因此先跑检测、再等串口反馈。
+            // sample_at 会阻塞到出现 received_at >= 图像时刻 的反馈样本，而姿态反馈
+            // 周期约 24ms，串行执行会把这段等待整个叠加在推理之后：既抬高整链路延迟，
+            // 也把控制周期压到 30Hz 附近。先检测可以让 YOLO 推理与等待重叠。
             const auto detector_start = Clock::now();
             auto armors = detector.detect(image);
             const auto detector_end = Clock::now();
@@ -699,6 +691,26 @@ int main(int argc, char * argv[])
                 sample["mean_confidence"] = 0.0;
                 sample["max_confidence"] = 0.0;
             }
+            // 反馈等待是等数据，不是算法耗时；单独计时才能与检测耗时区分开。
+            const auto feedback_wait_start = Clock::now();
+            const auto feedback = serial_feedback.sample_at(image_timestamp);
+            sample["feedback_wait_ms"] = duration_ms(feedback_wait_start, Clock::now());
+            if (!feedback) {
+                sample["event"] = "skip";
+                sample["skip_reason"] = "no fresh feedback on both sides of image time";
+                sample["detected"] = detected;
+                sample["detector_ms"] = duration_ms(detector_start, detector_end);
+                clear_tx_on_hard_failure();
+                record_sample(sample);
+                show_skip_frame(image, "waiting for serial feedback");
+                log_skip("no fresh feedback on both sides of image time");
+                continue;
+            }
+
+            solver.set_gimbal_to_world(feedback->gimbal_to_world);
+            // tracker_ms 必须只覆盖 tracker.track：检测与反馈等待已移到它之前，
+            // 不能再沿用 detector_end 作为起点，否则等待时间会被误计入 Tracker。
+            const auto tracker_start = Clock::now();
             auto targets = tracker.track(armors, image_timestamp);
             const auto tracker_end = Clock::now();
             const double bullet_speed = feedback->feedback.bullet_speed_mps;
@@ -712,7 +724,7 @@ int main(int argc, char * argv[])
                 sample["tracker_state"] = tracker.state();
                 sample["tracker_generation"] = tracker.target_generation();
                 sample["detector_ms"] = duration_ms(detector_start, detector_end);
-                sample["tracker_ms"] = duration_ms(detector_end, tracker_end);
+                sample["tracker_ms"] = duration_ms(tracker_start, tracker_end);
                 append_target_json(sample, targets);
                 append_reprojection_json(
                     sample, solver, detected_armors_for_diagnostic, targets);
@@ -901,7 +913,7 @@ int main(int argc, char * argv[])
             sample["mode"] = feedback->feedback.mode;
             sample["color"] = feedback->feedback.color;
             sample["detector_ms"] = duration_ms(detector_start, detector_end);
-            sample["tracker_ms"] = duration_ms(detector_end, tracker_end);
+            sample["tracker_ms"] = duration_ms(tracker_start, tracker_end);
             sample["aimer_ms"] = duration_ms(aimer_start, finished_at);
             sample["capture_to_detector_ms"] = duration_ms(image_timestamp, detector_start);
             sample["capture_to_aimer_ms"] = duration_ms(image_timestamp, finished_at);

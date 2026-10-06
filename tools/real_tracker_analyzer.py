@@ -127,6 +127,7 @@ def analyze_records(records, max_mapped_age_ms=200.0, max_mapping_delay_ms=100.0
             "detector_ms": summarize(finite_values(processed, "detector_ms")),
             "tracker_ms": summarize(finite_values(processed, "tracker_ms")),
             "aimer_ms": summarize(finite_values(processed, "aimer_ms")),
+            "feedback_wait_ms": summarize(finite_values(processed, "feedback_wait_ms")),
             "state_counts": dict(state_counts),
         },
         "tracker": {
@@ -170,6 +171,13 @@ def print_report(report):
         f"Tracker状态={pipeline['state_counts']}"
     )
     print("跳过原因:", report["skip_reasons"] or "无")
+    for key in ("detector_ms", "tracker_ms", "aimer_ms", "feedback_wait_ms"):
+        summary = pipeline.get(key)
+        if summary and summary.get("count"):
+            print(
+                f"  {key}: mean={summary['mean']:.2f}ms "
+                f"p95={summary['p95']:.2f}ms max={summary['max']:.2f}ms"
+            )
     print("[诊断]")
     if report["warnings"]:
         for warning in report["warnings"]:
