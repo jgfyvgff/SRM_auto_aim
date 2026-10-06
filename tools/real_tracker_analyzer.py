@@ -38,6 +38,29 @@ def summarize(values):
     }
 
 
+def frame_periods(records):
+    """用设备 tick 计算相邻成功帧的间隔，得到链路真实控制周期。
+
+    相机的帧号会持续前进，但容量 1 丢旧帧队列只保留最新图像，因此
+    tick 间隔反映的是主循环周期，不是相机帧率。tick_hz 缺失（回退到
+    主机收帧时间）或 tick 回退的样本无法换算，直接跳过。
+    """
+    periods = []
+    previous = None
+    for record in records:
+        hz = record.get("tick_hz")
+        ticks = record.get("device_ticks")
+        if not hz or not isinstance(ticks, (int, float)):
+            previous = None
+            continue
+        if previous is not None:
+            delta = ticks - previous[1]
+            if delta > 0:
+                periods.append(delta / hz * 1000.0)
+        previous = (hz, ticks)
+    return periods
+
+
 def load_records(path):
     records = []
     invalid = 0
@@ -88,6 +111,7 @@ def analyze_records(records, max_mapped_age_ms=200.0, max_mapping_delay_ms=100.0
 
     mapped_age = finite_values(processed, "mapped_age_ms")
     mapping_delay = finite_values(processed, "mapping_delay_ms")
+    periods = frame_periods(processed)
     if mapped_age and percentile(mapped_age, 0.95) > max_mapped_age_ms:
         warnings.append(
             f"mapped_age P95={percentile(mapped_age, 0.95):.1f}ms 超过 {max_mapped_age_ms:.1f}ms"
@@ -118,6 +142,8 @@ def analyze_records(records, max_mapped_age_ms=200.0, max_mapping_delay_ms=100.0
             "mapped_age_ms": summarize(mapped_age),
             "mapping_delay_ms": summarize(mapping_delay),
             "bracket_ms": summarize(finite_values(processed, "bracket_ms")),
+            "period_ms": summarize(periods),
+            "effective_hz": 1000.0 / statistics.fmean(periods) if periods else None,
         },
         "pipeline": {
             "detection_rate": sum(value > 0 for value in detections) / len(detections)
@@ -128,6 +154,10 @@ def analyze_records(records, max_mapped_age_ms=200.0, max_mapping_delay_ms=100.0
             "tracker_ms": summarize(finite_values(processed, "tracker_ms")),
             "aimer_ms": summarize(finite_values(processed, "aimer_ms")),
             "feedback_wait_ms": summarize(finite_values(processed, "feedback_wait_ms")),
+            "capture_to_detector_ms": summarize(
+                finite_values(processed, "capture_to_detector_ms")
+            ),
+            "capture_to_aimer_ms": summarize(finite_values(processed, "capture_to_aimer_ms")),
             "state_counts": dict(state_counts),
         },
         "tracker": {
@@ -158,20 +188,29 @@ def print_report(report):
     print(f"设备频率: {report['tick_hz']}")
     print(f"时间戳来源: {report['timestamp']['sources']}")
     timestamp = report["timestamp"]
-    for key in ("mapped_age_ms", "mapping_delay_ms", "bracket_ms"):
+    for key in ("mapped_age_ms", "mapping_delay_ms", "bracket_ms", "period_ms"):
         summary = timestamp[key]
         if summary.get("count"):
             print(
                 f"  {key}: mean={summary['mean']:.2f}ms "
                 f"p95={summary['p95']:.2f}ms"
             )
+    if timestamp.get("effective_hz"):
+        print(f"  链路实际帧率: {timestamp['effective_hz']:.1f}Hz （由相机 tick 间隔换算）")
     pipeline = report["pipeline"]
     print(
         f"检测率={pipeline['detection_rate']:.3f} 目标率={pipeline['target_rate']:.3f} "
         f"Tracker状态={pipeline['state_counts']}"
     )
     print("跳过原因:", report["skip_reasons"] or "无")
-    for key in ("detector_ms", "tracker_ms", "aimer_ms", "feedback_wait_ms"):
+    for key in (
+        "detector_ms",
+        "tracker_ms",
+        "aimer_ms",
+        "feedback_wait_ms",
+        "capture_to_detector_ms",
+        "capture_to_aimer_ms",
+    ):
         summary = pipeline.get(key)
         if summary and summary.get("count"):
             print(
