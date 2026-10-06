@@ -51,6 +51,8 @@ const std::string kKeys =
     "{tx-command-ttl-ms|100|命令有效期，单位 ms}"
     "{tx-max-yaw-step-deg|2.0|每帧 yaw 最大变化量，单位 deg}"
     "{tx-max-pitch-step-deg|1.0|每帧 pitch 最大变化量，单位 deg}"
+    "{tx-follow-temp-lost|false|temp_lost 期间继续发送受限外推跟随指令，默认关闭}"
+    "{tx-temp-lost-frames|5|允许外推的最大连续丢失帧数，超出后回到保持角}"
     "{save-frame|/tmp/real_srm_frame.jpg|按 s 保存当前显示帧}"
     "{debug-jsonl||保存逐帧真机诊断 JSONL}"
     "{exposure-ms|0|临时覆盖 YAML 曝光时间，单位 ms，0 表示沿用 YAML}"
@@ -446,6 +448,8 @@ int main(int argc, char * argv[])
         const int tx_command_ttl_ms = cli.get<int>("tx-command-ttl-ms");
         const double tx_max_yaw_step_deg = cli.get<double>("tx-max-yaw-step-deg");
         const double tx_max_pitch_step_deg = cli.get<double>("tx-max-pitch-step-deg");
+        const bool tx_follow_temp_lost = cli.get<bool>("tx-follow-temp-lost");
+        const int tx_temp_lost_max_frames = cli.get<int>("tx-temp-lost-frames");
         const double exposure_override = cli.get<double>("exposure-ms");
         const double gain_override = cli.get<double>("gain");
         const int max_frames = cli.get<int>("max-frames");
@@ -462,6 +466,9 @@ int main(int argc, char * argv[])
             !std::isfinite(tx_max_yaw_step_deg) || tx_max_yaw_step_deg <= 0.0 ||
             !std::isfinite(tx_max_pitch_step_deg) || tx_max_pitch_step_deg <= 0.0) {
             throw std::invalid_argument("Invalid TX timing or step configuration");
+        }
+        if (tx_temp_lost_max_frames < 0) {
+            throw std::invalid_argument("--tx-temp-lost-frames must be non-negative");
         }
         if (cli.get<bool>("check-config")) {
             std::cout << "Real read-only config OK: " << config.image_width << 'x'
@@ -585,6 +592,23 @@ int main(int argc, char * argv[])
             [&serial_feedback, enable_tx, &last_valid_aim_command]() {
             last_valid_aim_command.reset();
             if (enable_tx) serial_feedback.clear_command();
+        };
+        // 保持角发送：未进入跟随（或外推解算无效）时锁定上次有效瞄准角；首次跟踪前
+        // 保持当前反馈姿态。保持模式只写角度，不外推丢失目标，也不允许开火。
+        const auto send_hold_command = [&](const auto & feedback_sample) {
+            if (!enable_tx) return;
+            const auto hold = last_valid_aim_command.value_or(
+                io::srm_auto_aim::CommandFrame{
+                    feedback_sample->feedback.yaw_deg, feedback_sample->feedback.pitch_deg, 0});
+            if (std::isfinite(hold.yaw_deg) && std::isfinite(hold.pitch_deg)) {
+                serial_feedback.set_hold_command(hold);
+                tx_command_sent = true;
+                tx_command_mode = last_valid_aim_command ? "hold_last_aim" : "hold_current";
+                tx_command_yaw_deg = hold.yaw_deg;
+                tx_command_pitch_deg = hold.pitch_deg;
+            } else {
+                clear_tx_on_hard_failure();
+            }
         };
         const auto record_sample = [&recorder, &serial_feedback](Json & sample) {
             // tx_command_sent 仅表示进入邮箱；这两个累计量来自串口线程成功写入。
@@ -749,7 +773,19 @@ int main(int argc, char * argv[])
             sample["planner_yaw_deg"] = nullptr;
             sample["planner_pitch_deg"] = nullptr;
             const auto planner_start = Clock::now();
-            if (!targets.empty() && tracker.state() == "tracking") {
+            // temp_lost 期间 Tracker 仍返回外推目标，但默认只保持上次瞄准角：真机日志
+            // 显示这会造成每秒约 7.6 次"冻结→恢复补跳"（1852 次 / 245s），恢复帧 yaw
+            // 阶跃 p95 1.87°，而正常帧只有 0.45°。开启 --tx-follow-temp-lost 后，在连续
+            // 丢失帧数不超过 --tx-temp-lost-frames 时继续按预测状态发受限跟随指令，把
+            // 这个阶跃摊到数帧里；外推帧 planner_control 记 0、fire_flag 恒 0。
+            const int temp_lost_frames = tracker.temp_lost_count();
+            const bool tx_extrapolating =
+                tx_follow_temp_lost && tracker.state() == "temp_lost" &&
+                temp_lost_frames <= tx_temp_lost_max_frames;
+            if (
+                !targets.empty() &&
+                (tracker.state() == "tracking" || tx_extrapolating))
+            {
                 const auto motion = serial_feedback.latest_motion();
                 // 无真实弹速时仅计算诊断轨迹；不能据此驱动云台或申请开火。
                 const double planning_speed = measured_speed ? bullet_speed : planner_debug_speed;
@@ -798,12 +834,19 @@ int main(int argc, char * argv[])
                 target.predict(planner_start);
                 const auto plan = planner.plan(target, planning_speed, planner_state);
                 if (!plan.diagnostic_valid || (!measured_speed && !tx_use_nominal_speed)) {
-                    clear_tx_on_hard_failure();
+                    // 外推帧解算无效时退回保持角：一次瞬时无效不该被当成硬故障清空指令。
+                    if (tx_extrapolating) {
+                        send_hold_command(feedback);
+                    } else {
+                        clear_tx_on_hard_failure();
+                    }
                 }
                 sample["planner_status"] =
                     !plan.diagnostic_valid ? "invalid" :
                     plan.solver_converged ? "ok" : "unconverged_diagnostic";
-                sample["planner_control"] = plan.control && has_measured_velocity ? 1 : 0;
+                // 外推帧不进入控制判据，只用于把恢复阶跃摊平。
+                sample["planner_control"] =
+                    plan.control && has_measured_velocity && !tx_extrapolating ? 1 : 0;
                 sample["planner_solver_converged"] = plan.solver_converged;
                 sample["planner_yaw_solver_status"] = plan.yaw_solver_status;
                 sample["planner_pitch_solver_status"] = plan.pitch_solver_status;
@@ -873,30 +916,18 @@ int main(int argc, char * argv[])
                         serial_feedback.set_command(command);
                         last_valid_aim_command = command;
                         tx_command_sent = true;
-                        tx_command_mode = plan.solver_converged ? "tracking" : "acquire";
+                        tx_command_mode = tx_extrapolating ? "extrapolate" :
+                                          (plan.solver_converged ? "tracking" : "acquire");
                         tx_command_yaw_deg = command_yaw * 180.0 / CV_PI;
                         tx_command_pitch_deg = command_pitch * 180.0 / CV_PI;
                     }
                 }
             } else if (enable_tx) {
-                // 未进入 tracking 时固定上次有效瞄准角；首次跟踪前保持当前反馈姿态。
-                // 保持模式只锁定角度，不外推丢失目标，也不允许开火。
-                const auto hold = last_valid_aim_command.value_or(
-                    io::srm_auto_aim::CommandFrame{
-                        feedback->feedback.yaw_deg, feedback->feedback.pitch_deg, 0});
-                if (std::isfinite(hold.yaw_deg) && std::isfinite(hold.pitch_deg)) {
-                    serial_feedback.set_hold_command(hold);
-                    tx_command_sent = true;
-                    tx_command_mode = last_valid_aim_command
-                        ? "hold_last_aim" : "hold_current";
-                    tx_command_yaw_deg = hold.yaw_deg;
-                    tx_command_pitch_deg = hold.pitch_deg;
-                } else {
-                    clear_tx_on_hard_failure();
-                }
+                send_hold_command(feedback);
             }
             sample["tx_command_sent"] = tx_command_sent;
             sample["tx_command_mode"] = tx_command_mode;
+            sample["tx_extrapolating"] = tx_extrapolating;
             if (tx_command_sent) {
                 sample["tx_command_yaw_deg"] = tx_command_yaw_deg;
                 sample["tx_command_pitch_deg"] = tx_command_pitch_deg;
