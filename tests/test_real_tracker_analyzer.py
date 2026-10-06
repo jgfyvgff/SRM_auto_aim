@@ -356,6 +356,50 @@ class RealTrackerAnalyzerTest(unittest.TestCase):
             any("冻结时长来自没有任何敌方装甲板检测" in w for w in report["warnings"])
         )
 
+    def test_frame_causes_follow_individual_frames(self):
+        # 真机日志里的 611 帧长盲区是混合段：段级成因只看"这段中出现过什么证据"，
+        # 会把整段算成 detection_not_associated，因此按帧统计必须逐帧用自身证据
+        # 归类。否则 no_detection 会被压到阈值以下、candidate_rejected 被虚报，
+        # 直接导致主因判错（真机日志：段级 2731/1944/1703 vs 帧级 1636/3912/824）。
+        records = [{"event": "frame", "tracker_state": "tracking", "detected": 1}]
+        records += [
+            {"event": "frame", "tracker_state": "lost", "detected": 0} for _ in range(4)
+        ]
+        # 同一段里只有这一帧有检测，但没有形成关联候选。
+        records.append(
+            {
+                "event": "frame",
+                "tracker_state": "lost",
+                "detected": 1,
+                "association_matching_detection_count": 1,
+                "association_candidate_count": 0,
+            }
+        )
+        records.append({"event": "frame", "tracker_state": "tracking", "detected": 1})
+        report = analyze_records(records)
+        continuity = report["continuity"]
+        self.assertEqual(continuity["blind_runs"], 1)
+        self.assertEqual(continuity["run_causes"], {"detection_not_associated": 1})
+        self.assertEqual(continuity["frame_causes"], {"no_detection": 4,
+                                                      "detection_not_associated": 1})
+        self.assertEqual(continuity["cause_longest_frames"], {"detection_not_associated": 5})
+        self.assertEqual(continuity["longest_runs"][0]["frames"], 5)
+        self.assertEqual(continuity["longest_runs"][0]["cause"], "detection_not_associated")
+        self.assertEqual(
+            continuity["longest_runs"][0]["frame_causes"],
+            {"no_detection": 4, "detection_not_associated": 1},
+        )
+        self.assertEqual(continuity["longest_runs"][0]["start_index"], 1)
+        self.assertEqual(continuity["longest_runs"][0]["end_index"], 5)
+        # 帧级 no_detection 占 80%，必须告警；段级的 detection_not_associated 只有
+        # 20%，不该误报。
+        self.assertTrue(
+            any("冻结时长来自没有任何敌方装甲板检测" in w for w in report["warnings"])
+        )
+        self.assertFalse(
+            any("没有形成关联候选" in w for w in report["warnings"])
+        )
+
     def test_flags_short_blind_runs_as_minor(self):
         records = []
         for _ in range(3):

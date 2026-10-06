@@ -58,6 +58,10 @@ CRITICAL_FIELD_GROUPS = ("盲区与保持帧", "指令模式", "关联拒绝归�
 # 长度不超过该值的盲区视为"单次漏检造成的短暂冻结"，与"目标真的不在视野"分开。
 SHORT_BLIND_FRAMES = 2
 
+# 打印最长的几段盲区及其内部成因构成，用于判断长段是"整段无检测（目标真的不在
+# 视野）"还是"混合段（检测时有时无，被段级成因一言以蔽之）"。
+LONGEST_RUN_REPORT = 3
+
 
 def percentile(values, ratio):
     ordered = sorted(values)
@@ -237,17 +241,37 @@ def continuity_report(records, fallback_period_ms):
         runs.append(current)
 
     causes = collections.Counter()
-    cause_frames = collections.Counter()
+    frame_causes = collections.Counter()
     cause_longest_frames = collections.Counter()
     cause_longest_ms = {}
     longest_frames = 0
     longest_ms = 0.0
+    runs_detail = []
     for run in runs:
         frames = [tracked[index] for index in run]
         cause = blind_run_cause(frames)
         duration_ms = axis[run[-1]] - axis[run[0]] + fallback_period_ms
         causes[cause] += 1
-        cause_frames[cause] += len(run)
+        # 段级成因只记录"这段里出现过什么证据"，会把整段的帧数记到那一个成因上。
+        # 按帧加权必须逐帧用自身证据归类：一段 611 帧里只有 1 帧有检测时，段级
+        # 成因是 detection_not_associated，但那 610 帧的真因是 no_detection。
+        # 两种口径在真机日志上分别给出 2731/1944/1703（段级）与 1636/3912/824
+        # （帧级），差值全部来自这种混合段，判读必须以帧级为准。
+        composition = collections.Counter()
+        for frame in frames:
+            frame_cause = blind_run_cause([frame])
+            frame_causes[frame_cause] += 1
+            composition[frame_cause] += 1
+        runs_detail.append(
+            {
+                "start_index": run[0],
+                "end_index": run[-1],
+                "frames": len(run),
+                "ms": duration_ms,
+                "cause": cause,
+                "frame_causes": dict(composition),
+            }
+        )
         if len(run) > cause_longest_frames[cause]:
             cause_longest_frames[cause] = len(run)
             cause_longest_ms[cause] = duration_ms
@@ -276,9 +300,12 @@ def continuity_report(records, fallback_period_ms):
             1 for index in blind if (tracked[index].get("association_accepted_count") or 0) > 0
         ),
         "run_causes": dict(causes),
-        "frame_causes": dict(cause_frames),
+        "frame_causes": dict(frame_causes),
         "cause_longest_frames": dict(cause_longest_frames),
         "cause_longest_ms": cause_longest_ms,
+        "longest_runs": sorted(
+            runs_detail, key=lambda item: (item["frames"], item["ms"]), reverse=True
+        )[:LONGEST_RUN_REPORT],
         "short_blind_runs": len(short_runs),
         "short_blind_frames": sum(len(run) for run in short_runs),
         "short_blind_ratio": (
@@ -539,6 +566,13 @@ def analyze_records(
                 f"{rejected_share * 100:.0f}% 的冻结时长来自有检测但候选被全部拒绝的帧："
                 "瓶颈在关联门限或 EKF 后验，需要确认门限是否随距离与协方差自适应"
             )
+        detection_share = frame_causes.get("detection_not_associated", 0) / total_blind
+        if detection_share > NO_DETECTION_RUN_SHARE:
+            warnings.append(
+                f"{detection_share * 100:.0f}% 的冻结时长来自有检测但没有形成关联候选的帧："
+                "候选列表在匹配/颜色/PnP 阶段就被清空，先查 matching_detection_count 与"
+                "优化后的装甲板是否被判为无效，而不是看关联门限"
+            )
         no_detection_runs = continuity.get("run_causes", {}).get("no_detection", 0)
         total_runs = sum(continuity.get("run_causes", {}).values())
         if total_runs and no_detection_runs / total_runs > NO_DETECTION_RUN_SHARE:
@@ -725,7 +759,7 @@ def print_report(report):
             f"{name}={count}" for name, count in continuity.get("frame_causes", {}).items()
         )
         print(
-            f"  盲区成因(按帧权重): {frame_causes or '无'}；"
+            f"  盲区成因(按帧): {frame_causes or '无'}；"
             f"短盲区(≤{SHORT_BLIND_FRAMES}帧) {continuity.get('short_blind_runs', 0)} 段 "
             f"只占冻结帧 {continuity.get('short_blind_ratio', 0.0) * 100:.1f}%"
         )
@@ -734,6 +768,15 @@ def print_report(report):
             for name, frames in continuity.get("cause_longest_frames", {}).items()
         )
         print(f"  各成因最长段: {longest or '无'}")
+        for rank, run in enumerate(continuity.get("longest_runs", []), start=1):
+            detail = " ".join(
+                f"{name}={count}" for name, count in run.get("frame_causes", {}).items()
+            )
+            print(
+                f"  最长盲区段 #{rank}: {run['frames']} 帧 / {run['ms']:.0f}ms"
+                f"（帧 #{run['start_index']}~{run['end_index']}），"
+                f"段级成因 {run['cause']}，段内帧成因 {detail or '无'}"
+            )
     association = report.get("association", {})
     if association.get("candidate_frames"):
         print(
