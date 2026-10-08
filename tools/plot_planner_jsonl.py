@@ -102,6 +102,24 @@ def series_from_records(records, key):
     return np.asarray(values, dtype=float)
 
 
+def plot_time_axis_s(records, max_gap_s=1.0, fallback_ms=DEFAULT_FRAME_PERIOD_MS):
+    """绘图用的时间轴（秒）：把超过 max_gap_s 的间隔压到 max_gap_s。
+
+    日志里可能夹着长时间暂停（实测有一处 57 分钟），按真实设备时间画会把有数据的部分
+    压成一条竖线，什么都看不出来。压缩后横轴表示"有效数据时间"，只在图注里注明；
+    统计（盲区时长等）仍然用真实时间轴，不受这里影响。
+    """
+    raw = np.asarray(frame_time_axis_ms(records, fallback_ms), dtype=float) / 1000.0
+    if raw.size == 0:
+        return raw
+    out = np.empty_like(raw)
+    out[0] = raw[0]
+    for index in range(1, raw.size):
+        gap = max(0.0, float(raw[index] - raw[index - 1]))
+        out[index] = out[index - 1] + (gap if max_gap_s <= 0 else min(gap, max_gap_s))
+    return out
+
+
 def wrap_deg(delta):
     """把角度差折到 (-180, 180]，避免 179° 与 -179° 之间被判成 358°。"""
     if not math.isfinite(delta):
@@ -211,14 +229,14 @@ def print_summary(overview, rows):
             )
 
 
-def plot_panels(records, panels, output, title, show, dpi):
+def plot_panels(records, panels, output, title, show, dpi, max_gap_s=1.0):
     """画多面板图；缺列的曲线直接跳过，不因为某个字段没有就整张失败。"""
     import matplotlib
 
     matplotlib.use("TkAgg" if show else "Agg")
     import matplotlib.pyplot as plt
 
-    times = np.asarray(frame_time_axis_ms(records, DEFAULT_FRAME_PERIOD_MS), dtype=float) / 1000.0
+    times = plot_time_axis_s(records, max_gap_s)
     derived = {
         "yaw_error_deg": yaw_error_deg(records),
         "pitch_error_deg": pitch_error_deg(records),
@@ -294,7 +312,7 @@ def plot_panels(records, panels, output, title, show, dpi):
             if plotted:
                 axis.legend(loc="upper right", fontsize=8)
 
-    axes[-1].set_xlabel("time [s]")
+    axes[-1].set_xlabel("time [s] (gaps > {:g}s collapsed)".format(max_gap_s))
     figure.suptitle(title, fontsize=11)
     figure.tight_layout(rect=(0, 0, 1, 0.985))
 
@@ -306,7 +324,7 @@ def plot_panels(records, panels, output, title, show, dpi):
     plt.close(figure)
 
 
-def plot_all_curves(records, output, title, show, dpi):
+def plot_all_curves(records, output, title, show, dpi, max_gap_s=1.0):
     """--preset all：把日志里所有数值标量列铺成网格图。"""
     columns = []
     for record in records:
@@ -321,7 +339,7 @@ def plot_all_curves(records, output, title, show, dpi):
     matplotlib.use("TkAgg" if show else "Agg")
     import matplotlib.pyplot as plt
 
-    times = np.asarray(frame_time_axis_ms(records, DEFAULT_FRAME_PERIOD_MS), dtype=float) / 1000.0
+    times = plot_time_axis_s(records, max_gap_s)
     per_figure = 12
     for start in range(0, len(panels), per_figure):
         chunk = panels[start : start + per_figure]
@@ -353,6 +371,10 @@ def main():
     parser.add_argument("--title", help="图标题；默认用输入文件名")
     parser.add_argument("--show", action="store_true", help="弹出窗口（需要显示器）")
     parser.add_argument("--dpi", type=int, default=110)
+    parser.add_argument(
+        "--max-gap", type=float, default=1.0,
+        help="绘图时间轴把超过该秒数的间隔压缩掉；0 表示保留真实时间（默认 1.0）",
+    )
     args = parser.parse_args()
 
     input_path = Path(args.input)
@@ -376,12 +398,13 @@ def main():
     if args.curves:
         keys = tuple(key.strip() for key in args.curves.split(",") if key.strip())
         plot_panels(
-            records, [{"title": ", ".join(keys), "curves": keys}], output, title, args.show, args.dpi
+            records, [{"title": ", ".join(keys), "curves": keys}], output, title, args.show,
+            args.dpi, args.max_gap
         )
     elif args.preset == "all":
-        plot_all_curves(records, output, title, args.show, args.dpi)
+        plot_all_curves(records, output, title, args.show, args.dpi, args.max_gap)
     else:
-        plot_panels(records, PANELS, output, title, args.show, args.dpi)
+        plot_panels(records, PANELS, output, title, args.show, args.dpi, args.max_gap)
     return 0
 
 

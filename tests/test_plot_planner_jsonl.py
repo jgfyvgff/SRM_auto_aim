@@ -11,6 +11,7 @@ from tools.plot_planner_jsonl import (
     PANELS,
     pitch_error_deg,
     plot_panels,
+    plot_time_axis_s,
     required_yaw_step_deg,
     series_from_records,
     summarize_convergence,
@@ -130,6 +131,31 @@ class SummarizeTest(unittest.TestCase):
         overview, rows = summarize_convergence([{"planner_yaw_deg": None}])
         self.assertEqual(overview, {})
         self.assertEqual(rows, [])
+
+
+class PlotTimeAxisTest(unittest.TestCase):
+    def _records(self):
+        # tick_hz=1000 → 1 tick = 1 ms；第三帧与前一帧相差 600 s。
+        return [
+            {"device_ticks": 0, "tick_hz": 1000.0},
+            {"device_ticks": 10, "tick_hz": 1000.0},
+            {"device_ticks": 600010, "tick_hz": 1000.0},
+        ]
+
+    def test_large_gap_is_collapsed(self):
+        axis = plot_time_axis_s(self._records(), max_gap_s=1.0)
+        self.assertAlmostEqual(axis[1], 0.01)
+        # 600 s 的暂停被压成 1 s：否则有数据的部分会被压成一条竖线。
+        self.assertAlmostEqual(axis[2], 1.01)
+
+    def test_zero_keeps_real_time(self):
+        axis = plot_time_axis_s(self._records(), max_gap_s=0.0)
+        self.assertAlmostEqual(axis[2], 600.01)
+
+    def test_monotonic_for_all_records(self):
+        axis = plot_time_axis_s(self._records(), max_gap_s=1.0)
+        self.assertEqual(len(axis), 3)
+        self.assertTrue(all(axis[i] <= axis[i + 1] for i in range(len(axis) - 1)))
 
 
 class PlotSmokeTest(unittest.TestCase):
