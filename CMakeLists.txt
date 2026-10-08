@@ -106,6 +106,8 @@ add_test(NAME device_clock_mapper_test COMMAND device_clock_mapper_test)
 add_executable(real_serial_feedback_test tests/real_serial_feedback_test.cpp)
 target_link_libraries(real_serial_feedback_test real_serial_feedback)
 add_test(NAME real_serial_feedback_test COMMAND real_serial_feedback_test)
+add_executable(tx_command_limiter_test tests/tx_command_limiter_test.cpp)
+add_test(NAME tx_command_limiter_test COMMAND tx_command_limiter_test)
 add_executable(real_config_test tests/real_config_test.cpp)
 target_link_libraries(real_config_test yaml-cpp Eigen3::Eigen)
 add_test(

@@ -24,7 +24,8 @@ public:
     // 按标称波特率 sleep 等待凑满整个读缓冲。USB CDC 下波特率保持库默认 9600，
     // 一个"字节时间"= 1.0417ms，于是 read(64) 被拖成该值的整数倍（实测 bracket_ms
     // 92% 落在 1.0417ms 格点上，k=23/7），串口线程只能拿到 42~58Hz 姿态样本。
-    // 给出有限的字节间隔超时后，read 拿到数据即返回，读写等待仍受 timeout_ms 限制。
+    // 有限字节间隔超时让 serial 库可在间隔超限或总超时后返回部分数据；
+    // 它不保证首字节一到就返回，读写等待仍受 timeout_ms 限制。
     constexpr std::uint32_t kReadInterByteTimeoutMs = 2;
     serial::Timeout timeout(
       kReadInterByteTimeoutMs, config.timeout_ms, 0, config.timeout_ms, 0);

@@ -25,6 +25,7 @@
 #include "src/real_auto_aim/config.hpp"
 #include "src/real_auto_aim/debug_recorder.hpp"
 #include "src/real_auto_aim/serial_feedback_reader.hpp"
+#include "src/real_auto_aim/tx_command_limiter.hpp"
 #include "tasks/auto_aim/aimer.hpp"
 #include "tasks/auto_aim/planner/planner.hpp"
 #include "tasks/auto_aim/solver.hpp"
@@ -49,10 +50,13 @@ const std::string kKeys =
     "{tx-use-nominal-speed|false|弹速反馈无效时允许使用配置名义弹速，仅无开火}"
     "{tx-period-ms|20|控制发送周期，单位 ms}"
     "{tx-command-ttl-ms|100|命令有效期，单位 ms}"
-    "{tx-max-yaw-step-deg|2.0|每帧 yaw 最大变化量，单位 deg}"
-    "{tx-max-pitch-step-deg|1.0|每帧 pitch 最大变化量，单位 deg}"
+    "{tx-max-yaw-step-deg|2.0|单条命令 yaw 最大变化量，单位 deg}"
+    "{tx-max-pitch-step-deg|1.0|单条命令 pitch 最大变化量，单位 deg}"
+    "{tx-max-yaw-rate-deg-s|60.0|yaw 最大角速度，单位 deg/s}"
+    "{tx-max-pitch-rate-deg-s|30.0|pitch 最大角速度，单位 deg/s}"
     "{tx-follow-temp-lost|false|temp_lost 期间继续发送受限外推跟随指令，默认关闭}"
     "{tx-temp-lost-frames|5|允许外推的最大连续丢失帧数，超出后回到保持角}"
+    "{tx-temp-lost-rate-scale|0.35|外推角速度比例，范围 (0,1]}"
     "{save-frame|/tmp/real_srm_frame.jpg|按 s 保存当前显示帧}"
     "{debug-jsonl||保存逐帧真机诊断 JSONL}"
     "{exposure-ms|0|临时覆盖 YAML 曝光时间，单位 ms，0 表示沿用 YAML}"
@@ -64,12 +68,6 @@ const std::string kKeys =
 double duration_ms(Clock::time_point begin, Clock::time_point end)
 {
     return std::chrono::duration<double, std::milli>(end - begin).count();
-}
-
-double step_angle_towards(double current, double target, double max_step)
-{
-    const double delta = tools::limit_rad(target - current);
-    return tools::limit_rad(current + std::clamp(delta, -max_step, max_step));
 }
 
 void draw_polygon(
@@ -448,8 +446,11 @@ int main(int argc, char * argv[])
         const int tx_command_ttl_ms = cli.get<int>("tx-command-ttl-ms");
         const double tx_max_yaw_step_deg = cli.get<double>("tx-max-yaw-step-deg");
         const double tx_max_pitch_step_deg = cli.get<double>("tx-max-pitch-step-deg");
+        const double tx_max_yaw_rate_deg_s = cli.get<double>("tx-max-yaw-rate-deg-s");
+        const double tx_max_pitch_rate_deg_s = cli.get<double>("tx-max-pitch-rate-deg-s");
         const bool tx_follow_temp_lost = cli.get<bool>("tx-follow-temp-lost");
         const int tx_temp_lost_max_frames = cli.get<int>("tx-temp-lost-frames");
+        const double tx_temp_lost_rate_scale = cli.get<double>("tx-temp-lost-rate-scale");
         const double exposure_override = cli.get<double>("exposure-ms");
         const double gain_override = cli.get<double>("gain");
         const int max_frames = cli.get<int>("max-frames");
@@ -464,8 +465,12 @@ int main(int argc, char * argv[])
         }
         if (tx_period_ms <= 0 || tx_command_ttl_ms <= 0 ||
             !std::isfinite(tx_max_yaw_step_deg) || tx_max_yaw_step_deg <= 0.0 ||
-            !std::isfinite(tx_max_pitch_step_deg) || tx_max_pitch_step_deg <= 0.0) {
-            throw std::invalid_argument("Invalid TX timing or step configuration");
+            !std::isfinite(tx_max_pitch_step_deg) || tx_max_pitch_step_deg <= 0.0 ||
+            !std::isfinite(tx_max_yaw_rate_deg_s) || tx_max_yaw_rate_deg_s <= 0.0 ||
+            !std::isfinite(tx_max_pitch_rate_deg_s) || tx_max_pitch_rate_deg_s <= 0.0 ||
+            !std::isfinite(tx_temp_lost_rate_scale) || tx_temp_lost_rate_scale <= 0.0 ||
+            tx_temp_lost_rate_scale > 1.0) {
+            throw std::invalid_argument("Invalid TX timing, rate or step configuration");
         }
         if (tx_temp_lost_max_frames < 0) {
             throw std::invalid_argument("--tx-temp-lost-frames must be non-negative");
@@ -512,6 +517,10 @@ int main(int argc, char * argv[])
         double tx_command_yaw_deg = 0.0;
         double tx_command_pitch_deg = 0.0;
         std::optional<io::srm_auto_aim::CommandFrame> last_valid_aim_command;
+        std::optional<Clock::time_point> last_tx_command_at;
+        const real_auto_aim::TxRateLimits tx_rate_limits{
+            tx_max_yaw_rate_deg_s, tx_max_pitch_rate_deg_s,
+            tx_max_yaw_step_deg, tx_max_pitch_step_deg};
         const auto save_frame_path = cli.get<std::string>("save-frame");
         std::uint64_t saved_frame_count = 0;
         std::uint64_t captured_frame_count = 0;
@@ -589,8 +598,9 @@ int main(int argc, char * argv[])
             handle_window_key(visualization);
         };
         const auto clear_tx_on_hard_failure =
-            [&serial_feedback, enable_tx, &last_valid_aim_command]() {
+            [&serial_feedback, enable_tx, &last_valid_aim_command, &last_tx_command_at]() {
             last_valid_aim_command.reset();
+            last_tx_command_at.reset();
             if (enable_tx) serial_feedback.clear_command();
         };
         // 保持角发送：未进入跟随（或外推解算无效）时锁定上次有效瞄准角；首次跟踪前
@@ -602,6 +612,7 @@ int main(int argc, char * argv[])
                     feedback_sample->feedback.yaw_deg, feedback_sample->feedback.pitch_deg, 0});
             if (std::isfinite(hold.yaw_deg) && std::isfinite(hold.pitch_deg)) {
                 serial_feedback.set_hold_command(hold);
+                last_tx_command_at = Clock::now();
                 tx_command_sent = true;
                 tx_command_mode = last_valid_aim_command ? "hold_last_aim" : "hold_current";
                 tx_command_yaw_deg = hold.yaw_deg;
@@ -773,11 +784,9 @@ int main(int argc, char * argv[])
             sample["planner_yaw_deg"] = nullptr;
             sample["planner_pitch_deg"] = nullptr;
             const auto planner_start = Clock::now();
-            // temp_lost 期间 Tracker 仍返回外推目标，但默认只保持上次瞄准角：真机日志
-            // 显示这会造成每秒约 7.6 次"冻结→恢复补跳"（1852 次 / 245s），恢复帧 yaw
-            // 阶跃 p95 1.87°，而正常帧只有 0.45°。开启 --tx-follow-temp-lost 后，在连续
-            // 丢失帧数不超过 --tx-temp-lost-frames 时继续按预测状态发受限跟随指令，把
-            // 这个阶跃摊到数帧里；外推帧 planner_control 记 0、fire_flag 恒 0。
+            // temp_lost 期间 Tracker 仍返回预测目标；默认保持最后的瞄准角。
+            // 可选外推仅在短暂丢帧时使用，并降低角速度权限；是否减少恢复跳变需实车复验。
+            // 外推帧 planner_control 记 0、fire_flag 恒 0。
             const int temp_lost_frames = tracker.temp_lost_count();
             const bool tx_extrapolating =
                 tx_follow_temp_lost && tracker.state() == "temp_lost" &&
@@ -833,7 +842,10 @@ int main(int argc, char * argv[])
                 auto target = targets.front();
                 target.predict(planner_start);
                 const auto plan = planner.plan(target, planning_speed, planner_state);
-                if (!plan.diagnostic_valid || (!measured_speed && !tx_use_nominal_speed)) {
+                const bool finite_target =
+                    std::isfinite(plan.target_yaw) && std::isfinite(plan.target_pitch);
+                if (!plan.diagnostic_valid || !finite_target ||
+                    (!measured_speed && !tx_use_nominal_speed)) {
                     // 外推帧解算无效时退回保持角：一次瞬时无效不该被当成硬故障清空指令。
                     if (tx_extrapolating) {
                         send_hold_command(feedback);
@@ -891,43 +903,61 @@ int main(int argc, char * argv[])
                         Json(plan.pitch_dual_residual_max) : Json(nullptr);
                 }
 
-                // 发送分为两个阶段：MPC 收敛后跟踪 MPC 输出；未收敛但轨迹有限时，
-                // 先用几何目标让云台接近。每帧步进限制用于避免把大角度误差一次性
-                // 变成突发目标；它不改变 Planner 的诊断结果，也绝不申请开火。
+                // 绝对角协议统一追踪 Planner 的目标参考角。TinyMPC 求解状态仅用于
+                // 诊断，不再在两套相差数度的角度之间切换发送目标；始终禁止开火。
+                // 限幅以上一条已提交命令为基准，按真实间隔换算角速度，并受旧单次上限约束。
                 const bool tx_ready = enable_tx && (measured_speed || tx_use_nominal_speed) &&
-                                      has_measured_velocity && plan.diagnostic_valid;
-                if(tx_ready){                      
-                    const double requested_yaw =
-                        plan.solver_converged ? plan.yaw : plan.target_yaw;
-                    const double requested_pitch =
-                        plan.solver_converged ? plan.pitch : plan.target_pitch;
-                    const double max_yaw_step = tx_max_yaw_step_deg * CV_PI / 180.0;
-                    const double max_pitch_step = tx_max_pitch_step_deg * CV_PI / 180.0;
-                    const double command_yaw = step_angle_towards(
-                        planner_state.yaw, requested_yaw, max_yaw_step);
-                    const double command_pitch = planner_state.pitch + std::clamp(
-                        requested_pitch - planner_state.pitch,
-                        -max_pitch_step, max_pitch_step);
-                    if (std::isfinite(command_yaw) && std::isfinite(command_pitch)) {
-                        const io::srm_auto_aim::CommandFrame command{
-                            static_cast<float>(command_yaw * 180.0 / CV_PI),
-                            static_cast<float>(command_pitch * 180.0 / CV_PI),
-                            0};
-                        serial_feedback.set_command(command);
-                        last_valid_aim_command = command;
-                        tx_command_sent = true;
-                        tx_command_mode = tx_extrapolating ? "extrapolate" :
-                                          (plan.solver_converged ? "tracking" : "acquire");
-                        tx_command_yaw_deg = command_yaw * 180.0 / CV_PI;
-                        tx_command_pitch_deg = command_pitch * 180.0 / CV_PI;
+                                      has_measured_velocity && plan.diagnostic_valid && finite_target;
+                if (tx_ready) {
+                    const auto command_at = Clock::now();
+                    // 长时间没有新命令时不能用累计 dt 一次性追赶；首次使用发送周期。
+                    const double elapsed_s = last_tx_command_at ? std::clamp(
+                        std::chrono::duration<double>(command_at - *last_tx_command_at).count(),
+                        0.0, tx_command_ttl_ms / 1000.0) : tx_period_ms / 1000.0;
+                    const real_auto_aim::TxAnglesDeg base = last_valid_aim_command ?
+                        real_auto_aim::TxAnglesDeg{
+                            last_valid_aim_command->yaw_deg,
+                            last_valid_aim_command->pitch_deg} :
+                        real_auto_aim::TxAnglesDeg{
+                            planner_state.yaw * 180.0 / CV_PI,
+                            planner_state.pitch * 180.0 / CV_PI};
+                    const real_auto_aim::TxAnglesDeg requested{
+                        plan.target_yaw * 180.0 / CV_PI,
+                        plan.target_pitch * 180.0 / CV_PI};
+                    if (std::isfinite(base.yaw) && std::isfinite(base.pitch)) {
+                        const auto limited = real_auto_aim::limit_tx_angles(
+                            base, requested, elapsed_s, tx_rate_limits,
+                            tx_extrapolating ? tx_temp_lost_rate_scale : 1.0);
+                        if (std::isfinite(limited.yaw) && std::isfinite(limited.pitch)) {
+                            const io::srm_auto_aim::CommandFrame command{
+                                static_cast<float>(limited.yaw),
+                                static_cast<float>(limited.pitch),
+                                0};
+                            serial_feedback.set_command(command);
+                            last_valid_aim_command = command;
+                            last_tx_command_at = command_at;
+                            tx_command_sent = true;
+                            tx_command_mode = tx_extrapolating ? "extrapolate" : "tracking";
+                            tx_command_yaw_deg = command.yaw_deg;
+                            tx_command_pitch_deg = command.pitch_deg;
+                        } else {
+                            clear_tx_on_hard_failure();
+                        }
+                    } else {
+                        clear_tx_on_hard_failure();
                     }
+                } else if (enable_tx && plan.diagnostic_valid && finite_target &&
+                           (measured_speed || tx_use_nominal_speed) && !has_measured_velocity) {
+                    // 只有速度估计短时不可用时保持；轨迹/弹速无效仍按上面的硬故障处理。
+                    send_hold_command(feedback);
                 }
             } else if (enable_tx) {
                 send_hold_command(feedback);
             }
             sample["tx_command_sent"] = tx_command_sent;
             sample["tx_command_mode"] = tx_command_mode;
-            sample["tx_extrapolating"] = tx_extrapolating;
+            sample["tx_extrapolating"] =
+                tx_command_sent && tx_command_mode == "extrapolate";
             if (tx_command_sent) {
                 sample["tx_command_yaw_deg"] = tx_command_yaw_deg;
                 sample["tx_command_pitch_deg"] = tx_command_pitch_deg;

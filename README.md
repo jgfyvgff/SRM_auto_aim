@@ -298,13 +298,10 @@ python3 tools/real_tracker_analyzer.py \
 
 评估脚本会检查设备计数和帧号单调性、`mapped_age`、`mapping_delay`、串口匹配间隔、
 检测率、Tracker 状态、中心速度、预测时间、瞄准角以及 `skip_reason`。它只分析记录，
-不修改 Tracker 或 Aimer 参数。报告还包含关联门限离线扫描（`gate_sweep`）：它只用
-被拒帧已记录的 `association_primary_position_error`/`distance_error` 做数学回放，
-并沿用这些帧 angle/score/马氏门限的既有结论，直接回答"绝对门限放宽到多少米能救回
-多少被拒帧"，因此选门限不必重新上车采集；被 EKF 后验否决、或栽在 angle/score/马氏
-门限的帧单独计数，不计入可恢复帧（放宽绝对门限对它们无效）。`tx_extrapolating`
-帧数不为 0 时说明 `temp_lost` 外推跟随已生效，可对比 `hold_ratio` 与
-`resume_step_deg` 判断"冻结→补跳"是否被摊平。脚本测试：
+不修改 Tracker 或 Aimer 参数。报告将 Tracker 非 tracking 状态、实际保持指令和
+`temp_lost` 外推指令分开统计。关联统计保留实际门控失败项；固定 `angle_gate` 仅供
+诊断，不会被报告为拦截原因。检测输出为空也不能单独证明目标离开视野，需结合原图。
+脚本测试：
 
 ```bash
 python3 -m unittest tests/test_real_tracker_analyzer.py
@@ -313,8 +310,9 @@ python3 -m unittest tests/test_real_tracker_analyzer.py
 日志中的 `diagnostic_yaw/pitch` 只是 Aimer 计算结果；默认运行时 `tx_enabled=false`，
 无控制输出。启用发送后，应结合 `tx_command_sent` 和 `tx_command_mode` 判断上位机
 是否将无开火目标放入发送邮箱。
-`planner_status=ok` 表示求解器收敛；`unconverged_diagnostic` 表示仅有有限的数值轨迹，
-此时 `planner_control=0`，不可用于控制。可比较 `planner_measured_*`、
+`planner_status=ok` 表示求解器收敛；`unconverged_diagnostic` 表示求解器未收敛，
+但仍记录有限的诊断轨迹。`planner_control` 只表示 MPC 控制判据，不是命令发送标志；
+实际发送统一使用有限的 `planner_target_yaw/pitch` 参考角。可比较 `planner_measured_*`、
 `planner_state_*`、`planner_target_*` 与 `planner_yaw_deg/pitch_deg`，并查看
 `planner_feedback_age_ms`、`planner_feedback_interval_ms`、`planner_ms`。
 `planner_feedback_interval_ms` 是用于速度差分的收帧时间跨度，不是串口或相机硬件时间。
@@ -322,8 +320,8 @@ python3 -m unittest tests/test_real_tracker_analyzer.py
 `planner_{yaw,pitch}_solver_status`、`planner_{yaw,pitch}_solver_iterations` 和
 `planner_{yaw,pitch}_{primal,dual}_residual_max`；状态 0 表示该轴收敛，残差为
 TinyMPC 原始数值，不是角度误差。100 ms 角度只用于查看轨迹趋势，不是下发命令；
-`planner_control=0` 不代表接近阶段没有发送，接近阶段由 `tx_command_mode=acquire`
-单独标记。
+`planner_control=0` 不代表没有发送角度命令，实际发送状态由 `tx_command_sent` 标记，
+普通跟踪命令使用 `tx_command_mode=tracking`。
 云台静止且无法形成可靠差分速度时，Planner 使用图像时刻已匹配的串口 yaw/pitch，
 将角速度置零，并标记 `planner_state_source=matched_pose_zero_velocity`；该状态只能
 用于静止场景诊断，`planner_control` 保持为 0。存在有效差分速度时，状态来源标记为
@@ -338,29 +336,34 @@ Planner 输出的是下一 10 ms 规划步的
 或图像过期时不更新 Tracker。当前海康 `Camera::read()` 在无图像时仍可能阻塞，
 该入口的退出有赖于相机持续返回图像，尚未完成硬件验收。
 
-启用上位机无开火控制时，`standard_srm` 会在 Planner 收敛后发送 MPC 角度；
-Planner 尚未收敛但轨迹有限时，会发送受限步进的目标角，先让云台接近目标。
-有效目标跨帧保留，避免视觉处理期间交替发送目标与零命令。Tracker 不在 tracking
-状态时，正常有图像和新鲜反馈的帧会保持最后一次有效的云台目标角；首次跟踪前则
-保持当前反馈角，`fire_flag` 始终为 0。保持模式不受普通跟踪命令 100 ms TTL 限制，
-恢复 tracking 后重新使用正常的限幅 Planner 命令。图像时间戳无效、串口反馈缺失
-或轨迹非法等硬故障会立即清空命令邮箱，随后发送 yaw=0、pitch=0、fire=0。
+启用上位机无开火控制时，`standard_srm` 始终以 Planner 的目标参考角作为发送目标；
+TinyMPC 求解状态保留在 `planner_status` 等字段中用于诊断，不会在两套角度之间切换。
+命令从上一条已提交角度按实际间隔限速，再受旧的单次步进参数约束。默认角速度上限为
+yaw 60 deg/s、pitch 30 deg/s；单次命令上限仍为 yaw 2 deg、pitch 1 deg。跟踪命令进入
+邮箱后跨帧保留，避免视觉处理期间交替发送目标与零命令。Tracker 未跟踪时，正常有图像
+和新鲜反馈的帧会保持最后一次有效目标角；首次跟踪前保持当前反馈角，`fire_flag` 恒为 0。
+速度估计短时不可用时也发送保持角；图像时间戳无效、串口反馈缺失或轨迹非法等硬故障
+会清空命令邮箱，随后发送 yaw=0、pitch=0、fire=0。
 反馈弹速在 10–25 m/s 时使用实测值；若反馈为 0，可显式设置
 `--tx-use-nominal-speed=1`，让无开火控制计算使用配置中的名义弹速。有效反馈弹速
 始终优先，`fire_flag` 始终为 0。JSONL 的 `tx_speed_source` 会标明本帧来源。
-默认情况下 `temp_lost` 帧只发送保持角：真机日志显示这会在每次漏检后形成"先冻结、
-恢复时一次性补跳"的循环（1852 次 / 245s ≈ 7.6 次/秒，恢复帧 yaw 跳变 p95 1.87°，
-而正常帧只有 0.45°）。`--tx-follow-temp-lost=1` 会在连续丢失帧数不超过
-`--tx-temp-lost-frames`（默认 5，≈100ms）时按预测状态继续发送受限步进跟随命令，
-把这个阶跃摊到数帧里；这些帧在 JSONL 中标记为 `tx_command_mode=extrapolate`、
-`tx_extrapolating=true`，`planner_control` 记 0，`fire_flag` 仍恒为 0。超出帧数
-上限、解算无效或进入 `lost` 时立即回到保持角。
+默认情况下 `temp_lost` 帧保持最后一次有效角。`--tx-follow-temp-lost=1` 会在连续丢失
+帧数不超过 `--tx-temp-lost-frames`（默认 5 帧）时允许用 Tracker 预测目标继续跟随，
+并将角速度上限乘以 `--tx-temp-lost-rate-scale`（默认 0.35，范围 (0,1]）。帧数对应的
+实际时长随视觉帧率变化；该选项默认关闭，其抖动改善需要在实车上验证。成功提交的
+外推命令标记为 `tx_command_mode=extrapolate` 和 `tx_extrapolating=true`；没有实际发送
+的外推尝试不会计入。`planner_control` 仅描述 Planner 求解状态，不等同于命令是否已发送；
+以 `tx_command_sent` 和 `tx_command_mode` 为准。超出帧数上限、解算无效或进入 `lost`
+时回到保持角，`fire_flag` 仍恒为 0。
 `tx_command_sent` 只表示命令进入邮箱；`tx_wire_target_frames` 和
 `tx_wire_zero_frames` 是串口线程成功写入的累计帧数，不等于下位机执行回执。
-默认参数为 20 ms 发送周期、100 ms 命令有效期、yaw 每帧最多 2 deg、pitch 每帧最多 1 deg，
-可通过命令行覆盖。这里的 `tx_command_mode=acquire` 表示接近阶段，
-`tx_command_mode=tracking` 表示 Planner 已收敛后的跟踪阶段；
-`hold_last_aim` 表示保持上次有效目标角，`hold_current` 表示首次跟踪前保持反馈角。
+默认参数为 20 ms 发送周期、100 ms 命令有效期、yaw/pitch 角速度上限分别 60/30 deg/s，
+单次命令变化上限分别为 2/1 deg，均可通过 `--tx-max-yaw-rate-deg-s`、
+`--tx-max-pitch-rate-deg-s`、`--tx-max-yaw-step-deg` 和 `--tx-max-pitch-step-deg` 覆盖。
+`--tx-temp-lost-rate-scale` 控制暂失外推的角速度比例。当前版本的 `tracking` 表示普通
+目标参考指令；TinyMPC 是否收敛单独看 `planner_status`。旧日志里的 `acquire` 表示旧版
+未收敛接近阶段。`hold_last_aim` 表示保持上次有效角，`hold_current` 表示首次跟踪前保持
+反馈角。
 
 首次只建议进行无开火短时测试：
 
