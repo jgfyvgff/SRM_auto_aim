@@ -62,6 +62,16 @@ Tracker::Tracker(const std::string & config_path, Solver & solver)
     yaml["association_max_mahalanobis_distance"].IsDefined()
       ? yaml["association_max_mahalanobis_distance"].as<double>()
       : 3.2;
+  // 默认 7 帧窗口内同类出现 5 次才改判类别：远距离分类是边缘的（实测同一块装甲板在
+  // two / outpost 之间逐帧跳），单帧证据不足以定类别。参数做边界收敛，避免配出
+  // "窗口 0 帧"或"要求票数多于窗口"这类永远不成立的条件。
+  relock_name_window_ =
+    yaml["relock_name_window"].IsDefined() ? yaml["relock_name_window"].as<int>() : 7;
+  relock_name_votes_ =
+    yaml["relock_name_votes"].IsDefined() ? yaml["relock_name_votes"].as<int>() : 5;
+  if (relock_name_window_ < 1) relock_name_window_ = 1;
+  if (relock_name_votes_ < 1) relock_name_votes_ = 1;
+  if (relock_name_votes_ > relock_name_window_) relock_name_votes_ = relock_name_window_;
   measurement_bearing_variance_ =
     yaml["measurement_bearing_variance"].IsDefined()
       ? yaml["measurement_bearing_variance"].as<double>()
@@ -161,11 +171,23 @@ std::list<Target> Tracker::track(
 
   bool found;
   if (state_ == "lost") {
+    // 重新捕获时清空投票窗口，避免把上一次目标、甚至上一次丢失前的票带进来。
+    recent_names_.clear();
     found = set_target(armors, t);
+    if (found && !armors.empty()) push_recent_name(armors.front().name);
   }//如果是lost状态，则寻找优先级最高的装甲板
 
   else {
-    found = update_target(armors, t);
+    if (!armors.empty()) push_recent_name(armors.front().name);
+    // 只在还没进入 tracking 的阶段改判：tracking 期间锁定类别是有意为之（避免同类装甲板
+    // 之间跳变），而捕获阶段相反——类别错了必须尽早纠正，否则正确的观测会被名字过滤
+    // 一直拦到超时。switching 属于全向感知那条路径，这里不碰。
+    const bool capture_phase = (state_ == "detecting" || state_ == "temp_lost");
+    if (capture_phase && relock_on_majority_name(armors, t)) {
+      found = true;
+    } else {
+      found = update_target(armors, t);
+    }
   }
 
   state_machine(found);
@@ -350,6 +372,46 @@ void Tracker::state_machine(bool found)
       }
     }
   }
+}
+
+void Tracker::push_recent_name(std::optional<ArmorName> name)
+{
+  if (!name.has_value()) return;
+  recent_names_.push_back(*name);
+  while (recent_names_.size() > static_cast<std::size_t>(relock_name_window_)) {
+    recent_names_.pop_front();
+  }
+}
+
+bool Tracker::relock_on_majority_name(
+  std::list<Armor> & armors, std::chrono::steady_clock::time_point t)
+{
+  if (armors.empty()) return false;
+  const auto winner = majority_armor_name(recent_names_, relock_name_window_, relock_name_votes_);
+  if (!winner.has_value() || winner->name == target_.name) return false;
+
+  // 用本帧里属于胜出类别、置信度最高的装甲板重建目标。set_target 取 front()，
+  // 所以把它提到链表首位；其余装甲板的相对顺序保持不变。
+  auto best = armors.end();
+  for (auto it = armors.begin(); it != armors.end(); ++it) {
+    if (it->name != winner->name) continue;
+    if (best == armors.end() || it->confidence > best->confidence) best = it;
+  }
+  if (best == armors.end()) return false;
+
+  const ArmorName previous = target_.name;
+  armors.splice(armors.begin(), armors, best);
+  if (!set_target(armors, t)) return false;
+
+  // 改判后重新走一次确认流程，避免单帧直接进入 tracking 造成抖动。
+  state_ = "detecting";
+  detect_count_ = 1;
+  temp_lost_count_ = 0;
+  // 这类改判必须留痕：远距离分类抖动时它会反复出现，是判断"模型是否可信"的直接依据。
+  tools::logger()->info(
+    "[Tracker] Relock name {} -> {} (votes {}/{})", ARMOR_NAMES[previous], ARMOR_NAMES[winner->name],
+    winner->votes, static_cast<int>(recent_names_.size()));
+  return true;
 }
 
 bool Tracker::set_target(std::list<Armor> & armors, std::chrono::steady_clock::time_point t)

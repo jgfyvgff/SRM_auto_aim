@@ -111,6 +111,8 @@ add_test(NAME tx_command_limiter_test COMMAND tx_command_limiter_test)
 add_executable(dynamic_roi_test tests/dynamic_roi_test.cpp)
 target_link_libraries(dynamic_roi_test ${OpenCV_LIBS})
 add_test(NAME dynamic_roi_test COMMAND dynamic_roi_test)
+add_executable(tracker_name_vote_test tests/tracker_name_vote_test.cpp)
+add_test(NAME tracker_name_vote_test COMMAND tracker_name_vote_test)
 add_executable(real_config_test tests/real_config_test.cpp)
 target_link_libraries(real_config_test yaml-cpp Eigen3::Eigen)
 add_test(

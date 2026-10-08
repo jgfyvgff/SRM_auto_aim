@@ -5,12 +5,15 @@
 #include <array>
 #include <chrono>
 #include <cstdint>
+#include <deque>
 #include <list>
+#include <optional>
 #include <string>
 
 #include "armor.hpp"
 #include "solver.hpp"
 #include "target.hpp"
+#include "tasks/auto_aim/tracker_name_vote.hpp"
 #include "tasks/omniperception/perceptron.hpp"
 #include "tools/thread_safe_queue.hpp"
 
@@ -129,8 +132,18 @@ private:
   AssociationDebug association_debug_;
   // 每次 set_target 成功后递增，用于区分真实 ID 跳变和 Tracker 重初始化。
   std::uint64_t target_generation_ = 0;
+  // 捕获阶段的类别投票窗口；只在还没进入 tracking 时用于改判类别。
+  int relock_name_window_;
+  int relock_name_votes_;
+  std::deque<ArmorName> recent_names_;
 
   void state_machine(bool found);
+
+  void push_recent_name(std::optional<ArmorName> name);
+
+  // 捕获阶段按多数票改判类别；返回 true 表示已经用新类别重建了目标。
+  bool relock_on_majority_name(
+    std::list<Armor> & armors, std::chrono::steady_clock::time_point t);
 
   bool set_target(std::list<Armor> & armors, std::chrono::steady_clock::time_point t);
 

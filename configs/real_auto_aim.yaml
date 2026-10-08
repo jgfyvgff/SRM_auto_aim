@@ -43,6 +43,12 @@ max_side_ratio: 1.5
 max_rectangular_error: 25
 
 min_detect_count: 5
+# 类别投票改判：远距离下模型会在相邻类别之间抖动（实测同一块装甲板在 two/outpost 之间
+# 逐帧跳）。追踪器第 0 帧没有先验、走整帧缩放，判错后正确的类别会被名字过滤全部拦掉
+# 直到 temp_lost 超时（实测 30 帧里 29 帧卡住）。因此改为：窗口 7 帧内同类出现 5 次，
+# 就在还没进入 tracking 的阶段按多数票重建目标。tracking 期间行为不变。
+relock_name_window: 7
+relock_name_votes: 5
 max_temp_lost_count: 15
 outpost_max_temp_lost_count: 75
 tracker_max_prediction_gap: 0.3
