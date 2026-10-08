@@ -14,6 +14,15 @@ device: GPU
 # 且这 39 帧目标都在视野内、temp_lost_count 多为 1~3，即逐帧闪烁；
 # 降到 0.7 后 300 帧零丢帧，tracking 由 102/150 升到 146/150。
 min_confidence: 0.7
+# 动态 ROI：按上一帧目标框裁剪再缩放到 640，使装甲板在网络输入里保持约 40px。
+# 实测 5.8m 处：整帧路径 30/30 帧把 "2" 判成 outpost（追踪器因此按 3 块/r=0.2765 建模），
+# 裁剪后 30/30 帧判成 two。关掉即回到原整帧行为，便于 A/B。
+dynamic_roi: true
+# ROI 边长 = 目标框宽 × 该倍率；16 使装甲板在 640 宽输入里恒为 40px（任何距离）。
+# 实测 40px 分类正确、30px 仍会错，所以取 16 而不是更激进的倍率。
+dynamic_roi_scale: 16.0
+# ROI 边长下限：窗口太小会丢掉上下文，影响 NMS 与后续关联。
+dynamic_roi_min_width: 320
 use_traditional: false
 use_roi: false
 roi:

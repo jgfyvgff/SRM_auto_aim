@@ -3,13 +3,22 @@
 #include <fmt/chrono.h>
 #include <yaml-cpp/yaml.h>
 
+#include <algorithm>
 #include <filesystem>
+#include <optional>
 
 #include "tools/img_tools.hpp"
 #include "tools/logger.hpp"
 
 namespace auto_aim
 {
+namespace
+{
+// 连续漏检超过该帧数就放弃先验、回退整帧：66Hz 下约 75ms，够跨越单帧闪烁，
+// 又不至于在目标已经移出窗口后一直空找。
+constexpr int kRoiMissTolerance = 5;
+}  // namespace
+
 YOLOV5::YOLOV5(const std::string & config_path, bool debug)
 : debug_(debug), detector_(config_path, false)
 {
@@ -26,6 +35,12 @@ YOLOV5::YOLOV5(const std::string & config_path, bool debug)
   height = yaml["roi"]["height"].as<int>();
   use_roi_ = yaml["use_roi"].as<bool>();
   use_traditional_ = yaml["use_traditional"].as<bool>();
+  // 动态 ROI 是可选增强：老配置文件没有这些键时保持原有整帧行为，便于 A/B 与回退。
+  dynamic_roi_ = yaml["dynamic_roi"].IsDefined() ? yaml["dynamic_roi"].as<bool>() : false;
+  dynamic_roi_scale_ =
+    yaml["dynamic_roi_scale"].IsDefined() ? yaml["dynamic_roi_scale"].as<double>() : 16.0;
+  dynamic_roi_min_width_ =
+    yaml["dynamic_roi_min_width"].IsDefined() ? yaml["dynamic_roi_min_width"].as<int>() : 320;
   roi_ = cv::Rect(x, y, width, height);
   offset_ = cv::Point2f(x, y);
 
@@ -64,7 +79,16 @@ std::list<Armor> YOLOV5::detect(const cv::Mat & raw_img, int frame_count)
   }
 
   cv::Mat bgr_img;
-  if (use_roi_) {
+  if (dynamic_roi_) {
+    // 先验来自上一帧检测；连续漏检超限就用整帧重新捕获。
+    const bool use_prior = last_target_box_.has_value() && roi_miss_streak_ <= kRoiMissTolerance;
+    auto rect = dynamic_roi_rect(
+      use_prior ? last_target_box_ : std::nullopt, dynamic_roi_scale_, dynamic_roi_min_width_,
+      raw_img.cols, raw_img.rows);
+    // offset_ 必须跟着裁剪原点走：parse 得到的坐标是裁剪图坐标，靠它加回原图坐标。
+    offset_ = cv::Point2f(static_cast<float>(rect.x), static_cast<float>(rect.y));
+    bgr_img = raw_img(rect);
+  } else if (use_roi_) {
     if (roi_.width == -1) {  // -1 表示该维度不裁切
       roi_.width = raw_img.cols;
     }
@@ -98,7 +122,26 @@ std::list<Armor> YOLOV5::detect(const cv::Mat & raw_img, int frame_count)
   auto output_shape = output_tensor.get_shape();
   cv::Mat output(output_shape[1], output_shape[2], CV_32F, output_tensor.data());//创建输出矩阵，指定行数、列数、数据类型和数据指针
 
-  return parse(scale, output, raw_img, frame_count);//解析输出矩阵，返回识别到的装甲板信息
+  // 解析输出矩阵，返回识别到的装甲板信息
+  auto armors = parse(scale, output, raw_img, frame_count);
+
+  if (dynamic_roi_) {
+    if (!armors.empty()) {
+      // Armor 的 offset 构造已把 center 回填到原图坐标，可直接作为下一帧先验；
+      // box 仍是裁剪图坐标，但宽度与原图一致，所以只取宽度。
+      const auto best = std::max_element(
+        armors.begin(), armors.end(),
+        [](const Armor & a, const Armor & b) { return a.confidence < b.confidence; });
+      const float prior_width = static_cast<float>(best->box.width);
+      last_target_box_ = cv::Rect2f(
+        best->center.x - prior_width / 2.0F, best->center.y - prior_width * 0.375F, prior_width,
+        prior_width * 0.75F);
+      roi_miss_streak_ = 0;
+    } else {
+      ++roi_miss_streak_;
+    }
+  }
+  return armors;
 }
 
 

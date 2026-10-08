@@ -9,6 +9,7 @@
 
 #include "tasks/auto_aim/armor.hpp"
 #include "tasks/auto_aim/detector.hpp"
+#include "tasks/auto_aim/dynamic_roi.hpp"
 #include "tasks/auto_aim/yolo.hpp"
 
 namespace auto_aim
@@ -27,6 +28,14 @@ private:
   std::string device_, model_path_;
   std::string save_path_, debug_path_;
   bool debug_, use_roi_, use_traditional_;
+
+  // 动态 ROI（可选）：按上一帧目标框裁剪再缩放到 640，使装甲板在网络输入里保持约
+  // 40px，远距离才不会因为数字像素不足被判错类别。原理与实测见 dynamic_roi.hpp。
+  bool dynamic_roi_;
+  double dynamic_roi_scale_;
+  int dynamic_roi_min_width_;
+  std::optional<cv::Rect2f> last_target_box_;  // 上一帧置信度最高的目标框（原图坐标）
+  int roi_miss_streak_ = 0;                    // 连续未检出帧数，超限即回退整帧重捕获
 
   const int class_num_ = 13;
   const float nms_threshold_ = 0.3;
