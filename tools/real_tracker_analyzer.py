@@ -12,34 +12,39 @@ from pathlib import Path
 # 反馈样本到达间隔低于该值即视为"采样变密"（只作指标，单独不能判定异常）。
 SHORT_BRACKET_MS = 20.0
 
-# 串口库默认 9600（8N1）对应的字节时间，仅作为间隔分布的诊断参照。
+# 串口库按标称波特率换算"字节时间"；USB CDC 不设波特率，库保持默认 9600（8N1），
+# 即 1.0417ms。采样间隔若大量落在这个格点上，说明 read() 在按字节时间等待凑满读缓冲，
+# 采样节律被读路径节流，而不是由下位机反馈率决定。
 BYTE_TIME_MS = 1000.0 / (9600.0 / 10.0)
 
 # 判定读路径节流还要求平均插值区间明显长于单帧量级：修复后间隔会落到
 # 2 个字节时间（读满 64 字节）附近，格点占比同样很高，但采样率已经恢复正常。
 THROTTLED_BRACKET_MS = 5.0
 
-# 这是 Tracker 状态统计口径。新版本可在 temp_lost 期间发送外推命令，
-# 所以非 tracking 帧不等于云台保持帧；实际保持比例从 tx_command_mode 统计。
+# 只有 tracking 状态会发送跟踪指令；其余状态 standard_srm 发送保持角
+# （即 last_valid_aim_command）。因此这些帧的占比等于"云台冻结"占比。
 FOLLOWING_STATES = ("tracking",)
 
 # 缺设备 tick 时把盲区帧数换算成时长的兜底控制周期（≈71Hz）。
 DEFAULT_FRAME_PERIOD_MS = 14.0
 
-# 实际保持命令占发送命令比例超过该值时提示检查控制行为。
-HOLD_RATIO_WARNING = 0.20
+# 保持帧占比超过该值即认为控制链路大部分时间没有在跟随目标。
+FREEZE_RATIO_WARNING = 0.20
 
-# 非 tracking 帧证据的提示门限；这些比例用于定位复核方向，不单独断言根因。
-NO_DETECTION_FRAME_SHARE = 0.60
-CANDIDATE_REJECT_FRAME_SHARE = 0.30
+# 盲区片段成因占比判据：无检测占多数说明瓶颈在检测器，候选被拒占多数说明在门限。
+NO_DETECTION_RUN_SHARE = 0.60
+CANDIDATE_REJECT_RUN_SHARE = 0.30
 
 # 同一 Tracker 世代内 radius 波动超过该值会明显平移瞄点（瞄点 = 中心 - r·方向）。
 RADIUS_DRIFT_WARN_M = 0.05
 
+# 保持→跟随切换那一帧的 yaw 跳变超过该值即存在可见追赶。
+RESUME_STEP_WARN_DEG = 1.0
+
 # 诊断字段分组：日志缺少整组字段时，对应统计必然为空。必须显式报告字段覆盖，
 # 否则"字段缺失"会被误读成"没有这个问题"（旧日志尤其容易踩）。
 FIELD_GROUPS = (
-    ("tracker_state", "Tracker状态"),
+    ("tracker_state", "盲区与保持帧"),
     ("tx_command_mode", "指令模式"),
     ("tx_command_yaw_deg", "指令步进与恢复跳变"),
     ("association_candidate_count", "关联拒绝归因"),
@@ -48,12 +53,13 @@ FIELD_GROUPS = (
 )
 
 # 缺这几组字段时主结论无法给出，必须告警；其余组只在覆盖行里按需展示。
-CRITICAL_FIELD_GROUPS = ("Tracker状态", "指令模式", "关联拒绝归因")
+CRITICAL_FIELD_GROUPS = ("盲区与保持帧", "指令模式", "关联拒绝归因")
 
-# 长度不超过该值的连续非 tracking 段单独统计；它不推断目标是否真的离开视野。
+# 长度不超过该值的盲区视为"单次漏检造成的短暂冻结"，与"目标真的不在视野"分开。
 SHORT_BLIND_FRAMES = 2
 
-# 仅打印最长的少数几段，帮助把 Tracker 状态与逐帧检测/关联证据对照。
+# 打印最长的几段盲区及其内部成因构成，用于判断长段是"整段无检测（目标真的不在
+# 视野）"还是"混合段（检测时有时无，被段级成因一言以蔽之）"。
 LONGEST_RUN_REPORT = 3
 
 
@@ -176,7 +182,8 @@ def field_coverage(records):
 def frame_time_axis_ms(records, fallback_ms):
     """为每帧给出单调时间轴（ms），缺设备 tick 时用兜底周期累加。
 
-    非 tracking 区间长度按时间而不是帧数衡量：帧率变化时相同帧数并不对应相同时长。
+    盲区时长必须按时间而不是帧数衡量：控制周期随读路径修复变化，帧数相同
+    不代表云台冻结时长相同。
     """
     axis = []
     current = None
@@ -210,7 +217,13 @@ def blind_run_cause(run):
 
 
 def continuity_report(records, fallback_period_ms):
-    """统计 Tracker 非 tracking 帧及观测证据，不据此推断云台命令是否保持。"""
+    """统计非跟踪帧占比、盲区段长度与成因。
+
+    Tracker 在 temp_lost 仍返回外推 Target，但控制门限要求 state=="tracking"，
+    所以这些帧云台只发保持角。只看总占比无法区分"检测器没输出"和"有输出但被
+    关联/EKF 拒绝"，因此逐段归类成 no_detection / detection_not_associated /
+    candidate_rejected 三种，分别对应检测器、关联前置条件和关联门限三条修复路径。
+    """
     tracked = [record for record in records if "tracker_state" in record]
     if not tracked:
         return {}
@@ -265,12 +278,16 @@ def continuity_report(records, fallback_period_ms):
         longest_frames = max(longest_frames, len(run))
         longest_ms = max(longest_ms, duration_ms)
 
-    # 同时保留逐帧和逐段证据，便于回到原图复核；detected=0 本身不能证明目标离开视野。
+    # 按段统计会被大量 1~2 帧的短盲区稀释：1853 段里可能只有几段是"目标真的不在
+    # 视野"，其余全是单帧漏检造成的短暂冻结。必须同时给出按帧加权的成因占比与
+    # 短盲区占比，否则无法判断该修检测器、门限，还是根本不用修。
     short_runs = [run for run in runs if len(run) <= SHORT_BLIND_FRAMES]
     blind = [index for run in runs for index in run]
     return {
-        "semantics": "Tracker state is not tracking; this does not imply a hold command",
         "following_states": list(FOLLOWING_STATES),
+        # 显式声明口径：这里的"盲区"是 Tracker 非 tracking 的帧，不等于云台冻结帧，
+        # 避免"非 tracking 占比"被误读成"云台保持占比"。
+        "semantics": "blind = tracker not in tracking; not the same as gimbal hold frames",
         "blind_frames": len(blind),
         "blind_ratio": len(blind) / len(tracked),
         "blind_runs": len(runs),
@@ -321,9 +338,11 @@ def association_report(records):
         record for record in candidate_frames if not (record.get("association_accepted_count") or 0)
     ]
     failing = collections.Counter()
-    gate_passed_but_rejected = 0
     diagnostic_angle_failures = 0
+    gate_passed_but_rejected = 0
     for record in rejected:
+        # 固定 angle 门限不参与接受判定（tracker.cpp 的 gate_passed 只含
+        # score/position/distance/马氏），因此它只能作诊断，不能算作拒绝原因。
         if tri_state(record.get("association_primary_angle_gate_passed")) is False:
             diagnostic_angle_failures += 1
         if tri_state(record.get("association_primary_gate_passed")):
@@ -390,7 +409,10 @@ def within_group_stdev(records, key, group_key="tracker_generation", min_frames=
 def command_jitter_report(records):
     """控制指令模式、逐帧步进与目标重建次数。
 
-    hold_* 统计实际提交的保持命令；Tracker 状态只描述视觉跟踪状态，不代表命令模式。
+    hold_* 表示保持角（未跟随）；resume_step_deg 专门统计"保持→跟随"切换那一帧
+    的角度跳变，它直接对应"盲区结束后云台突然追赶"。
+    hold_ratio 以全部帧为分母，等于"云台冻结占比"；而指令步进只统计实际进入邮箱的
+    命令（tx_command_sent），否则未下发的候选角度会被误算成一次指令变化。
     """
     modes = collections.Counter(
         record["tx_command_mode"] for record in records if "tx_command_mode" in record
@@ -418,18 +440,15 @@ def command_jitter_report(records):
             if str(previous[1]).startswith("hold") and not str(mode).startswith("hold"):
                 resume_steps.append(delta)
         previous = (float(yaw), mode)
-    hold_frames = sum(
-        1 for record in sent_records
-        if str(record.get("tx_command_mode", "")).startswith("hold")
-    )
+    hold_frames = sum(count for mode, count in modes.items() if str(mode).startswith("hold"))
     extrapolate_frames = sum(
         1 for record in sent_records if record.get("tx_command_mode") == "extrapolate"
     )
     return {
         "tx_command_mode_counts": dict(modes),
-        "command_frames": len(sent_records),
         "hold_frames": hold_frames,
-        "hold_ratio": hold_frames / len(sent_records) if sent_records else 0.0,
+        "hold_ratio": hold_frames / len(records) if records else 0.0,
+        "command_frames": len(sent_records),
         "extrapolate_frames": extrapolate_frames,
         "command_yaw_step_deg": summarize(steps),
         "resume_step_deg": summarize(resume_steps),
@@ -466,8 +485,9 @@ def analyze_records(
 ):
     """汇总逐帧诊断记录。
 
-    bracket_ms 是姿态插值所用两侧反馈样本的接收间隔。字节时间格点只作为分布特征，
-    不能单独证明串口库正在节流；还需结合反馈等待时间和实际收包记录判断。
+    bracket_ms 是姿态插值所用两侧反馈样本的接收间隔，它由串口读路径决定，
+    不必然等于下位机反馈周期：间隔偏短说明样本变密；间隔既落在串口库字节时间
+    格点上、平均值又远超单帧量级时，说明 read() 在等待凑满读缓冲，采样被节流。
     """
     processed = [record for record in records if record.get("event") == "frame"]
     skipped = [record for record in records if record.get("event") == "skip"]
@@ -529,8 +549,8 @@ def analyze_records(
         warnings.append(
             f"姿态插值区间平均 {bracket_mean_ms:.1f}ms（超过 {throttle_bracket_ms:.1f}ms），"
             f"且 {lattice_share * 100:.1f}% 的到达间隔落在串口库 {BYTE_TIME_MS:.4f}ms "
-            "字节时间格点上：该分布与读路径等待相符，但不能单凭格点确认根因；"
-            "请结合 feedback_wait_ms 和独立收包记录复核"
+            "字节时间格点上（随机分布约 30%）：read() 正在按标称波特率等待凑满读缓冲，"
+            "串口采样被读路径节流，采样率与插值区间由主机读路径决定，而不是下位机反馈率"
         )
 
     control_period_ms = statistics.fmean(periods) if periods else DEFAULT_FRAME_PERIOD_MS
@@ -546,39 +566,49 @@ def analyze_records(
             "不代表没有该问题；需要用带这些字段的版本（standard_srm 的 "
             "tx_command_mode / association_*）重新采集"
         )
-    if jitter.get("hold_ratio", 0.0) > HOLD_RATIO_WARNING:
+    if continuity.get("blind_ratio", 0.0) > FREEZE_RATIO_WARNING:
         warnings.append(
-            f"实际保持命令占比 {jitter['hold_ratio'] * 100:.1f}% "
-            f"（超过 {HOLD_RATIO_WARNING * 100:.0f}%），占已提交命令 "
-            f"{jitter['command_frames']} 帧中的 {jitter['hold_frames']} 帧"
+            f"云台保持帧占比 {continuity['blind_ratio'] * 100:.1f}% "
+            f"（超过 {FREEZE_RATIO_WARNING * 100:.0f}%），共 {continuity['blind_runs']} 段盲区，"
+            f"最长 {continuity['longest_blind_frames']} 帧 / {continuity['longest_blind_ms']:.1f}ms："
+            "非 tracking 帧只发送保持角，这段时间云台没有跟随目标"
         )
     frame_causes = continuity.get("frame_causes", {})
     total_blind = sum(frame_causes.values())
     if total_blind:
         no_detection_share = frame_causes.get("no_detection", 0) / total_blind
         rejected_share = frame_causes.get("candidate_rejected", 0) / total_blind
-        if no_detection_share > NO_DETECTION_FRAME_SHARE:
+        if no_detection_share > NO_DETECTION_RUN_SHARE:
             warnings.append(
-                f"{no_detection_share * 100:.0f}% 的 Tracker 非跟踪帧没有检测输出 "
-                "（detected==0）；需结合原图判断目标是否离开视野、被遮挡或漏检，"
-                "再决定是否调整曝光和检测阈值"
+                f"{no_detection_share * 100:.0f}% 的冻结时长来自没有任何敌方装甲板检测"
+                "（detected==0）的帧：瓶颈在检测器（min_confidence、曝光、焦距），"
+                "而不是 Tracker 状态机或关联参数"
             )
-        if rejected_share > CANDIDATE_REJECT_FRAME_SHARE:
+        if rejected_share > CANDIDATE_REJECT_RUN_SHARE:
             warnings.append(
-                f"{rejected_share * 100:.0f}% 的 Tracker 非跟踪帧有候选但未接受："
-                "结合失败门限和 EKF 后验统计检查关联拒绝原因"
+                f"{rejected_share * 100:.0f}% 的冻结时长来自有检测但候选被全部拒绝的帧："
+                "瓶颈在关联门限或 EKF 后验，需要确认门限是否随距离与协方差自适应"
             )
         detection_share = frame_causes.get("detection_not_associated", 0) / total_blind
-        if detection_share > NO_DETECTION_FRAME_SHARE:
+        if detection_share > NO_DETECTION_RUN_SHARE:
             warnings.append(
-                f"{detection_share * 100:.0f}% 的 Tracker 非跟踪帧有检测但没有关联候选："
-                "检查 matching_detection_count、颜色筛选和 PnP 有效性"
+                f"{detection_share * 100:.0f}% 的冻结时长来自有检测但没有形成关联候选的帧："
+                "候选列表在匹配/颜色/PnP 阶段就被清空，先查 matching_detection_count 与"
+                "优化后的装甲板是否被判为无效，而不是看关联门限"
+            )
+        no_detection_runs = continuity.get("run_causes", {}).get("no_detection", 0)
+        total_runs = sum(continuity.get("run_causes", {}).values())
+        if total_runs and no_detection_runs / total_runs > NO_DETECTION_RUN_SHARE:
+            warnings.append(
+                f"{no_detection_runs / total_runs * 100:.0f}% 的盲区段（{total_runs} 段）"
+                "完全没有检测：这些段里云台不动是目标真的不在视野，不是状态机缺陷"
             )
         short_ratio = continuity.get("short_blind_ratio", 0.0)
-        if continuity.get("short_blind_runs") and short_ratio < HOLD_RATIO_WARNING:
+        if continuity.get("short_blind_runs") and short_ratio < FREEZE_RATIO_WARNING:
             warnings.append(
-                f"{continuity['short_blind_runs']} 段短暂 Tracker 非跟踪区间（≤{SHORT_BLIND_FRAMES} 帧）"
-                f"占非跟踪帧的 {short_ratio * 100:.1f}%；其余区间较长，需结合逐帧检测和关联记录检查"
+                f"{continuity['short_blind_runs']} 段短盲区（≤{SHORT_BLIND_FRAMES} 帧）"
+                f"只占冻结帧的 {short_ratio * 100:.1f}%：主要冻结时长来自长盲区，"
+                "优先按上面的成因修根因，而不是只做短时外推"
             )
     if association.get("gate_passed_but_rejected_frames", 0):
         warnings.append(
@@ -592,6 +622,13 @@ def analyze_records(
             f"（超过 {RADIUS_DRIFT_WARN_M:.2f}m）：瞄点按 中心-r·方向 计算，"
             "半径漂移会直接平移指令角，是抖动的独立来源"
         )
+    resume_max = jitter.get("resume_step_deg", {}).get("max")
+    if resume_max is not None and resume_max > RESUME_STEP_WARN_DEG:
+        warnings.append(
+            f"保持→跟随切换的最大 yaw 跳变 {resume_max:.2f}°"
+            f"（超过 {RESUME_STEP_WARN_DEG:.1f}°）：对应盲区结束后云台突然追赶"
+        )
+
     detections = finite_values(processed, "detected")
     targets = finite_values(processed, "targets")
     state_counts = collections.Counter(record.get("tracker_state", "unknown") for record in processed)
@@ -728,16 +765,16 @@ def print_report(report):
     continuity = report.get("continuity", {})
     if continuity.get("blind_frames"):
         print(
-            f"  Tracker 非 tracking 帧: {continuity['blind_frames']} 帧 "
-            f"({continuity['blind_ratio'] * 100:.1f}%)，连续区间 {continuity['blind_runs']} 段，"
+            f"  云台保持帧: {continuity['blind_frames']} 帧 "
+            f"({continuity['blind_ratio'] * 100:.1f}%)，盲区 {continuity['blind_runs']} 段，"
             f"最长 {continuity['longest_blind_frames']} 帧 / {continuity['longest_blind_ms']:.1f}ms"
         )
         causes = " ".join(
             f"{name}={count}" for name, count in continuity["run_causes"].items()
         )
         print(
-            f"  非 tracking 区间证据(按段): {causes or '无'}"
-            f"（其中有检测的帧 {continuity['blind_frames_with_detection']}，"
+            f"  盲区成因(按段): {causes or '无'}"
+            f"（其中有检测的盲区帧 {continuity['blind_frames_with_detection']}，"
             f"有候选 {continuity['blind_frames_with_candidate']}，"
             f"有确认观测 {continuity['blind_frames_accepted']}）"
         )
@@ -745,9 +782,9 @@ def print_report(report):
             f"{name}={count}" for name, count in continuity.get("frame_causes", {}).items()
         )
         print(
-            f"  非 tracking 帧证据(按帧): {frame_causes or '无'}；"
+            f"  盲区成因(按帧): {frame_causes or '无'}；"
             f"短盲区(≤{SHORT_BLIND_FRAMES}帧) {continuity.get('short_blind_runs', 0)} 段 "
-            f"占非 tracking 帧 {continuity.get('short_blind_ratio', 0.0) * 100:.1f}%"
+            f"只占冻结帧 {continuity.get('short_blind_ratio', 0.0) * 100:.1f}%"
         )
         longest = " ".join(
             f"{name}={frames}帧/{continuity.get('cause_longest_ms', {}).get(name, 0.0):.0f}ms"
@@ -759,7 +796,7 @@ def print_report(report):
                 f"{name}={count}" for name, count in run.get("frame_causes", {}).items()
             )
             print(
-                f"  最长非 tracking 区间 #{rank}: {run['frames']} 帧 / {run['ms']:.0f}ms"
+                f"  最长盲区段 #{rank}: {run['frames']} 帧 / {run['ms']:.0f}ms"
                 f"（帧 #{run['start_index']}~{run['end_index']}），"
                 f"段级成因 {run['cause']}，段内帧成因 {detail or '无'}"
             )

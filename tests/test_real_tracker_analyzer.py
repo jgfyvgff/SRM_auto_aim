@@ -119,8 +119,7 @@ class RealTrackerAnalyzerTest(unittest.TestCase):
         ]
         report = analyze_records(records)
         self.assertAlmostEqual(report["timestamp"]["bracket_short_ratio"], 0.5)
-        self.assertTrue(any("字节时间格点" in warning for warning in report["warnings"]))
-        self.assertTrue(any("feedback_wait_ms" in warning for warning in report["warnings"]))
+        self.assertTrue(any("读路径节流" in warning for warning in report["warnings"]))
 
     def test_accepts_fast_feedback_after_read_fix(self):
         # 读路径修好后样本间隔会落到单帧量级（这里取 1 个字节时间）：
@@ -156,8 +155,8 @@ class RealTrackerAnalyzerTest(unittest.TestCase):
         self.assertFalse(any("字节时间格点" in warning for warning in report["warnings"]))
 
 
-    def test_reports_tracker_gap_and_actual_hold_ratio(self):
-        # 该样例明确记录了保持命令；Tracker 的非 tracking 占比本身不等同于保持占比。
+    def test_reports_blind_gap_and_freeze_ratio(self):
+        # 非 tracking 帧只发保持角：这些帧的占比就是云台停止跟随的占比。
         # 两个 temp_lost 帧都没有检测，说明盲区来自检测器而不是关联。
         records = []
         for index in range(3):
@@ -205,8 +204,8 @@ class RealTrackerAnalyzerTest(unittest.TestCase):
         self.assertAlmostEqual(continuity["longest_blind_ms"], 20.0)
         self.assertEqual(continuity["blind_frames_with_detection"], 0)
         self.assertEqual(continuity["run_causes"], {"no_detection": 1})
-        self.assertTrue(any("实际保持命令占比" in warning for warning in report["warnings"]))
-        self.assertTrue(any("没有检测输出" in warning for warning in report["warnings"]))
+        self.assertTrue(any("云台保持帧占比" in warning for warning in report["warnings"]))
+        self.assertTrue(any("没有任何敌方装甲板检测" in warning for warning in report["warnings"]))
 
     def test_classifies_blind_gap_causes(self):
         records = [
@@ -225,7 +224,7 @@ class RealTrackerAnalyzerTest(unittest.TestCase):
             {"detection_not_associated": 1, "candidate_rejected": 1},
         )
         self.assertEqual(report["continuity"]["blind_frames_with_detection"], 2)
-        self.assertTrue(any("候选但未接受" in warning for warning in report["warnings"]))
+        self.assertTrue(any("候选被全部拒绝" in warning for warning in report["warnings"]))
         self.assertFalse(any("没有任何敌方装甲板检测" in warning for warning in report["warnings"]))
 
 
@@ -251,12 +250,11 @@ class RealTrackerAnalyzerTest(unittest.TestCase):
         self.assertEqual(association["accepted_frames"], 0)
         self.assertEqual(association["rejected_frames"], 2)
         self.assertEqual(association["gate_passed_but_rejected_frames"], 1)
-        self.assertEqual(association["diagnostic_angle_gate_failed_frames"], 0)
         self.assertEqual(association["failing_gates"], {"position": 1})
         self.assertAlmostEqual(association["rejected_position_error"]["max"], 0.9)
         self.assertTrue(any("EKF 后验检查否决" in warning for warning in report["warnings"]))
 
-    def test_reports_command_mode_and_resume_step_without_false_alarm(self):
+    def test_reports_command_mode_and_resume_step(self):
         records = [
             {"event": "frame", "tracker_state": "tracking", "tx_command_mode": "tracking",
              "tx_command_yaw_deg": 10.0},
@@ -272,22 +270,7 @@ class RealTrackerAnalyzerTest(unittest.TestCase):
         self.assertAlmostEqual(jitter["hold_ratio"], 1.0 / 3.0)
         self.assertEqual(jitter["resume_step_deg"]["count"], 1)
         self.assertAlmostEqual(jitter["resume_step_deg"]["max"], 2.0)
-        # 恢复步进仍作为数据报告；不能仅凭超过固定角度阈值就推断为突发追赶。
-        self.assertFalse(any("保持→跟随切换" in warning for warning in report["warnings"]))
-
-    def test_command_steps_ignore_unsent_candidate_angles(self):
-        records = [
-            {"event": "frame", "tx_command_sent": True, "tx_command_mode": "tracking",
-             "tx_command_yaw_deg": 10.0},
-            {"event": "frame", "tx_command_sent": False, "tx_command_mode": "extrapolate",
-             "tx_command_yaw_deg": 120.0},
-            {"event": "frame", "tx_command_sent": True, "tx_command_mode": "tracking",
-             "tx_command_yaw_deg": 11.0},
-        ]
-        jitter = analyze_records(records)["jitter"]
-        self.assertEqual(jitter["command_frames"], 2)
-        self.assertEqual(jitter["command_yaw_step_deg"]["count"], 1)
-        self.assertAlmostEqual(jitter["command_yaw_step_deg"]["max"], 1.0)
+        self.assertTrue(any("保持→跟随切换" in warning for warning in report["warnings"]))
 
     def test_reports_within_generation_radius_drift(self):
         # 跨世代重建会掩盖漂移，只有同一世代内的波动才是抖动来源。
@@ -313,7 +296,7 @@ class RealTrackerAnalyzerTest(unittest.TestCase):
         self.assertEqual(report["continuity"], {})
         self.assertEqual(report["jitter"]["tx_command_mode_counts"], {})
         self.assertEqual(report["association"]["candidate_frames"], 0)
-        self.assertFalse(any("实际保持命令占比" in warning for warning in report["warnings"]))
+        self.assertFalse(any("云台保持帧占比" in warning for warning in report["warnings"]))
 
 
     def test_reports_missing_diagnostic_fields(self):
@@ -324,7 +307,7 @@ class RealTrackerAnalyzerTest(unittest.TestCase):
         ]
         report = analyze_records(records)
         coverage = report["coverage"]
-        self.assertEqual(coverage["Tracker状态"], 3)
+        self.assertEqual(coverage["盲区与保持帧"], 3)
         self.assertEqual(coverage["指令模式"], 0)
         self.assertEqual(coverage["关联拒绝归因"], 0)
         self.assertIn("指令模式", report["missing_fields"])
@@ -345,7 +328,7 @@ class RealTrackerAnalyzerTest(unittest.TestCase):
 
 
     def test_weights_blind_causes_by_frames(self):
-        # 按段统计会被大量单帧漏检稀释：少数长非 tracking 区间可能占据大部分时间。
+        # 按段统计会被大量单帧漏检稀释：真正吃掉冻结时长的可能是少数长盲区。
         records = [{"event": "frame", "tracker_state": "tracking", "detected": 1}]
         records += [
             {"event": "frame", "tracker_state": "temp_lost", "detected": 0} for _ in range(20)
@@ -370,7 +353,7 @@ class RealTrackerAnalyzerTest(unittest.TestCase):
         self.assertEqual(continuity["short_blind_frames"], 1)
         self.assertAlmostEqual(continuity["short_blind_ratio"], 1.0 / 21.0)
         self.assertTrue(
-            any("没有检测输出" in w for w in report["warnings"])
+            any("冻结时长来自没有任何敌方装甲板检测" in w for w in report["warnings"])
         )
 
     def test_frame_causes_follow_individual_frames(self):
@@ -408,9 +391,10 @@ class RealTrackerAnalyzerTest(unittest.TestCase):
         )
         self.assertEqual(continuity["longest_runs"][0]["start_index"], 1)
         self.assertEqual(continuity["longest_runs"][0]["end_index"], 5)
-        # 按帧报告无检测证据，但不据此断言摄像头目标出视野或控制冻结。
+        # 帧级 no_detection 占 80%，必须告警；段级的 detection_not_associated 只有
+        # 20%，不该误报。
         self.assertTrue(
-            any("没有检测输出" in w for w in report["warnings"])
+            any("冻结时长来自没有任何敌方装甲板检测" in w for w in report["warnings"])
         )
         self.assertFalse(
             any("没有形成关联候选" in w for w in report["warnings"])
@@ -430,8 +414,23 @@ class RealTrackerAnalyzerTest(unittest.TestCase):
         self.assertEqual(report["continuity"]["short_blind_runs"], 3)
         self.assertEqual(report["continuity"]["short_blind_frames"], 3)
         self.assertTrue(
-            any("短暂 Tracker 非跟踪区间" in warning for warning in report["warnings"])
+            any("短盲区" in warning and "冻结帧" in warning for warning in report["warnings"])
         )
+
+    def test_command_steps_ignore_unsent_candidate_angles(self):
+        # 未进入邮箱的候选角度不是实际指令，不能算进逐帧步进。
+        records = [
+            {"event": "frame", "tx_command_sent": True, "tx_command_mode": "tracking",
+             "tx_command_yaw_deg": 10.0},
+            {"event": "frame", "tx_command_sent": False, "tx_command_mode": "extrapolate",
+             "tx_command_yaw_deg": 120.0},
+            {"event": "frame", "tx_command_sent": True, "tx_command_mode": "tracking",
+             "tx_command_yaw_deg": 11.0},
+        ]
+        jitter = analyze_records(records)["jitter"]
+        self.assertEqual(jitter["command_frames"], 2)
+        self.assertEqual(jitter["command_yaw_step_deg"]["count"], 1)
+        self.assertAlmostEqual(jitter["command_yaw_step_deg"]["max"], 1.0)
 
     def test_reports_extrapolate_frames_from_temp_lost_follow(self):
         records = [
@@ -444,10 +443,12 @@ class RealTrackerAnalyzerTest(unittest.TestCase):
         ]
         report = analyze_records(records)
         self.assertEqual(report["jitter"]["extrapolate_frames"], 1)
-        # 未实际下发的外推候选不能计入外推命令数。
+        # 未实际下发的外推候选不能计入外推命令数；mode 只有 extrapolate/tracking，
+        # 没有 hold_*，所以冻结帧数应为 0。
         self.assertEqual(report["jitter"]["hold_frames"], 0)
 
     def test_angle_gate_is_reported_as_diagnostic_not_rejection_gate(self):
+        # tracker.cpp 的 gate_passed 不含 angle，因此它只能作诊断，不能算作拒绝原因。
         records = [
             {"event": "frame", "tracker_state": "temp_lost", "detected": 1,
              "association_candidate_count": 1, "association_accepted_count": 0,
