@@ -70,6 +70,9 @@ private:
   double yaw_offset_;
   double pitch_offset_;
   double fire_thresh_;
+  // TinyMPC 迭代上限。真机日志显示 yaw 的迭代次数中位正好等于 10（撞上限），
+  // 是未收敛帧的主要来源，因此做成可配参数以便不重编就能比较收敛率。
+  int max_iter_;
 
   TinySolver * yaw_solver_;
   TinySolver * pitch_solver_;

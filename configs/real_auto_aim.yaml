@@ -62,6 +62,10 @@ decision_speed: 7
 # 真机 Planner 先只读对比；弹速反馈为 0 时使用诊断参考值，不能用于开火或控制。
 planner_debug_bullet_speed_mps: 23.0
 fire_thresh: 0.003
+# TinyMPC 迭代上限。真机 10526 帧日志实测：yaw 的迭代次数中位正好等于 10（p95 也是 10，
+# 即撞在上限上），是 17% 未收敛帧的主要来源；单次求解仅约 0.3ms，放宽上限的代价可忽略。
+# 改这个值不需要重编，配 PlotJuggler 看 planner_{yaw,pitch}_solver_status 的 1 占比即可。
+planner_max_iter: 10
 max_yaw_acc: 50
 Q_yaw: [9e6, 0]
 R_yaw: [1]

@@ -18,6 +18,10 @@ Planner::Planner(const std::string & config_path)
   yaw_offset_ = tools::read<double>(yaml, "yaw_offset") / 57.3;
   pitch_offset_ = tools::read<double>(yaml, "pitch_offset") / 57.3;
   fire_thresh_ = tools::read<double>(yaml, "fire_thresh");
+  // 老配置没有这个键时保持原来的 10 次，避免其他入口因缺键起不来；上限小于 1 时
+  // TinyMPC 会直接返回"达上限"，等于永不解算，所以这里兜到 1。
+  max_iter_ = yaml["planner_max_iter"].IsDefined() ? yaml["planner_max_iter"].as<int>() : 10;
+  if (max_iter_ < 1) max_iter_ = 1;
 
   setup_yaw_solver(config_path);
   setup_pitch_solver(config_path);
@@ -208,7 +212,8 @@ void Planner::setup_yaw_solver(const std::string & config_path)
   Eigen::MatrixXd u_max = Eigen::MatrixXd::Constant(1, HORIZON - 1, max_yaw_acc);
   tiny_set_bound_constraints(yaw_solver_, x_min, x_max, u_min, u_max);
 
-  yaw_solver_->settings->max_iter = 10;
+  // 上限可配：写死 10 时 yaw 长期顶在上限，是否收敛取决于运气。
+  yaw_solver_->settings->max_iter = max_iter_;
 }
 
 void Planner::setup_pitch_solver(const std::string & config_path)
@@ -231,7 +236,8 @@ void Planner::setup_pitch_solver(const std::string & config_path)
   Eigen::MatrixXd u_max = Eigen::MatrixXd::Constant(1, HORIZON - 1, max_pitch_acc);
   tiny_set_bound_constraints(pitch_solver_, x_min, x_max, u_min, u_max);
 
-  pitch_solver_->settings->max_iter = 10;
+  // 上限可配：写死 10 时 yaw 长期顶在上限，是否收敛取决于运气。
+  pitch_solver_->settings->max_iter = max_iter_;
 }
 
 Eigen::Matrix<double, 2, 1> Planner::aim(const Target & target, double bullet_speed)
