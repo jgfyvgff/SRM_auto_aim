@@ -6,6 +6,12 @@ build/
 Camera/
 logs/
 assets/img_with_q/
+# 标定采集的原图：单次数 MB 且只在标定当时有用，标定结果已落在
+# configs/intrinsics_real*.yaml 与 configs/handeye_real*.yaml 里，原图不必入库。
+assets/real_handeye/
+assets/real_intrinsics/
+assets/real_ha/
+assets/handeye_can/
 records/
 records_auto_buff_big/
 records_new/
