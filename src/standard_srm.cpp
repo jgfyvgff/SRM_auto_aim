@@ -23,6 +23,7 @@
 #include "io/camera.hpp"
 #include "io/srm_auto_aim_transport.hpp"
 #include "src/real_auto_aim/config.hpp"
+#include "src/real_auto_aim/frame_path.hpp"
 #include "src/real_auto_aim/debug_recorder.hpp"
 #include "src/real_auto_aim/serial_feedback_reader.hpp"
 #include "src/real_auto_aim/tx_command_limiter.hpp"
@@ -58,7 +59,7 @@ const std::string kKeys =
     "{tx-follow-temp-lost|false|temp_lost 期间继续发送受限外推跟随指令，默认关闭}"
     "{tx-temp-lost-frames|5|允许外推的最大连续丢失帧数，超出后回到保持角}"
     "{tx-temp-lost-rate-scale|0.35|外推角速度比例，范围 (0,1]}"
-    "{save-frame|/tmp/real_srm_frame.jpg|按 s 保存当前显示帧}"
+    "{save-frame|imgs/real_srm_frame.jpg|按 s 保存当前显示帧（相对运行目录，默认 imgs/；不带扩展名时按 .jpg 保存）}"
     "{debug-jsonl||保存逐帧真机诊断 JSONL}"
     "{exposure-ms|0|临时覆盖 YAML 曝光时间，单位 ms，0 表示沿用 YAML}"
     "{gain|-1|临时覆盖 YAML 增益，负数表示沿用 YAML}"
@@ -555,12 +556,10 @@ int main(int argc, char * argv[])
                     if (!parent_path.empty()) {
                         std::filesystem::create_directories(parent_path);
                     }
-                    std::ostringstream numbered_name;
-                    numbered_name << base_path.stem().string() << "_"
-                                  << std::setfill('0') << std::setw(6)
-                                  << ++saved_frame_count
-                                  << base_path.extension().string();
-                    const auto output_path = parent_path / numbered_name.str();
+                    // 扩展名决定 imwrite 的编码格式：路径不带扩展名时会每按一次 s 报一次
+                    // "could not find a writer for the specified extension"，由 helper 补 .jpg。
+                    const auto output_path =
+                        real_auto_aim::numbered_frame_path(base_path, ++saved_frame_count);
                     if (cv::imwrite(output_path.string(), image)) {
                         tools::logger()->info(
                             "Saved display frame to {}", output_path.string());
