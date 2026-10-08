@@ -87,6 +87,7 @@ std::list<Armor> YOLOV5::detect(const cv::Mat & raw_img, int frame_count)
       raw_img.cols, raw_img.rows);
     // offset_ 必须跟着裁剪原点走：parse 得到的坐标是裁剪图坐标，靠它加回原图坐标。
     offset_ = cv::Point2f(static_cast<float>(rect.x), static_cast<float>(rect.y));
+    applied_roi_ = rect;
     bgr_img = raw_img(rect);
   } else if (use_roi_) {
     if (roi_.width == -1) {  // -1 表示该维度不裁切
@@ -95,6 +96,7 @@ std::list<Armor> YOLOV5::detect(const cv::Mat & raw_img, int frame_count)
     if (roi_.height == -1) {  // -1 表示该维度不裁切
       roi_.height = raw_img.rows;
     }
+    applied_roi_ = roi_;
     bgr_img = raw_img(roi_);
   } else {
     bgr_img = raw_img;
@@ -218,7 +220,10 @@ std::list<Armor> YOLOV5::parse(
 
   std::list<Armor> armors;
   for (const auto & i : indices) {
-    if (use_roi_) {
+    // 只要这一帧做过裁剪（静态 ROI 或动态 ROI），就必须把裁剪原点加回去：
+    // 否则 center/points 会停在裁剪图坐标，跟踪器拿到的是错误位置，
+    // 动态 ROI 也会因此按错误位置推算下一帧窗口。
+    if (use_roi_ || dynamic_roi_) {
       armors.emplace_back(
         color_ids[i], num_ids[i], confidences[i], boxes[i], armors_key_points[i], offset_);
     } else {
@@ -293,9 +298,10 @@ void YOLOV5::draw_detections(
     tools::draw_text(detection, info, armor.center, {0, 255, 0});
   }
 
-  if (use_roi_) {
+  if (use_roi_ || dynamic_roi_) {
+    // 画本帧实际裁剪区域；动态 ROI 下它每帧都在变，便于确认窗口有没有跟住目标。
     cv::Scalar green(0, 255, 0);
-    cv::rectangle(detection, roi_, green, 2);
+    cv::rectangle(detection, applied_roi_, green, 2);
   }
   cv::resize(detection, detection, {}, 0.5, 0.5);  // 显示时缩小图片尺寸
   cv::imshow("detection", detection);

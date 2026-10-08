@@ -48,6 +48,7 @@ private:
   cv::Rect roi_;
   cv::Point2f offset_;
   cv::Mat tmp_img_;
+  cv::Rect applied_roi_;  // 本帧实际裁剪区域（原图坐标），仅供调试绘制
 
   Detector detector_;
   friend class MultiThreadDetector;
