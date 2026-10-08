@@ -731,7 +731,7 @@ int main(int argc, char * argv[])
                 // 两者放在一起才能区分"先验窗口抖动"和"类别判错"：排查远距离误分类时，
                 // 旧日志只有 radius，无法判断是检测错了还是被跟踪器的名字过滤拒绝。
                 if (best_armor != nullptr) {
-                    sample["best_detection_name"] = ARMOR_NAMES[best_armor->name];
+                    sample["best_detection_name"] = auto_aim::ARMOR_NAMES[best_armor->name];
                     sample["best_detection_width_px"] = best_armor->box.width;
                 }
             } else {
