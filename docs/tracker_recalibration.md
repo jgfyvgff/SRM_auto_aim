@@ -4,9 +4,21 @@
 分析对象：`tasks/auto_aim/`（Tracker / Target / Aimer）、`src/standard_srm.cpp`（真机链路）、
 `configs/real_auto_aim.yaml`、`tools/real_tracker_analyzer.py`
 
-> **本文只做分析，没有修改任何源码或配置。**
-> 仓库当前的 `git diff` 与本轮分析开始时逐项一致（7 个文件、227 插入 / 438 删除，
-> 全部是你原有的未提交改动）。文中第 5、6 节是**建议方案与标定流程**，尚未实施。
+> **本文的分析部分（第 1~4 节）是纯分析。第 5 节的代码级改动仍未实施。**
+> 与本文分析相关、**已经落地**的只有配置项，见下方"已实施的配置变更"。
+> 第 6 节描述的标定流程需要自行写临时脚本，分析器里没有对应的现成输出。
+
+## 已实施的配置变更（2026-10-08）
+
+只改了 `configs/real_auto_aim.yaml`，代码与 Tracker 算法**未改**：
+
+| 配置项 | 原值 | 新值 | 依据 |
+| --- | --- | --- | --- |
+| `min_confidence` | 0.8 | **0.7** | 交替 A/B（同距离、各 150 帧）：0.8 丢 39 帧且目标都在视野内、`temp_lost_count` 多为 1~3；0.7 的 300 帧零丢帧，tracking 102/150 → 146/150。0.7 也是检测器内部硬编码的 `score_threshold_`，是不改代码的下限 |
+| `exposure_ms` / `gain` | 2.7 / 17 | **2.2 / 16.9** | 实车对比后选定 |
+| `standard_geometry_constraint` | false | **true** | 标准四装甲车 r 已知（0.18 m），单块装甲观测下不可观测 |
+
+另外确认：当前生效的手眼外参出自 `configs/handeye_real4.yaml`（精确吻合）。
 
 ---
 
