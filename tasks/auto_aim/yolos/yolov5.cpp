@@ -102,32 +102,32 @@ std::list<Armor> YOLOV5::detect(const cv::Mat & raw_img, int frame_count)
     bgr_img = raw_img;
   }
 
-  auto x_scale = static_cast<double>(640) / bgr_img.rows;
-  auto y_scale = static_cast<double>(640) / bgr_img.cols;
-  auto scale = std::min(x_scale, y_scale);
-  auto h = static_cast<int>(bgr_img.rows * scale);
-  auto w = static_cast<int>(bgr_img.cols * scale);
-
-  // preproces
-  auto input = cv::Mat(640, 640, CV_8UC3, cv::Scalar(0, 0, 0));
-  auto roi = cv::Rect(0, 0, w, h);
-  cv::resize(bgr_img, input(roi), {w, h});
-  ov::Tensor input_tensor(ov::element::u8, {1, 640, 640, 3}, input.data);//创建输入张量，指定数据类型、形状和指针
-
-  // infer
-  auto infer_request = compiled_model_.create_infer_request();
-  infer_request.set_input_tensor(input_tensor);
-  infer_request.infer();
-
-  // postprocess
-  auto output_tensor = infer_request.get_output_tensor();
-  auto output_shape = output_tensor.get_shape();
-  cv::Mat output(output_shape[1], output_shape[2], CV_32F, output_tensor.data());//创建输出矩阵，指定行数、列数、数据类型和数据指针
-
-  // 解析输出矩阵，返回识别到的装甲板信息
-  auto armors = parse(scale, output, raw_img, frame_count);
+  auto armors = infer_and_parse(bgr_img, raw_img, frame_count);
 
   if (dynamic_roi_) {
+    if (!armors.empty() && !last_target_box_.has_value()) {
+      // 首次捕获没有先验，整帧缩放到 640 会让远距离装甲板的数字只剩几个像素、类别读错；
+      // 而追踪器正是在这一帧锁定类别，锁错之后会被名字过滤一直拦到超时（真机实测
+      // 开 ROI 时 30 帧里 27 帧有检测却 0 候选）。这里按整帧检出结果就地再裁一次重新
+      // 分类，只多花一次推理，且只发生在锁定目标之前。
+      const auto best = std::max_element(
+        armors.begin(), armors.end(),
+        [](const Armor & a, const Armor & b) { return a.confidence < b.confidence; });
+      const float width = static_cast<float>(best->box.width);
+      const cv::Rect2f prior{
+        best->center.x - width / 2.0F, best->center.y - width * 0.375F, width, width * 0.75F};
+      const auto rect = dynamic_roi_rect(
+        prior, dynamic_roi_scale_, dynamic_roi_min_width_, raw_img.cols, raw_img.rows);
+      if (rect.width < raw_img.cols || rect.height < raw_img.rows) {
+        offset_ = cv::Point2f(static_cast<float>(rect.x), static_cast<float>(rect.y));
+        auto refined = infer_and_parse(raw_img(rect), raw_img, frame_count);
+        // 细化失败（裁剪窗口内没检出）就保留整帧结果，宁可先用错类别也不要丢这一帧。
+        if (!refined.empty()) {
+          armors = std::move(refined);
+          applied_roi_ = rect;
+        }
+      }
+    }
     if (!armors.empty()) {
       // Armor 的 offset 构造已把 center 回填到原图坐标，可直接作为下一帧先验；
       // box 仍是裁剪图坐标，但宽度与原图一致，所以只取宽度。
@@ -144,6 +144,35 @@ std::list<Armor> YOLOV5::detect(const cv::Mat & raw_img, int frame_count)
     }
   }
   return armors;
+}
+
+std::list<Armor> YOLOV5::infer_and_parse(
+  const cv::Mat & crop_img, const cv::Mat & raw_img, int frame_count)
+{
+  auto x_scale = static_cast<double>(640) / crop_img.rows;
+  auto y_scale = static_cast<double>(640) / crop_img.cols;
+  auto scale = std::min(x_scale, y_scale);
+  auto h = static_cast<int>(crop_img.rows * scale);
+  auto w = static_cast<int>(crop_img.cols * scale);
+
+  // preproces
+  auto input = cv::Mat(640, 640, CV_8UC3, cv::Scalar(0, 0, 0));
+  auto roi = cv::Rect(0, 0, w, h);
+  cv::resize(crop_img, input(roi), {w, h});
+  ov::Tensor input_tensor(ov::element::u8, {1, 640, 640, 3}, input.data);//创建输入张量，指定数据类型、形状和指针
+
+  // infer
+  auto infer_request = compiled_model_.create_infer_request();
+  infer_request.set_input_tensor(input_tensor);
+  infer_request.infer();
+
+  // postprocess
+  auto output_tensor = infer_request.get_output_tensor();
+  auto output_shape = output_tensor.get_shape();
+  cv::Mat output(output_shape[1], output_shape[2], CV_32F, output_tensor.data());//创建输出矩阵，指定行数、列数、数据类型和数据指针
+
+  // 解析输出矩阵，返回识别到的装甲板信息
+  return parse(scale, output, raw_img, frame_count);
 }
 
 

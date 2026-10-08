@@ -27,6 +27,7 @@
 #include "src/real_auto_aim/serial_feedback_reader.hpp"
 #include "src/real_auto_aim/tx_command_limiter.hpp"
 #include "tasks/auto_aim/aimer.hpp"
+#include "tasks/auto_aim/armor.hpp"
 #include "tasks/auto_aim/planner/planner.hpp"
 #include "tasks/auto_aim/solver.hpp"
 #include "tasks/auto_aim/tracker.hpp"
@@ -715,13 +716,24 @@ int main(int argc, char * argv[])
             if (!armors.empty()) {
                 double confidence_sum = 0.0;
                 double confidence_max = 0.0;
+                const auto_aim::Armor * best_armor = nullptr;
                 for (const auto & armor : armors) {
                     confidence_sum += armor.confidence;
-                    confidence_max = std::max(confidence_max, armor.confidence);
+                    if (confidence_max < armor.confidence) {
+                        confidence_max = armor.confidence;
+                        best_armor = &armor;
+                    }
                 }
                 sample["mean_confidence"] =
                     confidence_sum / static_cast<double>(armors.size());
                 sample["max_confidence"] = confidence_max;
+                // 记录最高置信度检测的类别名与框宽。动态 ROI 的窗口大小由上一帧框宽决定，
+                // 两者放在一起才能区分"先验窗口抖动"和"类别判错"：排查远距离误分类时，
+                // 旧日志只有 radius，无法判断是检测错了还是被跟踪器的名字过滤拒绝。
+                if (best_armor != nullptr) {
+                    sample["best_detection_name"] = ARMOR_NAMES[best_armor->name];
+                    sample["best_detection_width_px"] = best_armor->box.width;
+                }
             } else {
                 sample["mean_confidence"] = 0.0;
                 sample["max_confidence"] = 0.0;

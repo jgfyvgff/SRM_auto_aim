@@ -60,6 +60,11 @@ private:
 
   std::list<Armor> parse(double scale, cv::Mat & output, const cv::Mat & bgr_img, int frame_count);
 
+  // 对给定图像做一次 预处理→推理→解析。crop_img 可能已裁剪，raw_img 恒为原图，用于
+  // center_norm 归一化；坐标回填靠 offset_，由调用方在裁剪时设置。
+  std::list<Armor> infer_and_parse(
+    const cv::Mat & crop_img, const cv::Mat & raw_img, int frame_count);
+
   void save(const Armor & armor) const;
   void draw_detections(const cv::Mat & img, const std::list<Armor> & armors, int frame_count) const;
   double sigmoid(double x);
