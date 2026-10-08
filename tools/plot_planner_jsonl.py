@@ -88,6 +88,29 @@ def wrap_deg(delta):
     return (delta + 180.0) % 360.0 - 180.0
 
 
+def unwrap_deg_series(values):
+    """把跨 ±180 的角度序列解卷绕，避免图上出现假的 350° 大误差。
+
+    实测数据里 planner_target_yaw_deg 稳定在 +174，而 planner_measured_yaw_deg 会从
+    +178 越过 ±180 变成 -176：两者只差 12°，直接画出来却是两条相距 350° 的平线，
+    看图的人会以为是跟踪完全失效。逐点按最短弧接起来才是"云台实际转到了哪"。
+    """
+    out = np.asarray(values, dtype=float).copy()
+    reference = math.nan
+    for index, value in enumerate(out):
+        if not math.isfinite(value):
+            continue
+        if math.isfinite(reference):
+            out[index] = reference + wrap_deg(float(value) - reference)
+        reference = out[index]
+    return out
+
+
+def angle_series_from_records(records, key):
+    """角度列：先取原始值，再解卷绕（仅用于绘图，不改变统计口径）。"""
+    return unwrap_deg_series(series_from_records(records, key))
+
+
 def required_yaw_step_deg(records):
     """云台当前 yaw 到瞄准参考 yaw 的夹角（deg）。
 
@@ -189,6 +212,9 @@ def plot_panels(records, panels, output, title, show, dpi):
     def values_for(key):
         if key == "required_yaw_step_deg":
             return steps
+        # 角度列解卷绕后再画：否则跨 ±180 时会被读成几百度的误差。
+        if key.endswith("_yaw_deg") or key.endswith("_pitch_deg"):
+            return angle_series_from_records(records, key)
         return series_from_records(records, key)
 
     figure, axes = plt.subplots(
@@ -198,11 +224,16 @@ def plot_panels(records, panels, output, title, show, dpi):
 
     for axis, panel in zip(axes, panels):
         plotted = 0
+        collected = []
         for key in panel["curves"]:
             values = values_for(key)
             if np.all(np.isnan(values)):
                 continue
-            axis.plot(times, values, label=key, drawstyle="steps-post" if panel.get("step") else "default")
+            axis.plot(
+                times, values, label=key,
+                drawstyle="steps-post" if panel.get("step") else "default",
+            )
+            collected.append(values[np.isfinite(values)])
             plotted += 1
         axis.set_title(panel["title"], fontsize=10)
         axis.grid(alpha=0.3)
@@ -212,25 +243,43 @@ def plot_panels(records, panels, output, title, show, dpi):
             axis.text(0.5, 0.5, "no data", ha="center", va="center", transform=axis.transAxes)
 
         twin_keys = panel.get("twin", ())
+        twin = None
         if twin_keys:
             twin = axis.twinx()
+            twin_values = []
             for key in twin_keys:
                 values = values_for(key)
                 if np.all(np.isnan(values)):
                     continue
                 twin.plot(times, values, label=key, color="tab:red", alpha=0.7, linewidth=1.0)
+                twin_values.append(values[np.isfinite(values)])
                 if panel.get("twin_log"):
                     twin.set_yscale("log")
             twin.set_ylabel(" / ".join(twin_keys), fontsize=8)
             twin.tick_params(labelsize=8)
+            # radius 的 0.18 / 0.2765 参考线必须画在 radius 自己的轴上：
+            # 画在左侧角度轴上会变成"0.18 度"这种没有意义的刻度。
+            if not panel.get("twin_log") and "radius" in twin_keys and twin_values:
+                twin.axhline(0.18, color="gray", linestyle="--", linewidth=0.8)
+                twin.axhline(0.2765, color="gray", linestyle=":", linewidth=0.8)
 
-        if panel.get("twin_log"):
+        if panel.get("step"):
+            # 未收敛是 0/1 阶梯，用填充把"哪一段没解出来"直接画成色块，比线更容易看。
+            for key in panel["curves"]:
+                values = values_for(key)
+                if np.all(np.isnan(values)):
+                    continue
+                axis.fill_between(times, 0, np.nan_to_num(values), step="post", alpha=0.25)
+            axis.set_ylim(-0.1, 1.1)
             axis.set_ylabel("status", fontsize=8)
-        elif "radius" in panel.get("twin", ()):
-            # 0.18 = 标准四装甲，0.2765 = 前哨；画出参考线便于一眼看出锁错。
-            axis.axhline(0.18, color="gray", linestyle="--", linewidth=0.8)
-            axis.axhline(0.2765, color="gray", linestyle=":", linewidth=0.8)
-            axis.set_ylabel("deg", fontsize=8)
+        elif collected:
+            # 按 1%~99% 分位数设 y 轴：末尾几帧的突发会把整体压平，导致真正的细节看不见。
+            stacked = np.concatenate(collected)
+            low, high = np.percentile(stacked, [1, 99])
+            if math.isfinite(low) and math.isfinite(high) and high > low:
+                margin = 0.1 * (high - low)
+                axis.set_ylim(low - margin, high + margin)
+            axis.set_ylabel("deg" if "deg" in panel["title"] else "rad/s", fontsize=8)
 
     axes[-1].set_xlabel("time [s]")
     figure.suptitle(title, fontsize=11)

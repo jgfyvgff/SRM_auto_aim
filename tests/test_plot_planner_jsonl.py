@@ -9,10 +9,12 @@ sys.path.insert(0, str(REPOSITORY_ROOT))
 
 from tools.plot_planner_jsonl import (
     PANELS,
+    angle_series_from_records,
     plot_panels,
     required_yaw_step_deg,
     series_from_records,
     summarize_convergence,
+    unwrap_deg_series,
     wrap_deg,
 )
 
@@ -46,6 +48,38 @@ class WrapTest(unittest.TestCase):
 
     def test_nan_stays_nan(self):
         self.assertTrue(math.isnan(wrap_deg(math.nan)))
+
+
+class UnwrapTest(unittest.TestCase):
+    def test_crossing_180_is_continuous(self):
+        # 实测里 target 稳定在 +174，而 measured 会从 +178 越界成 -176：
+        # 直接画是两条相距 350° 的平线，解卷绕后应接成 178 → 184 → 186。
+        series = unwrap_deg_series([178.0, -176.0, -174.0])
+        self.assertAlmostEqual(series[0], 178.0)
+        self.assertAlmostEqual(series[1], 184.0)
+        self.assertAlmostEqual(series[2], 186.0)
+
+    def test_nan_gap_keeps_last_reference(self):
+        series = unwrap_deg_series([170.0, math.nan, -175.0])
+        self.assertAlmostEqual(series[0], 170.0)
+        self.assertTrue(math.isnan(series[1]))
+        # 断点之后仍以最后一个有效值为基准接续，否则会重新从 -175 开始。
+        self.assertAlmostEqual(series[2], 185.0)
+
+    def test_already_continuous_is_unchanged(self):
+        series = unwrap_deg_series([169.0, 170.0, 171.0])
+        self.assertAlmostEqual(series[0], 169.0)
+        self.assertAlmostEqual(series[2], 171.0)
+
+    def test_angle_series_helper_reads_records(self):
+        records = [{"planner_measured_yaw_deg": 178.0}, {"planner_measured_yaw_deg": -176.0}]
+        series = angle_series_from_records(records, "planner_measured_yaw_deg")
+        self.assertAlmostEqual(series[1], 184.0)
+        # 解卷绕只用于绘图，不改变"需要转过的角度"这种按最短弧计算的统计口径：
+        # 两个字段解卷绕后相差 6°，而原始最短弧也是 6°。
+        self.assertAlmostEqual(required_yaw_step_deg(
+            [{"planner_measured_yaw_deg": 178.0, "planner_target_yaw_deg": -176.0}]
+        )[0], 6.0)
 
 
 class RequiredStepTest(unittest.TestCase):
