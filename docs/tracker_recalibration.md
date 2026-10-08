@@ -19,7 +19,9 @@
 | `standard_geometry_constraint` | false | **true** | 标准四装甲车 r 已知（0.18 m），单块装甲观测下不可观测 |
 | `dynamic_roi` / `dynamic_roi_scale` / `dynamic_roi_min_width` | 无 | **true / 16.0 / 320** | 见第 9 节 |
 
-另外确认：当前生效的手眼外参出自 `configs/handeye_real4.yaml`（精确吻合）。
+另外确认：当前生效的内外参出自 `configs/intrinsics_real6.yaml` 与
+`configs/handeye_real6.yaml`（2026-10-09 重新标定；更早的 real1~real5 已删除）。
+注意本次手眼平移的 x 由 4.65cm 变为 16.12cm，标定残差指标虽更好，仍须实车复核系统偏差。
 注意 `standard_geometry_constraint` 只在标准四装甲分支里施加，在第 9 节的类别问题解决前
 它一直是空转的。
 

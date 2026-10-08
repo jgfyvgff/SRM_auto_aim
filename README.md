@@ -330,7 +330,7 @@ Planner 输出的是下一 10 ms 规划步的
 绝对角；当前串口协议没有速度、加速度字段，日志中的规划速度与加速度不会发送。
 `frame/ticks/tick_hz` 为 SDK 帧号、原始计数和相机报告的频率；`mapped_age` 与
 `mapping_delay` 均基于估计的主机映射时间，不能解释为已测得的曝光/串口硬件延迟。
-配置暂用 `handeye_real2.yaml` 外参、`intrinsics_real.yaml` 内参；敌方颜色由
+配置使用 `handeye_real6.yaml` 外参、`intrinsics_real6.yaml` 内参；敌方颜色由
 `enemy_color` 配置决定。
 模式和颜色反馈只记录原始整数，不猜测协议映射。图像尺寸不符会直接报错；姿态缺失
 或图像过期时不更新 Tracker。当前海康 `Camera::read()` 在无图像时仍可能阻塞，
