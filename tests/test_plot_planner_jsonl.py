@@ -9,13 +9,14 @@ sys.path.insert(0, str(REPOSITORY_ROOT))
 
 from tools.plot_planner_jsonl import (
     PANELS,
-    angle_series_from_records,
+    pitch_error_deg,
     plot_panels,
     required_yaw_step_deg,
     series_from_records,
     summarize_convergence,
-    unwrap_deg_series,
+    tracking_error_deg,
     wrap_deg,
+    yaw_error_deg,
 )
 
 
@@ -50,47 +51,34 @@ class WrapTest(unittest.TestCase):
         self.assertTrue(math.isnan(wrap_deg(math.nan)))
 
 
-class UnwrapTest(unittest.TestCase):
-    def test_crossing_180_is_continuous(self):
-        # 实测里 target 稳定在 +174，而 measured 会从 +178 越界成 -176：
-        # 直接画是两条相距 350° 的平线，解卷绕后应接成 178 → 184 → 186。
-        series = unwrap_deg_series([178.0, -176.0, -174.0])
-        self.assertAlmostEqual(series[0], 178.0)
-        self.assertAlmostEqual(series[1], 184.0)
-        self.assertAlmostEqual(series[2], 186.0)
+class TrackingErrorTest(unittest.TestCase):
+    def test_signed_error(self):
+        records = [
+            {"t": 10.0, "m": 5.0},
+            {"t": 5.0, "m": 10.0},
+        ]
+        error = tracking_error_deg(records, "t", "m")
+        self.assertAlmostEqual(error[0], 5.0)
+        self.assertAlmostEqual(error[1], -5.0)
 
-    def test_nan_gap_keeps_last_reference(self):
-        series = unwrap_deg_series([170.0, math.nan, -175.0])
-        self.assertAlmostEqual(series[0], 170.0)
-        self.assertTrue(math.isnan(series[1]))
-        # 断点之后仍以最后一个有效值为基准接续，否则会重新从 -175 开始。
-        self.assertAlmostEqual(series[2], 185.0)
-
-    def test_already_continuous_is_unchanged(self):
-        series = unwrap_deg_series([169.0, 170.0, 171.0])
-        self.assertAlmostEqual(series[0], 169.0)
-        self.assertAlmostEqual(series[2], 171.0)
-
-    def test_angle_series_helper_reads_records(self):
-        records = [{"planner_measured_yaw_deg": 178.0}, {"planner_measured_yaw_deg": -176.0}]
-        series = angle_series_from_records(records, "planner_measured_yaw_deg")
-        self.assertAlmostEqual(series[1], 184.0)
-        # 解卷绕只用于绘图，不改变"需要转过的角度"这种按最短弧计算的统计口径：
-        # 两个字段解卷绕后相差 6°，而原始最短弧也是 6°。
-        self.assertAlmostEqual(required_yaw_step_deg(
-            [{"planner_measured_yaw_deg": 178.0, "planner_target_yaw_deg": -176.0}]
-        )[0], 6.0)
-
-
-class RequiredStepTest(unittest.TestCase):
-    def test_uses_shortest_arc_not_raw_difference(self):
-        records = [{"planner_measured_yaw_deg": -179.0, "planner_target_yaw_deg": 179.0}]
-        # 原始差是 358，跨过 ±180 的最短弧是 2；用错会让"需要转过的角度"整桶偏大。
-        self.assertAlmostEqual(required_yaw_step_deg(records)[0], 2.0)
+    def test_crossing_180_uses_shortest_arc(self):
+        # 实测场景：target 稳定在 +174，measured 从 +178 越界成 -176，
+        # 真实误差只有 6°，绝不能算成 -354°。
+        records = [{"t": -176.0, "m": 178.0}]
+        self.assertAlmostEqual(tracking_error_deg(records, "t", "m")[0], 6.0)
 
     def test_missing_side_is_nan(self):
-        self.assertTrue(math.isnan(required_yaw_step_deg([{"planner_measured_yaw_deg": 1.0}])[0]))
-        self.assertTrue(math.isnan(required_yaw_step_deg([{"planner_target_yaw_deg": 1.0}])[0]))
+        self.assertTrue(math.isnan(tracking_error_deg([{"t": 1.0}], "t", "m")[0]))
+        self.assertTrue(math.isnan(tracking_error_deg([{"m": 1.0}], "t", "m")[0]))
+
+    def test_required_step_is_absolute_error(self):
+        records = [{"planner_target_yaw_deg": 5.0, "planner_measured_yaw_deg": 10.0}]
+        self.assertAlmostEqual(required_yaw_step_deg(records)[0], 5.0)
+        self.assertAlmostEqual(yaw_error_deg(records)[0], -5.0)
+
+    def test_pitch_helper_reads_pitch_fields(self):
+        records = [{"planner_target_pitch_deg": -3.0, "planner_measured_pitch_deg": 0.5}]
+        self.assertAlmostEqual(pitch_error_deg(records)[0], -3.5)
 
 
 class SummarizeTest(unittest.TestCase):
