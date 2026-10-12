@@ -6,14 +6,12 @@ build/
 Camera/
 logs/
 assets/img_with_q/
-# 标定采集的原图：单次数 MB、只在标定当时有用；标定结果已落在
-# configs/intrinsics_real*.yaml 与 configs/handeye_real*.yaml 里，原图不必入库。
-# 只按后缀忽略图片，不写 assets/：模型文件（yolov5.bin、yolo11*.onnx 等）也在
-# 这个目录下，整目录忽略会让以后新增的模型被静默跳过。
-assets/**/*.jpg
-assets/**/*.jpeg
-assets/**/*.png
-assets/**/*.bmp
+# 标定采集目录（real_handeye / real_intrinsics / real_ha ...）：原图与同名 .txt 标注
+# 都是单次采集产物，标定结果已落在 configs/intrinsics_real*.yaml 与
+# configs/handeye_real*.yaml 里，原图和标注都不必入库。
+# 刻意不写 assets/ 整目录规则：模型文件（yolov5.bin、yolo11*.onnx 等）也在 assets/ 下，
+# 整目录忽略会让以后新增的模型被静默跳过。
+assets/real_*/
 records/
 records_auto_buff_big/
 records_new/
