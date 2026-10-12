@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <stdexcept>
 #include <vector>
 
 #include "tools/math_tools.hpp"
@@ -106,7 +107,9 @@ Plan Planner::plan(std::optional<Target> target, double bullet_speed)
   return plan(*target, bullet_speed);
 }
 
-Plan Planner::plan(Target target, double bullet_speed, const PlannerState & state)
+Plan Planner::plan(
+  Target target, double bullet_speed, const PlannerState & state,
+  std::optional<int> armor_id)
 {
   // 真机链路只接受调用方明确给出的有效弹速，避免原入口的 22 m/s 隐式回退进入控制准备。
   if (bullet_speed < 10.0 || bullet_speed > 25.0 ||
@@ -118,9 +121,15 @@ Plan Planner::plan(Target target, double bullet_speed, const PlannerState & stat
 
   const auto armors = target.armor_xyza_list();
   if (armors.empty()) return {false};
+  if (armor_id &&
+      (*armor_id < 0 || static_cast<std::size_t>(*armor_id) >= armors.size())) {
+    return {false};
+  }
   double min_dist = 1e10;
   Eigen::Vector3d nearest_xyz = Eigen::Vector3d::Zero();
-  for (const auto & xyza : armors) {
+  for (std::size_t id = 0; id < armors.size(); ++id) {
+    if (armor_id && id != static_cast<std::size_t>(*armor_id)) continue;
+    const auto & xyza = armors[id];
     const double dist = xyza.head<2>().norm();
     if (dist < min_dist) {
       min_dist = dist;
@@ -132,9 +141,9 @@ Plan Planner::plan(Target target, double bullet_speed, const PlannerState & stat
   target.predict(flight.fly_time);
 
   try {
-    const double yaw0 = aim(target, bullet_speed)(0);
+    const double yaw0 = aim(target, bullet_speed, armor_id)(0);
     // 旧入口的参考轨迹以当前时刻为中点；本入口从当前时刻起算，x0 才能对应同一时刻。
-    const auto traj = get_trajectory(target, yaw0, bullet_speed, true);
+    const auto traj = get_trajectory(target, yaw0, bullet_speed, true, armor_id);
     if (!std::isfinite(yaw0) || !traj.allFinite()) return {false};
     Eigen::Vector2d yaw_x0(tools::limit_rad(state.yaw - yaw0), state.yaw_vel);
     Eigen::Vector2d pitch_x0(state.pitch, state.pitch_vel);
@@ -240,20 +249,27 @@ void Planner::setup_pitch_solver(const std::string & config_path)
   pitch_solver_->settings->max_iter = max_iter_;
 }
 
-Eigen::Matrix<double, 2, 1> Planner::aim(const Target & target, double bullet_speed)
+Eigen::Matrix<double, 2, 1> Planner::aim(
+  const Target & target, double bullet_speed, std::optional<int> armor_id)
 {
   Eigen::Vector3d xyz;
   double yaw;
   auto min_dist = 1e10;
 
-  for (auto & xyza : target.armor_xyza_list()) {
+  const auto armors = target.armor_xyza_list();
+  bool selected = false;
+  for (std::size_t id = 0; id < armors.size(); ++id) {
+    if (armor_id && id != static_cast<std::size_t>(*armor_id)) continue;
+    const auto & xyza = armors[id];
     auto dist = xyza.head<2>().norm();
     if (dist < min_dist) {
       min_dist = dist;
       xyz = xyza.head<3>();
       yaw = xyza[3];
+      selected = true;
     }
   }
+  if (!selected) throw std::out_of_range("Planner armor ID not present");
   debug_xyza = Eigen::Vector4d(xyz.x(), xyz.y(), xyz.z(), yaw);
 
   auto azim = std::atan2(xyz.y(), xyz.x());
@@ -264,20 +280,21 @@ Eigen::Matrix<double, 2, 1> Planner::aim(const Target & target, double bullet_sp
 }//得到目标的yaw和pitch角度，yaw为世界坐标系下的偏航角，pitch为世界坐标系下的俯仰角
 
 Trajectory Planner::get_trajectory(
-  Target & target, double yaw0, double bullet_speed, bool start_at_now)
+  Target & target, double yaw0, double bullet_speed, bool start_at_now,
+  std::optional<int> armor_id)
 {
   Trajectory traj;
 
   target.predict(-DT * (start_at_now ? 1 : HALF_HORIZON + 1));
-  auto yaw_pitch_last = aim(target, bullet_speed);
+  auto yaw_pitch_last = aim(target, bullet_speed, armor_id);
 
   // 旧入口第 50 列对应当前时刻；实测初态入口第 0 列对应当前时刻。
   target.predict(DT);
-  auto yaw_pitch = aim(target, bullet_speed);
+  auto yaw_pitch = aim(target, bullet_speed, armor_id);
 
   for (int i = 0; i < HORIZON; i++) {
     target.predict(DT);
-    auto yaw_pitch_next = aim(target, bullet_speed);
+    auto yaw_pitch_next = aim(target, bullet_speed, armor_id);
 
     auto yaw_vel = tools::limit_rad(yaw_pitch_next(0) - yaw_pitch_last(0)) / (2 * DT);
     auto pitch_vel = (yaw_pitch_next(1) - yaw_pitch_last(1)) / (2 * DT);

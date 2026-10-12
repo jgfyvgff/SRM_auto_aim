@@ -113,6 +113,11 @@ target_link_libraries(dynamic_roi_test ${OpenCV_LIBS})
 add_test(NAME dynamic_roi_test COMMAND dynamic_roi_test)
 add_executable(tracker_name_vote_test tests/tracker_name_vote_test.cpp)
 add_test(NAME tracker_name_vote_test COMMAND tracker_name_vote_test)
+add_executable(tracker_capture_test tests/tracker_capture_test.cpp)
+target_link_libraries(tracker_capture_test ${OpenCV_LIBS} fmt::fmt yaml-cpp tools io auto_aim)
+add_test(
+    NAME tracker_capture_test
+    COMMAND tracker_capture_test ${PROJECT_SOURCE_DIR}/configs/real_auto_aim.yaml)
 add_executable(frame_path_test tests/frame_path_test.cpp)
 add_test(NAME frame_path_test COMMAND frame_path_test)
 add_executable(real_config_test tests/real_config_test.cpp)

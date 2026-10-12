@@ -31,6 +31,8 @@ struct AssociationCandidateDebug
   bool position_gate_passed = false;
   bool distance_gate_passed = false;
   bool mahalanobis_gate_passed = false;
+  // 四装甲模型中仅与相邻板比较图像距离，防止沿用旧 ID 或被背面板误拒绝。
+  bool image_model_gate_passed = false;
   double score = 0.0;
   // 关联候选与预测装甲板的三维位置残差，单位为 m，仅用于诊断。
   double position_error = 0.0;
@@ -47,6 +49,8 @@ struct AssociationCandidateDebug
   double predicted_x = 0.0;
   double predicted_y = 0.0;
   double predicted_z = 0.0;
+  // 关联前预测的装甲板 yaw，单位 rad；用于日志回投影，不参与门控。
+  double predicted_yaw = 0.0;
   double observed_distance = 0.0;
   double predicted_distance = 0.0;
   double orientation_error = 0.0;
@@ -61,11 +65,16 @@ struct AssociationCandidateDebug
   double yaw_correction = 0.0;
   double image_x = 0.0;
   double image_y = 0.0;
+  // 检测四角点的真实均值；Armor.center 是外接框中心，不能替代该值。
+  std::optional<cv::Point2f> observed_quad_center;
 };
 
 // 每帧最多保留两个最优候选用于诊断，但实际只允许一个候选更新 EKF。
 struct AssociationDebug
 {
+  // 记录 Target 原有物理模型；检测标签改判时仍按继承的模型回投影。
+  ArmorName model_name = ArmorName::not_armor;
+  ArmorType model_type = ArmorType::small;
   // matching_detection_count 表示输入中与当前目标同名同类型的检测数量。
   // gate_passed_count 表示这些检测中至少有一个模型 ID 通过全部关联门限的数量。
   int matching_detection_count = 0;
@@ -88,6 +97,14 @@ public:
   std::uint64_t target_generation() const;
   int temp_lost_count() const;
   int max_temp_lost_count() const;
+  // 物理模型与检测标签分开记录；跨几何模型的捕获期改判会显式重建目标。
+  std::string geometry_branch() const;
+  bool geometry_trusted() const;
+  bool geometry_constraint_active() const;
+  bool observation_accepted() const;
+  ArmorName tracked_label() const;
+  // 丢失发生在本帧 EKF 更新之后时，仍可只读记录触发丢失的滤波诊断。
+  const Target * diagnostic_target() const;
 
   std::list<Target> track(
     std::list<Armor> & armors, std::chrono::steady_clock::time_point t,
@@ -130,6 +147,11 @@ private:
   std::chrono::steady_clock::time_point last_timestamp_;
   ArmorPriority omni_target_priority_;
   AssociationDebug association_debug_;
+  ArmorName tracked_label_ = ArmorName::not_armor;
+  std::string geometry_branch_ = "none";
+  bool geometry_constraint_active_ = false;
+  bool rejected_unknown_geometry_ = false;
+  bool observation_accepted_ = false;
   // 每次 set_target 成功后递增，用于区分真实 ID 跳变和 Tracker 重初始化。
   std::uint64_t target_generation_ = 0;
   // 捕获阶段的类别投票窗口；只在还没进入 tracking 时用于改判类别。
@@ -141,13 +163,14 @@ private:
 
   void push_recent_name(std::optional<ArmorName> name);
 
-  // 捕获阶段按多数票改判类别；返回 true 表示已经用新类别重建了目标。
-  bool relock_on_majority_name(
-    std::list<Armor> & armors, std::chrono::steady_clock::time_point t);
+  bool set_target(
+    std::list<Armor> & armors, std::chrono::steady_clock::time_point t,
+    bool pose_solved = false);
 
-  bool set_target(std::list<Armor> & armors, std::chrono::steady_clock::time_point t);
-
-  bool update_target(std::list<Armor> & armors, std::chrono::steady_clock::time_point t);
+  // 投票仅允许检查另一检测标签；位置、姿态与 EKF 后验仍需通过原有门限。
+  bool update_target(
+    std::list<Armor> & armors, std::chrono::steady_clock::time_point t,
+    std::optional<NameVote> relabel_vote = std::nullopt);
 };
 
 }  // namespace auto_aim

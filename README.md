@@ -328,10 +328,23 @@ TinyMPC 原始数值，不是角度误差。100 ms 角度只用于查看轨迹�
 `latest_pose_extrapolated`。
 Planner 输出的是下一 10 ms 规划步的
 绝对角；当前串口协议没有速度、加速度字段，日志中的规划速度与加速度不会发送。
+真机入口将本帧 Aimer 已选的装甲板 ID 传给 Planner，整条预测轨迹固定该物理板；
+当 Aimer 未给出有效瞄点时，Planner 保留原有最近距离选板行为。日志中的
+`aim_armor_id`、`planner_target_yaw_deg` 和 `diagnostic_yaw_deg` 可用于检查两者是否一致。
 `frame/ticks/tick_hz` 为 SDK 帧号、原始计数和相机报告的频率；`mapped_age` 与
 `mapping_delay` 均基于估计的主机映射时间，不能解释为已测得的曝光/串口硬件延迟。
 配置使用 `handeye_real6.yaml` 外参、`intrinsics_real6.yaml` 内参；敌方颜色由
 `enemy_color` 配置决定。
+Tracker 捕获阶段的类别投票须通过当前目标关联与 EKF 后验后才改变观测标签；
+若误捕获为 `outpost_three` 后投票改为标准四装甲类别，则用已接受的姿态重建
+`standard_four`，并重新累计捕获帧；其余改判保持原 EKF 和几何。首次捕获未标定
+几何类别时不产生跟随目标。真机 JSONL
+用 `tracker_geometry_branch`、`tracker_geometry_trusted`、
+`tracker_geometry_constraint_active`、`tracker_radius_variance_m2`、
+`tracker_last_nis`、`tracker_recent_nis_failures` 诊断模型；仅当
+`tracker_nis_fresh=true` 时，`tracker_last_nis` 属于本帧。
+`tracker_observation_accepted` 包含首次捕获，`tracker_model_name` 与
+`tracker_tracked_label` 分别表示保留的物理模型和当前接受的检测标签。
 模式和颜色反馈只记录原始整数，不猜测协议映射。图像尺寸不符会直接报错；姿态缺失
 或图像过期时不更新 Tracker。当前海康 `Camera::read()` 在无图像时仍可能阻塞，
 该入口的退出有赖于相机持续返回图像，尚未完成硬件验收。
@@ -398,6 +411,21 @@ ctest --test-dir build -R '^real_serial_feedback_test$' --output-on-failure
 `gimbal_*` 是 TF 测得的实际云台状态，`published_fire_advice` 是最终发送给
 模拟器的开火建议。
 
+### 真机 Tracker PlotJuggler 曲线
+
+在 NUC 的 PlotJuggler 中启动 UDP Server 并监听 `9870`，然后运行：
+
+```bash
+timeout 60s ./build/standard_srm --max-frames=300 \
+  --debug-jsonl=/tmp/real_srm_tracker.jsonl --debug-udp
+```
+
+UDP 会发送与 JSONL 相同的逐帧诊断记录。`mpc_layout.xml` 中是 MPC 曲线；
+Tracker 字段可在 PlotJuggler 的数据列表中选择，例如
+`tracker_last_nis`、`tracker_recent_nis_failures`、
+`tracker_radius_variance_m2` 和 `tracker_observation_accepted`。
+该选项只发送诊断数据，不启用云台控制。
+
 ### Tracker 自动分析
 
 启动 `sim_detector_probe` 后，可使用独立脚本订阅 `/sim_aim/debug`，自动比较静止与小陀螺阶段的车辆中心、速度、半径和装甲板 ID 切换情况：
@@ -422,13 +450,24 @@ Tracker 世代变化和状态消息序列缺口。分析脚本会同时订阅该
 `--prediction-match-tolerance` 调整。
 
 Tracker 对每个同名检测框分别以各模型 ID 的预测 yaw 选择 IPPE 姿态分支，再计算
-该分支与模型 ID 的关联误差。通过全部门限后，同一帧只使用马氏距离最小的一个组合
-更新 EKF，避免两个机器人同时进入画面时把同名装甲板一起写入同一个目标；其余
+该分支与模型 ID 的关联误差。标准四装甲还要求当前 ID 的预测中心比其两块物理相邻板
+更接近检测中心；背面板不参与比较。投影无效时本帧关联失败，短时丢失按原状态机保持。
+该检查不增加像素阈值。
+通过全部门限后，同一帧先按综合关联分数选择候选，
+分数相同时再按马氏距离排序更新 EKF，避免两个机器人同时进入画面时把同名装甲板
+一起写入同一个目标；其余
 检测候选仍会发布到 `/sim_aim/debug` 供诊断。
 `association_model_candidates` 额外记录每个检测框对各模型 ID 的门限、马氏距离、
 位置/姿态误差和该 ID 所选的 IPPE yaw，按检测框与模型 ID 的遍历顺序保存；
 最多保留八项，超出时只丢弃诊断记录，不影响实际关联。它用于分析初始
 模型 ID 锁定，不参与 Tracker 决策，也不能当作物理装甲板编号。
+真机 JSONL 中的 `association_primary_predicted_center_error_px`、
+`association_secondary_predicted_center_error_px` 和各
+`association_model_candidates[].predicted_center_error_px` 是各候选在 EKF 更新前
+按继承的物理模型回投影所得中心，与检测四角点均值的像素距离。对应的
+`predicted_center_error_valid` 字段为 0 时误差为 `null`。该数值用于诊断；
+`image_model_gate_passed` 记录相邻预测模型 ID 比较是否通过。投影误差同时包含
+模型、姿态和标定误差，不能单凭它修改外参或指定固定像素门限。
 关联门限通过后，还会比较同一块装甲板更新前后的三维位置残差。已知几何目标
 使用两组装甲中较大半径的旋转直径作为残差恶化上限；超过时恢复本帧预测状态与
 EKF 统计。其他目标仍使用本帧距离观测噪声的一个标准差。拒绝帧不增加装甲切换计数。
@@ -442,8 +481,9 @@ EKF 统计。其他目标仍使用本帧距离观测噪声的一个标准差。�
 观测。实际关联接受由综合分数、位置/距离绝对误差和 `S = HPHᵀ + R` 的 Mahalanobis
 门控共同决定；角度误差仍参与综合分数，因此明显错误的姿态仍会被拒绝。
 
-Tracker 还会计算 4 维观测创新的马氏距离：`S = HPHᵀ + R`，关联优先选择马氏距离
-最小的模型装甲板。`association_max_mahalanobis_distance` 是无量纲统计门限；位置
+Tracker 还会计算 4 维观测创新的马氏距离：`S = HPHᵀ + R`。该距离仍用于统计门控；
+通过全部门限的候选按综合关联分数排序，分数相同时才比较马氏距离。
+`association_max_mahalanobis_distance` 是无量纲统计门限；位置
 和距离绝对误差门限仍保留作为安全门；固定角度门降级为诊断项。它不是固定处理延迟，
 也不替代基于真实时间戳的延迟测量与预测时间对齐。
 

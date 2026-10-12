@@ -63,8 +63,11 @@ public:
 
   Plan plan(Target target, double bullet_speed);
   Plan plan(std::optional<Target> target, double bullet_speed);
-  // 真机诊断入口：target 应由调用方预测到当前计算时刻；首个规划点使用实测云台状态。
-  Plan plan(Target target, double bullet_speed, const PlannerState & state);
+  // 真机入口：target 已预测到计算时刻；传入 Aimer 选板 ID 后整条轨迹固定该物理装甲板。
+  // 未传 ID 的调用方保留原有最近距离选板行为，首个规划点仍使用实测云台状态。
+  Plan plan(
+    Target target, double bullet_speed, const PlannerState & state,
+    std::optional<int> armor_id = std::nullopt);
 
 private:
   double yaw_offset_;
@@ -80,9 +83,12 @@ private:
   void setup_yaw_solver(const std::string & config_path);
   void setup_pitch_solver(const std::string & config_path);
 
-  Eigen::Matrix<double, 2, 1> aim(const Target & target, double bullet_speed);
+  Eigen::Matrix<double, 2, 1> aim(
+    const Target & target, double bullet_speed,
+    std::optional<int> armor_id = std::nullopt);
   Trajectory get_trajectory(
-    Target & target, double yaw0, double bullet_speed, bool start_at_now = false);
+    Target & target, double yaw0, double bullet_speed, bool start_at_now = false,
+    std::optional<int> armor_id = std::nullopt);
 };
 
 }  // namespace auto_aim

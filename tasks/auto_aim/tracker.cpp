@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <numeric>
 #include <optional>
 #include <stdexcept>
 #include <tuple>
@@ -12,6 +13,7 @@
 
 #include "tools/logger.hpp"
 #include "tools/math_tools.hpp"
+#include "tasks/auto_aim/tracker_association_policy.hpp"
 #include "tracker_time_policy.hpp"
 
 namespace auto_aim
@@ -129,10 +131,42 @@ int Tracker::temp_lost_count() const { return temp_lost_count_; }
 
 int Tracker::max_temp_lost_count() const { return max_temp_lost_count_; }
 
+std::string Tracker::geometry_branch() const
+{
+  if (state_ == "lost") {
+    if (rejected_unknown_geometry_) return "unknown_rejected";
+    return observation_accepted_ ? geometry_branch_ : "none";
+  }
+  return geometry_branch_;
+}
+
+bool Tracker::geometry_trusted() const
+{
+  return state_ != "lost" && geometry_branch_ != "none";
+}
+
+bool Tracker::geometry_constraint_active() const
+{
+  return geometry_trusted() && geometry_constraint_active_;
+}
+
+bool Tracker::observation_accepted() const { return observation_accepted_; }
+
+ArmorName Tracker::tracked_label() const { return tracked_label_; }
+
+const Target * Tracker::diagnostic_target() const
+{
+  // 未捕获目标或丢失后的旧 EKF 不参与逐帧统计；更新后当帧丢失仍保留诊断。
+  if (state_ == "lost" && !observation_accepted_) return nullptr;
+  return &target_;
+}
+
 std::list<Target> Tracker::track(
   std::list<Armor> & armors, std::chrono::steady_clock::time_point t, bool use_enemy_color)
 {
   association_debug_ = AssociationDebug{};
+  observation_accepted_ = false;
+  rejected_unknown_geometry_ = false;
   auto dt = tools::delta_time(t, last_timestamp_);
   last_timestamp_ = t;
 
@@ -179,15 +213,15 @@ std::list<Target> Tracker::track(
 
   else {
     if (!armors.empty()) push_recent_name(armors.front().name);
-    // 只在还没进入 tracking 的阶段改判：tracking 期间锁定类别是有意为之（避免同类装甲板
-    // 之间跳变），而捕获阶段相反——类别错了必须尽早纠正，否则正确的观测会被名字过滤
-    // 一直拦到超时。switching 属于全向感知那条路径，这里不碰。
+    // 捕获阶段的投票只提出新观测标签；同一目标还须通过当前几何预测的关联门限。
+    // tracking 期间继续锁定标签，全向感知的 switching 路径不受此投票影响。
     const bool capture_phase = (state_ == "detecting" || state_ == "temp_lost");
-    if (capture_phase && relock_on_majority_name(armors, t)) {
-      found = true;
-    } else {
-      found = update_target(armors, t);
-    }
+    const auto winner = capture_phase
+                          ? majority_armor_name(recent_names_, relock_name_window_, relock_name_votes_)
+                          : std::nullopt;
+    const auto relabel_vote =
+      winner && winner->name != tracked_label_ ? winner : std::nullopt;
+    found = update_target(armors, t, relabel_vote);
   }
 
   state_machine(found);
@@ -224,6 +258,8 @@ std::tuple<omniperception::DetectionResult, std::list<Target>> Tracker::track(
   std::chrono::steady_clock::time_point t, bool use_enemy_color)
 {
   association_debug_ = AssociationDebug{};
+  observation_accepted_ = false;
+  rejected_unknown_geometry_ = false;
   omniperception::DetectionResult switch_target{std::list<Armor>(), t, 0, 0};
   omniperception::DetectionResult temp_target{std::list<Armor>(), t, 0, 0};
   if (!detection_queue.empty()) {
@@ -383,46 +419,14 @@ void Tracker::push_recent_name(std::optional<ArmorName> name)
   }
 }
 
-bool Tracker::relock_on_majority_name(
-  std::list<Armor> & armors, std::chrono::steady_clock::time_point t)
-{
-  if (armors.empty()) return false;
-  const auto winner = majority_armor_name(recent_names_, relock_name_window_, relock_name_votes_);
-  if (!winner.has_value() || winner->name == target_.name) return false;
-
-  // 用本帧里属于胜出类别、置信度最高的装甲板重建目标。set_target 取 front()，
-  // 所以把它提到链表首位；其余装甲板的相对顺序保持不变。
-  auto best = armors.end();
-  for (auto it = armors.begin(); it != armors.end(); ++it) {
-    if (it->name != winner->name) continue;
-    if (best == armors.end() || it->confidence > best->confidence) best = it;
-  }
-  if (best == armors.end()) return false;
-
-  const ArmorName previous = target_.name;
-  armors.splice(armors.begin(), armors, best);
-  if (!set_target(armors, t)) return false;
-
-  // 改判后重新走一次确认流程，避免单帧直接进入 tracking 造成抖动。
-  state_ = "detecting";
-  detect_count_ = 1;
-  temp_lost_count_ = 0;
-  // 这类改判必须留痕：远距离分类抖动时它会反复出现，是判断"模型是否可信"的直接依据。
-  tools::logger()->info(
-    "[Tracker] Relock name {} -> {} (votes {}/{})", ARMOR_NAMES[previous], ARMOR_NAMES[winner->name],
-    winner->votes, static_cast<int>(recent_names_.size()));
-  return true;
-}
-
-bool Tracker::set_target(std::list<Armor> & armors, std::chrono::steady_clock::time_point t)
+bool Tracker::set_target(
+  std::list<Armor> & armors, std::chrono::steady_clock::time_point t, bool pose_solved)
 {
   if (armors.empty()) return false;
 
   auto & armor = armors.front();
-  solver_.solve(armor);
-
   // 根据兵种优化初始化参数
-  auto is_balance = (armor.type == ArmorType::big) &&
+  const auto is_balance = (armor.type == ArmorType::big) &&
                     (armor.name == ArmorName::three || armor.name == ArmorName::four ||
                      armor.name == ArmorName::five);
   const auto is_standard_four_armor =
@@ -430,22 +434,39 @@ bool Tracker::set_target(std::list<Armor> & armors, std::chrono::steady_clock::t
     (armor.name == ArmorName::two || armor.name == ArmorName::three ||
      armor.name == ArmorName::four || armor.name == ArmorName::five);
 
+  // 未标定类别不能借用四装甲默认模型生成可供云台跟随的预测目标。
+  if (!is_balance && armor.name != ArmorName::outpost &&
+      armor.name != ArmorName::base && !is_standard_four_armor) {
+    rejected_unknown_geometry_ = true;
+    tools::logger()->debug(
+      "[Tracker] Reject capture: unknown geometry for {}", ARMOR_NAMES[armor.name]);
+    return false;
+  }
+
+  // 已通过关联的观测保留其 IPPE 姿态分支，重建模型时不重新求解。
+  if (!pose_solved) solver_.solve(armor);
+  geometry_constraint_active_ = false;
+
   if (is_balance) {
+    geometry_branch_ = "balance_two";
     Eigen::VectorXd P0_dig{{1, 64, 1, 64, 1, 64, 0.4, 100, 1, 1, 1}};
     target_ = Target(armor, t, 0.18, 2, P0_dig);//参数分别为装甲板、时间戳、旋转半径、装甲板数量、初始协方差矩阵
   }
 
   else if (armor.name == ArmorName::outpost) {
+    geometry_branch_ = "outpost_three";
     Eigen::VectorXd P0_dig{{1, 64, 1, 64, 1, 81, 0.4, 100, 1e-4, 0, 0}};
     target_ = Target(armor, t, 0.2765, 3, P0_dig);
   }
 
   else if (armor.name == ArmorName::base) {
+    geometry_branch_ = "base_three";
     Eigen::VectorXd P0_dig{{1, 64, 1, 64, 1, 64, 0.4, 100, 1e-4, 0, 0}};
     target_ = Target(armor, t, 0.3205, 3, P0_dig);
   }
 
   else if (is_standard_four_armor) {
+    geometry_branch_ = "standard_four";
     // 单块静止装甲板无法同时观测车辆中心和半径，因此使用已知机械尺寸
     // 约束 r、两组半径差和高度差，避免半径向发散下限塌缩。
     Eigen::VectorXd P0_dig{
@@ -457,23 +478,23 @@ bool Tracker::set_target(std::list<Armor> & armors, std::chrono::steady_clock::t
       target_.set_geometry_constraint(
         0.18, 0.0, standard_radius_variance_,
         standard_radius_delta_variance_);
+      geometry_constraint_active_ = true;
     }
   }
 
-  else {
-    // 其他车型保持上游原有行为，后续应按实际机械尺寸分别标定。
-    Eigen::VectorXd P0_dig{{1, 64, 1, 64, 1, 64, 0.4, 100, 1, 1, 1}};
-    target_ = Target(armor, t, 0.18, 4, P0_dig);
-  }
-
   target_.set_measurement_bearing_variance(measurement_bearing_variance_);
+  tracked_label_ = armor.name;
+  observation_accepted_ = true;
   target_generation_++;
   return true;
 }
 
-bool Tracker::update_target(std::list<Armor> & armors, std::chrono::steady_clock::time_point t)
+bool Tracker::update_target(
+  std::list<Armor> & armors, std::chrono::steady_clock::time_point t,
+  std::optional<NameVote> relabel_vote)
 {
   target_.predict(t);// 预测，更新协方差矩阵和预测量
+  const ArmorName candidate_name = relabel_vote ? relabel_vote->name : tracked_label_;
 
   struct Candidate
   {
@@ -495,12 +516,45 @@ bool Tracker::update_target(std::list<Armor> & armors, std::chrono::steady_clock
     bool position_gate_passed;
     bool distance_gate_passed;
     bool mahalanobis_gate_passed;
+    bool image_model_gate_passed;
     bool gate_passed;
+  };
+  const auto rank_of = [](const Candidate & candidate) {
+    return AssociationRank{
+      candidate.gate_passed, candidate.association_score,
+      candidate.mahalanobis_distance};
   };
 
   const auto predicted_armors = target_.armor_xyza_list();
+  const auto quad_center = [](const std::vector<cv::Point2f> & points)
+    -> std::optional<cv::Point2f> {
+    if (points.size() != 4) return std::nullopt;
+    cv::Point2f center{0.0F, 0.0F};
+    for (const auto & point : points) {
+      if (!std::isfinite(point.x) || !std::isfinite(point.y)) return std::nullopt;
+      center += point;
+    }
+    return center * 0.25F;
+  };
+  const bool check_image_model = geometry_branch_ == "standard_four";
+  std::vector<cv::Point2f> predicted_centers;
+  if (check_image_model) {
+    for (const auto & predicted : predicted_armors) {
+      try {
+        const auto center = quad_center(solver_.reproject_armor(
+          predicted.head(3), predicted[3], target_.armor_type, target_.name));
+        if (!center) break;
+        predicted_centers.push_back(*center);
+      } catch (const cv::Exception &) {
+        // 投影失败时不沿用旧 ID，交给现有短时丢失流程保持瞄准角。
+        break;
+      }
+    }
+  }
+  association_debug_.model_name = target_.name;
+  association_debug_.model_type = target_.armor_type;
   // 所有模型假设和最终候选共用一份诊断字段转换，保证比较的是同一预测时刻。
-  const auto make_candidate_debug = [&predicted_armors](const Candidate & candidate) {
+  const auto make_candidate_debug = [&predicted_armors, &quad_center](const Candidate & candidate) {
     const auto & predicted_armor = predicted_armors[candidate.id];
     const auto predicted_ypd = tools::xyz2ypd(predicted_armor.head(3));
     AssociationCandidateDebug debug;
@@ -511,6 +565,7 @@ bool Tracker::update_target(std::list<Armor> & armors, std::chrono::steady_clock
     debug.position_gate_passed = candidate.position_gate_passed;
     debug.distance_gate_passed = candidate.distance_gate_passed;
     debug.mahalanobis_gate_passed = candidate.mahalanobis_gate_passed;
+    debug.image_model_gate_passed = candidate.image_model_gate_passed;
     debug.score = candidate.association_score;
     debug.position_error = candidate.position_error;
     debug.distance_error = candidate.distance_error;
@@ -523,6 +578,7 @@ bool Tracker::update_target(std::list<Armor> & armors, std::chrono::steady_clock
     debug.predicted_x = predicted_armor[0];
     debug.predicted_y = predicted_armor[1];
     debug.predicted_z = predicted_armor[2];
+    debug.predicted_yaw = predicted_armor[3];
     debug.observed_distance = candidate.solved_armor.ypd_in_world[2];
     debug.predicted_distance = predicted_ypd[2];
     debug.orientation_error = candidate.orientation_error;
@@ -538,12 +594,16 @@ bool Tracker::update_target(std::list<Armor> & armors, std::chrono::steady_clock
       candidate.solved_armor.ypr_in_world[0] - candidate.solved_armor.yaw_raw);
     debug.image_x = candidate.solved_armor.center.x;
     debug.image_y = candidate.solved_armor.center.y;
+    debug.observed_quad_center = quad_center(candidate.solved_armor.points);
     return debug;
   };
   std::vector<Candidate> candidates;
   for (auto & armor : armors) {
-    if (armor.name != target_.name || armor.type != target_.armor_type) continue;
+    if (armor.name != candidate_name || armor.type != target_.armor_type) continue;
     ++association_debug_.matching_detection_count;
+
+    const auto observed_image_center =
+      check_image_model ? quad_center(armor.points) : std::nullopt;
 
     std::optional<Candidate> best_gated_match;
     std::optional<Candidate> best_rejected_match;
@@ -585,19 +645,32 @@ bool Tracker::update_target(std::list<Armor> & armors, std::chrono::steady_clock
       const auto distance_gate_passed = distance_error <= association_max_distance_error_;
       const auto mahalanobis_gate_passed =
         match.mahalanobis_distance <= association_max_mahalanobis_distance_;
+      // 只与物理相邻的两块板比较；背面板投影重合不能否决当前板。
+      bool image_model_gate_passed = !check_image_model;
+      if (check_image_model && predicted_centers.size() == 4 && observed_image_center) {
+        const auto previous_id = (reference_id + 3) % 4;
+        const auto next_id = (reference_id + 1) % 4;
+        const auto reference_error =
+          cv::norm(*observed_image_center - predicted_centers[reference_id]);
+        const auto adjacent_error = std::min(
+          cv::norm(*observed_image_center - predicted_centers[previous_id]),
+          cv::norm(*observed_image_center - predicted_centers[next_id]));
+        image_model_gate_passed = reference_error <= adjacent_error;
+      }
       // 关联接受由综合分数、绝对空间误差和 EKF 创新协方差共同决定。
       // 固定 angle_gate 只用于诊断，避免在小陀螺状态下拒绝统计上合理的观测；
       // angle_error 仍然参与 association_score，明显错误的姿态不会绕过综合门限。
       const auto gate_passed =
         score_gate_passed && position_gate_passed &&
-        distance_gate_passed && mahalanobis_gate_passed;
+        distance_gate_passed && mahalanobis_gate_passed &&
+        image_model_gate_passed;
 
       Candidate candidate{
         &armor, solved_armor, match.id, match.angle_error, match.mahalanobis_distance,
         position_error, distance_error, position_angle_error, distance_angle_error,
         association_score, orientation_error, bearing_error, angle_gate_passed,
         score_gate_passed, position_gate_passed, distance_gate_passed,
-        mahalanobis_gate_passed, gate_passed};
+        mahalanobis_gate_passed, image_model_gate_passed, gate_passed};
       if (
         association_debug_.model_candidate_count <
         static_cast<int>(association_debug_.model_candidates.size()))
@@ -606,7 +679,7 @@ bool Tracker::update_target(std::list<Armor> & armors, std::chrono::steady_clock
           make_candidate_debug(candidate);
       }
       auto & best = gate_passed ? best_gated_match : best_rejected_match;
-      if (!best || candidate.mahalanobis_distance < best->mahalanobis_distance) {
+      if (!best || association_rank_precedes(rank_of(candidate), rank_of(*best))) {
         best = candidate;
       }
     }
@@ -622,20 +695,12 @@ bool Tracker::update_target(std::list<Armor> & armors, std::chrono::steady_clock
 
   if (candidates.empty()) return false;
 
-  // 所有关联都基于本帧同一个预测状态计算，再按误差从小到大更新。
+  // 所有关联都基于本帧同一个预测状态；多候选时按综合几何残差排序。
   // 同一个模型 ID 每帧只接收一个观测，避免重复框或顺序变化把 EKF 拉向不同装甲板。
   std::stable_sort(
     candidates.begin(), candidates.end(),
-    [](const Candidate & a, const Candidate & b) {
-      // 先保证候选通过全部安全门限，再在可接受候选中比较统计距离。
-      // 否则最小马氏距离的坏观测会挡住后面本可吸收的有效观测。
-      if (a.gate_passed != b.gate_passed) {
-        return a.gate_passed > b.gate_passed;
-      }
-      if (a.mahalanobis_distance != b.mahalanobis_distance) {
-        return a.mahalanobis_distance < b.mahalanobis_distance;
-      }
-      return a.association_score < b.association_score;
+    [&rank_of](const Candidate & a, const Candidate & b) {
+      return association_rank_precedes(rank_of(a), rank_of(b));
     });
 
   association_debug_.candidate_count = static_cast<int>(candidates.size());
@@ -645,7 +710,7 @@ bool Tracker::update_target(std::list<Armor> & armors, std::chrono::steady_clock
   }
 
   // 同一帧的同名装甲板可能来自不同机器人，不能把它们分别写入同一个 EKF。
-  // 只吸收通过门限且马氏距离最小的一个候选；其余候选仍保留在 debug 中供诊断。
+  // 只吸收排序最优的候选；其余候选仍保留在 debug 中供诊断。
   const auto & best_candidate = candidates.front();
   // 通过关联门限后仍需检查 EKF 后验；拒绝时保持预测状态和诊断候选。
   // 预测关联和更新后验共用距离门限，避免候选虽通过门控却被一次 EKF 更新拉出门限。
@@ -654,6 +719,34 @@ bool Tracker::update_target(std::list<Armor> & armors, std::chrono::steady_clock
   association_debug_.candidates[0].accepted = accepted;
   if (accepted) {
     association_debug_.accepted_count = 1;
+    observation_accepted_ = true;
+    if (relabel_vote) {
+      const ArmorName previous = tracked_label_;
+      const bool restore_standard_geometry =
+        geometry_branch_ == "outpost_three" &&
+        best_candidate.solved_armor.type == ArmorType::small &&
+        (relabel_vote->name == ArmorName::two ||
+         relabel_vote->name == ArmorName::three ||
+         relabel_vote->name == ArmorName::four ||
+         relabel_vote->name == ArmorName::five);
+      if (restore_standard_geometry) {
+        std::list<Armor> relabeled{best_candidate.solved_armor};
+        relabeled.front().name = relabel_vote->name;
+        set_target(relabeled, t, true);
+        // 几何模型已更换，重新累计捕获帧，不能沿用旧模型的 tracking 状态。
+        state_ = "detecting";
+        detect_count_ = 0;
+        temp_lost_count_ = 0;
+      } else {
+        // 同一几何分支内只改观测标签，保留已有 EKF 连续性。
+        tracked_label_ = relabel_vote->name;
+      }
+      tools::logger()->info(
+        "[Tracker] Relabel {} -> {} on continuous observation "
+        "(votes {}/{}, geometry={})",
+        ARMOR_NAMES[previous], ARMOR_NAMES[tracked_label_], relabel_vote->votes,
+        static_cast<int>(recent_names_.size()), geometry_branch_);
+    }
     // 探针会从原始检测列表读取已接收的位姿，因此把选中的分支回填给原对象。
     *best_candidate.armor = best_candidate.solved_armor;
   }

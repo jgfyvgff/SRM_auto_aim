@@ -10,6 +10,7 @@
 #include <sstream>
 #include <list>
 #include <memory>
+#include <numeric>
 #include <limits>
 #include <optional>
 #include <stdexcept>
@@ -36,6 +37,7 @@
 #include "tools/exiter.hpp"
 #include "tools/logger.hpp"
 #include "tools/math_tools.hpp"
+#include "tools/plotter.hpp"
 
 namespace
 {
@@ -61,6 +63,7 @@ const std::string kKeys =
     "{tx-temp-lost-rate-scale|0.35|外推角速度比例，范围 (0,1]}"
     "{save-frame|imgs/real_srm_frame.jpg|按 s 保存当前显示帧（相对运行目录，默认 imgs/；不带扩展名时按 .jpg 保存）}"
     "{debug-jsonl||保存逐帧真机诊断 JSONL}"
+    "{debug-udp|false|通过 UDP 将逐帧诊断 JSON 发到 127.0.0.1:9870}"
     "{exposure-ms|0|临时覆盖 YAML 曝光时间，单位 ms，0 表示沿用 YAML}"
     "{gain|-1|临时覆盖 YAML 增益，负数表示沿用 YAML}"
     "{max-frames|0|采集指定数量的非空图像后退出，0 表示持续运行}"
@@ -142,6 +145,36 @@ bool quad_center(const std::vector<cv::Point2f> & points, cv::Point2f & center)
     }
     center *= 0.25F;
     return true;
+}
+
+std::optional<double> candidate_predicted_center_error_px(
+    const auto_aim::AssociationCandidateDebug & candidate,
+    const auto_aim::AssociationDebug & association,
+    const auto_aim::Solver & solver)
+{
+    if (
+        candidate.model_id < 0 || !candidate.observed_quad_center ||
+        !std::isfinite(candidate.predicted_x) ||
+        !std::isfinite(candidate.predicted_y) ||
+        !std::isfinite(candidate.predicted_z) ||
+        !std::isfinite(candidate.predicted_yaw)) {
+        return std::nullopt;
+    }
+
+    try {
+        // 使用关联前的模型位置和 yaw；日志误差不参与 Tracker 决策。
+        const auto projected = solver.reproject_armor(
+            Eigen::Vector3d(
+                candidate.predicted_x, candidate.predicted_y, candidate.predicted_z),
+            candidate.predicted_yaw, association.model_type, association.model_name);
+        cv::Point2f projected_center;
+        if (!quad_center(projected, projected_center)) return std::nullopt;
+        const double error = cv::norm(projected_center - *candidate.observed_quad_center);
+        if (!std::isfinite(error)) return std::nullopt;
+        return error;
+    } catch (const cv::Exception &) {
+        return std::nullopt;
+    }
 }
 
 double best_order_reprojection_error(
@@ -309,7 +342,9 @@ void append_target_json(Json & sample, const std::list<auto_aim::Target> & targe
 
 void append_association_candidate_json(
     Json & sample, const std::string & prefix,
-    const auto_aim::AssociationCandidateDebug & candidate)
+    const auto_aim::AssociationCandidateDebug & candidate,
+    const auto_aim::AssociationDebug & association,
+    const auto_aim::Solver & solver)
 {
     if (candidate.model_id < 0) return;
     sample[prefix + "_id"] = candidate.model_id;
@@ -321,6 +356,8 @@ void append_association_candidate_json(
     sample[prefix + "_distance_gate_passed"] = candidate.distance_gate_passed ? 1 : 0;
     sample[prefix + "_mahalanobis_gate_passed"] =
         candidate.mahalanobis_gate_passed ? 1 : 0;
+    sample[prefix + "_image_model_gate_passed"] =
+        candidate.image_model_gate_passed ? 1 : 0;
     sample[prefix + "_score"] = candidate.score;
     sample[prefix + "_position_error"] = candidate.position_error;
     sample[prefix + "_distance_error"] = candidate.distance_error;
@@ -346,9 +383,18 @@ void append_association_candidate_json(
     sample[prefix + "_yaw_correction"] = candidate.yaw_correction;
     sample[prefix + "_image_x"] = candidate.image_x;
     sample[prefix + "_image_y"] = candidate.image_y;
+    const auto center_error = candidate_predicted_center_error_px(candidate, association, solver);
+    sample[prefix + "_predicted_center_error_valid"] = center_error ? 1 : 0;
+    if (center_error) {
+        sample[prefix + "_predicted_center_error_px"] = *center_error;
+    } else {
+        sample[prefix + "_predicted_center_error_px"] = nullptr;
+    }
 }
 
-void append_association_json(Json & sample, const auto_aim::AssociationDebug & association)
+void append_association_json(
+    Json & sample, const auto_aim::AssociationDebug & association,
+    const auto_aim::Solver & solver)
 {
     // 这些字段只记录关联决策的输入、门控和最终候选，不参与任何算法决策。
     // 真机日志需要据此区分 PnP 误差、模型 ID 切换和 EKF 中心漂移。
@@ -357,8 +403,86 @@ void append_association_json(Json & sample, const auto_aim::AssociationDebug & a
     sample["association_gate_passed_count"] = association.gate_passed_count;
     sample["association_candidate_count"] = association.candidate_count;
     sample["association_accepted_count"] = association.accepted_count;
-    append_association_candidate_json(sample, "association_primary", association.candidates[0]);
-    append_association_candidate_json(sample, "association_secondary", association.candidates[1]);
+    append_association_candidate_json(
+        sample, "association_primary", association.candidates[0], association, solver);
+    append_association_candidate_json(
+        sample, "association_secondary", association.candidates[1], association, solver);
+    // 同一检测还会按多个装甲板 ID 计算模型假设，保留完整列表便于复盘 ID 切换。
+    sample["association_model_candidates"] = Json::array();
+    for (int i = 0; i < association.model_candidate_count; ++i) {
+        const auto & candidate = association.model_candidates[static_cast<std::size_t>(i)];
+        if (candidate.model_id < 0) continue;
+        Json item = Json::object();
+        item["index"] = i;
+        item["model_id"] = candidate.model_id;
+        item["gate_passed"] = candidate.gate_passed ? 1 : 0;
+        item["angle_gate_passed"] = candidate.angle_gate_passed ? 1 : 0;
+        item["score_gate_passed"] = candidate.score_gate_passed ? 1 : 0;
+        item["position_gate_passed"] = candidate.position_gate_passed ? 1 : 0;
+        item["distance_gate_passed"] = candidate.distance_gate_passed ? 1 : 0;
+        item["mahalanobis_gate_passed"] = candidate.mahalanobis_gate_passed ? 1 : 0;
+        item["image_model_gate_passed"] = candidate.image_model_gate_passed ? 1 : 0;
+        item["score"] = candidate.score;
+        item["position_error"] = candidate.position_error;
+        item["distance_error"] = candidate.distance_error;
+        item["mahalanobis_distance"] = candidate.mahalanobis_distance;
+        item["position_angle_error"] = candidate.position_angle_error;
+        item["distance_angle_error"] = candidate.distance_angle_error;
+        item["orientation_error"] = candidate.orientation_error;
+        item["bearing_error"] = candidate.bearing_error;
+        item["angle_error"] = candidate.angle_error;
+        item["observed_x"] = candidate.observed_x;
+        item["observed_y"] = candidate.observed_y;
+        item["observed_z"] = candidate.observed_z;
+        item["predicted_x"] = candidate.predicted_x;
+        item["predicted_y"] = candidate.predicted_y;
+        item["predicted_z"] = candidate.predicted_z;
+        item["image_x"] = candidate.image_x;
+        item["image_y"] = candidate.image_y;
+        const auto center_error = candidate_predicted_center_error_px(candidate, association, solver);
+        item["predicted_center_error_valid"] = center_error ? 1 : 0;
+        if (center_error) {
+            item["predicted_center_error_px"] = *center_error;
+        } else {
+            item["predicted_center_error_px"] = nullptr;
+        }
+        sample["association_model_candidates"].push_back(std::move(item));
+    }
+}
+
+void append_tracker_filter_json(
+    Json & sample, const auto_aim::Tracker & tracker,
+    const std::list<auto_aim::Target> & targets)
+{
+    sample["tracker_geometry_branch"] = tracker.geometry_branch();
+    sample["tracker_geometry_trusted"] = tracker.geometry_trusted();
+    sample["tracker_geometry_constraint_active"] =
+        tracker.geometry_constraint_active();
+    // 首次捕获也接受了观测，但只有成功更新 EKF 才产生本帧的新 NIS。
+    sample["tracker_observation_accepted"] = tracker.observation_accepted();
+    sample["tracker_nis_fresh"] = false;
+    sample["tracker_model_name"] = nullptr;
+    sample["tracker_tracked_label"] = nullptr;
+    sample["tracker_radius_variance_m2"] = nullptr;
+    sample["tracker_last_nis"] = nullptr;
+    sample["tracker_recent_nis_failures"] = nullptr;
+    const auto * target = targets.empty() ? tracker.diagnostic_target() : &targets.front();
+    if (target == nullptr) return;
+
+    const auto & ekf = target->ekf();
+    sample["tracker_model_name"] = auto_aim::ARMOR_NAMES[target->name];
+    sample["tracker_tracked_label"] =
+        auto_aim::ARMOR_NAMES[tracker.tracked_label()];
+    if (ekf.P.rows() > 8 && ekf.P.cols() > 8) {
+        sample["tracker_radius_variance_m2"] = ekf.P(8, 8);
+    }
+    sample["tracker_recent_nis_failures"] = std::accumulate(
+        ekf.recent_nis_failures.begin(), ekf.recent_nis_failures.end(), 0);
+    if (ekf.last_innovation.size() > 0) {
+        sample["tracker_last_nis"] = ekf.last_nis;
+        sample["tracker_nis_fresh"] =
+            tracker.association_debug().accepted_count > 0;
+    }
 }
 
 void append_aim_json(Json & sample, const auto_aim::Aimer & aimer, const io::Command & command)
@@ -488,6 +612,11 @@ int main(int argc, char * argv[])
         const bool show = cli.get<bool>("show");
         const bool quality_metrics = cli.get<bool>("quality-metrics");
         real_auto_aim::DebugRecorder recorder(cli.get<std::string>("debug-jsonl"));
+        std::unique_ptr<tools::Plotter> udp_plotter;
+        if (cli.get<bool>("debug-udp")) {
+            // 复用仿真 PlotJuggler 的 UDP 接收端口，真机帧无需经过 ROS2 转发。
+            udp_plotter = std::make_unique<tools::Plotter>();
+        }
         io::CameraSettingsOverride camera_overrides;
         if (exposure_override > 0.0) camera_overrides.exposure_ms = exposure_override;
         if (gain_override >= 0.0) camera_overrides.gain = gain_override;
@@ -621,13 +750,15 @@ int main(int argc, char * argv[])
                 clear_tx_on_hard_failure();
             }
         };
-        const auto record_sample = [&recorder, &serial_feedback](Json & sample) {
-            // tx_command_sent 仅表示进入邮箱；这两个累计量来自串口线程成功写入。
-            const auto tx_stats = serial_feedback.tx_stats();
-            sample["tx_wire_target_frames"] = tx_stats.target_frames;
-            sample["tx_wire_zero_frames"] = tx_stats.zero_frames;
-            recorder.write(sample);
-        };
+        const auto record_sample =
+            [&recorder, &serial_feedback, &udp_plotter](Json & sample) {
+                // tx_command_sent 仅表示进入邮箱；这两个累计量来自串口线程成功写入。
+                const auto tx_stats = serial_feedback.tx_stats();
+                sample["tx_wire_target_frames"] = tx_stats.target_frames;
+                sample["tx_wire_zero_frames"] = tx_stats.zero_frames;
+                recorder.write(sample);
+                if (udp_plotter) udp_plotter->plot(sample);
+            };
         while (
             !exiter.exit() && !window_exit &&
             (max_frames == 0 || captured_frame_count < static_cast<std::uint64_t>(max_frames))) {
@@ -774,7 +905,8 @@ int main(int argc, char * argv[])
                 append_target_json(sample, targets);
                 append_reprojection_json(
                     sample, solver, detected_armors_for_diagnostic, targets);
-                append_association_json(sample, tracker.association_debug());
+                append_association_json(sample, tracker.association_debug(), solver);
+                append_tracker_filter_json(sample, tracker, targets);
                 clear_tx_on_hard_failure();
                 record_sample(sample);
                 show_skip_frame(image, "invalid bullet speed");
@@ -852,7 +984,13 @@ int main(int argc, char * argv[])
                 sample["planner_state_pitch_deg"] = planner_state.pitch * 180.0 / CV_PI;
                 auto target = targets.front();
                 target.predict(planner_start);
-                const auto plan = planner.plan(target, planning_speed, planner_state);
+                // 参考轨迹沿用 Aimer 的选板结果，避免近等距相邻板逐步互换。
+                const std::optional<int> planner_armor_id =
+                    diagnostic.control && aimer.debug_aim_point.valid
+                        ? std::optional<int>{aimer.debug_aim_point.armor_id}
+                        : std::nullopt;
+                const auto plan = planner.plan(
+                    target, planning_speed, planner_state, planner_armor_id);
                 const bool finite_target =
                     std::isfinite(plan.target_yaw) && std::isfinite(plan.target_pitch);
                 if (!plan.diagnostic_valid || !finite_target ||
@@ -992,7 +1130,8 @@ int main(int argc, char * argv[])
             append_target_json(sample, targets);
             append_reprojection_json(
                 sample, solver, detected_armors_for_diagnostic, targets);
-            append_association_json(sample, tracker.association_debug());
+            append_association_json(sample, tracker.association_debug(), solver);
+            append_tracker_filter_json(sample, tracker, targets);
             append_aim_json(sample, aimer, diagnostic);
             record_sample(sample);
 
