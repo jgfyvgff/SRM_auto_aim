@@ -402,7 +402,7 @@ ctest --test-dir build -R '^real_serial_feedback_test$' --output-on-failure
 ### MPC PlotJuggler 曲线
 
 启动 `sim_curve_plotter` 后，探针的 `/sim_aim/debug` JSON 会通过 UDP
-`127.0.0.1:9870` 转发给 PlotJuggler。加载根目录的 `mpc_layout.xml`，
+`127.0.0.1:9871` 转发给 PlotJuggler。加载根目录的 `mpc_layout.xml`，
 即可查看 MPC 参考角度、MPC 状态、实际云台 TF 姿态、速度、加速度和开火建议：
 
 ```bash
@@ -415,7 +415,7 @@ ctest --test-dir build -R '^real_serial_feedback_test$' --output-on-failure
 
 ### 真机 Tracker PlotJuggler 曲线
 
-在 NUC 的 PlotJuggler 中启动 UDP Server 并监听 `9870`，然后运行：
+在 NUC 的 PlotJuggler 中启动 UDP Server 并监听 `9871`，然后运行：
 
 ```bash
 timeout 60s ./build/standard_srm --max-frames=300 \

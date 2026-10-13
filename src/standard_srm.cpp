@@ -63,7 +63,7 @@ const std::string kKeys =
     "{tx-temp-lost-rate-scale|0.35|外推角速度比例，范围 (0,1]}"
     "{save-frame|imgs/real_srm_frame.jpg|按 s 保存当前显示帧（相对运行目录，默认 imgs/；不带扩展名时按 .jpg 保存）}"
     "{debug-jsonl||保存逐帧真机诊断 JSONL}"
-    "{debug-udp|false|通过 UDP 将逐帧诊断 JSON 发到 127.0.0.1:9870}"
+    "{debug-udp|false|通过 UDP 将逐帧诊断 JSON 发到 127.0.0.1:9871}"
     "{exposure-ms|0|临时覆盖 YAML 曝光时间，单位 ms，0 表示沿用 YAML}"
     "{gain|-1|临时覆盖 YAML 增益，负数表示沿用 YAML}"
     "{max-frames|0|采集指定数量的非空图像后退出，0 表示持续运行}"
@@ -1056,7 +1056,8 @@ int main(int argc, char * argv[])
                 // 诊断，不再在两套相差数度的角度之间切换发送目标；始终禁止开火。
                 // 限幅以上一条已提交命令为基准，按真实间隔换算角速度，并受旧单次上限约束。
                 const bool tx_ready = enable_tx && (measured_speed || tx_use_nominal_speed) &&
-                                      has_measured_velocity && plan.diagnostic_valid && finite_target;
+                                      has_measured_velocity && plan.diagnostic_valid &&
+                                      finite_target && plan.control;
                 if (tx_ready) {
                     const auto command_at = Clock::now();
                     // 长时间没有新命令时不能用累计 dt 一次性追赶；首次使用发送周期。
@@ -1096,8 +1097,9 @@ int main(int argc, char * argv[])
                         clear_tx_on_hard_failure();
                     }
                 } else if (enable_tx && plan.diagnostic_valid && finite_target &&
-                           (measured_speed || tx_use_nominal_speed) && !has_measured_velocity) {
-                    // 只有速度估计短时不可用时保持；轨迹/弹速无效仍按上面的硬故障处理。
+                           (measured_speed || tx_use_nominal_speed) &&
+                           (!has_measured_velocity || !plan.control)) {
+                    // 速度估计缺失或 Planner 未收敛时保持；未收敛的角度仅用于诊断。
                     send_hold_command(feedback);
                 }
             } else if (enable_tx) {

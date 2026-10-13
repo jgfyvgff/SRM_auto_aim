@@ -54,9 +54,9 @@ relock_name_votes: 5
 max_temp_lost_count: 15
 outpost_max_temp_lost_count: 75
 tracker_max_prediction_gap: 0.3
-# 标准四装甲车的半径 r 是已知机械尺寸（0.18 m），而单块装甲观测下 r 不可观测，
-# 不约束时会漂移到发散边界并平移瞄点，因此启用几何约束。
-standard_geometry_constraint: true
+# 当前 real6 诊断关闭四装甲半径硬约束，以观察拟合半径。
+# 单块装甲观测下半径仍可能漂移；旧的 0.18 m 不是本车已确认的实测尺寸。
+standard_geometry_constraint: false
 # 倒装相机不使用固定俯仰、零滚转的逐点 yaw 重投影优化。
 yaw_optimization_enabled: false
 
