@@ -49,10 +49,11 @@ private:
   double pitch_offset_;
   double comming_angle_;
   double leaving_angle_;
-  double lock_id_ = -1;
+  // 跨帧选板锁只由本帧最终有效的预测结果更新。
+  int lock_id_ = -1;
   double decision_speed_;
 
-  AimPoint choose_aim_point(const Target & target);
+  AimPoint choose_aim_point(const Target & target, int & lock_id);
 };
 
 }  // namespace auto_aim
