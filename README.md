@@ -353,7 +353,9 @@ Tracker 捕获阶段的类别投票须通过当前目标关联与 EKF 后验后�
 `tracker_tracked_label` 分别表示保留的物理模型和当前接受的检测标签。
 `standard_radius` 与 `standard_radius_variance` 设置标准四装甲模型的半径初值和
 EKF 初始方差；关闭 `standard_geometry_constraint` 时，它们提供软先验，不会在每帧
-强制固定半径。半径差仍沿用现有设置，待取得实测尺寸后再处理。
+强制固定半径。`standard_radius_delta_constraint` 可单独固定两组装甲的半径差；
+启用时半径差固定为 0，半径 `r` 仍可继续由观测修正。
+`tracker_geometry_constraint_active` 表示当前至少有一项几何尺寸约束生效。
 标准四装甲的候选还须满足图像中心误差不超过本帧检测框长边；
 同号相邻板即使通过三维关联评分，也不能从远处更新同一模型 ID。
 被拒绝的帧会进入现有暂失流程，可能增加短时保持帧，需用新采集复核。

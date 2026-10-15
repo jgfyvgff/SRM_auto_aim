@@ -125,6 +125,7 @@ private:
   int normal_temp_lost_count_;
   // 标准四装甲机器人的已知几何先验；方差单位为 m²。
   bool standard_geometry_constraint_;
+  bool standard_radius_delta_constraint_;
   double standard_radius_;
   double standard_radius_variance_;
   double standard_radius_delta_variance_;

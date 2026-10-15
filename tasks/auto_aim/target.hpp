@@ -61,6 +61,8 @@ public:
   void set_geometry_constraint(
     double radius, double radius_delta, double radius_variance,
     double radius_delta_variance);
+  // 单独固定两组装甲的半径差；不会锁定半径 r。
+  void set_radius_delta_constraint(double radius_delta, double variance);
   // 方位观测噪声方差，单位 rad²；关联和 EKF 更新共用此值。
   void set_measurement_bearing_variance(double variance);
 
@@ -94,6 +96,7 @@ private:
   tools::ExtendedKalmanFilter ekf_;
   std::chrono::steady_clock::time_point t_;
   std::optional<GeometryConstraint> geometry_constraint_;
+  std::optional<std::pair<double, double>> radius_delta_constraint_;
   double measurement_bearing_variance_ = 4e-3;
 
   bool update_ypda(

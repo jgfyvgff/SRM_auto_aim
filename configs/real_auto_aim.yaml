@@ -59,6 +59,9 @@ tracker_max_prediction_gap: 0.3
 standard_radius: 0.22
 standard_radius_variance: 0.0004
 standard_geometry_constraint: false
+# 两组装甲的实测旋转半径差为 0；方差单位 m²，对应 1 mm 标准差。
+standard_radius_delta_constraint: true
+standard_radius_delta_variance: 1e-6
 # 倒装相机不使用固定俯仰、零滚转的逐点 yaw 重投影优化。
 yaw_optimization_enabled: false
 

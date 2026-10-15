@@ -37,6 +37,10 @@ Tracker::Tracker(const std::string & config_path, Solver & solver)
   standard_geometry_constraint_ = yaml["standard_geometry_constraint"].IsDefined()
                                     ? yaml["standard_geometry_constraint"].as<bool>()
                                     : false;
+  standard_radius_delta_constraint_ =
+    yaml["standard_radius_delta_constraint"].IsDefined()
+      ? yaml["standard_radius_delta_constraint"].as<bool>()
+      : false;
   standard_radius_ =
     yaml["standard_radius"].IsDefined() ? yaml["standard_radius"].as<double>() : 0.18;
   standard_radius_variance_ = yaml["standard_radius_variance"].IsDefined()
@@ -467,17 +471,21 @@ bool Tracker::set_target(
 
   else if (is_standard_four_armor) {
     geometry_branch_ = "standard_four";
-    // 单块装甲无法同时确定车辆中心和半径，因此用实测半径及初始方差提供软先验；
-    // 是否在每次更新后强制固定尺寸，仍由 standard_geometry_constraint 单独控制。
+    // 单块装甲无法同时确定车辆中心和半径，因此 r 保持软先验；
+    // 半径差 l 可按实测尺寸单独约束，不必连带固定 r。
     Eigen::VectorXd P0_dig{
       {1, 64, 1, 64, 1, 64, 0.4, 0.1, standard_radius_variance_,
        standard_radius_delta_variance_, standard_height_delta_variance_}};
     target_ = Target(armor, t, standard_radius_, 4, P0_dig);
     if (standard_geometry_constraint_) {
-      // 仿真车辆尺寸已知时固定 r 和 l，避免单块装甲观测把半径压到发散下限。
+      // 整体几何约束会同时固定 r 和 l。
       target_.set_geometry_constraint(
         standard_radius_, 0.0, standard_radius_variance_,
         standard_radius_delta_variance_);
+      geometry_constraint_active_ = true;
+    } else if (standard_radius_delta_constraint_) {
+      // 实测两组装甲半径差为零时，只固定 l，继续让观测修正 r。
+      target_.set_radius_delta_constraint(0.0, standard_radius_delta_variance_);
       geometry_constraint_active_ = true;
     }
   }

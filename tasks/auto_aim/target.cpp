@@ -258,6 +258,15 @@ void Target::set_geometry_constraint(
   apply_geometry_constraint();
 }
 
+void Target::set_radius_delta_constraint(double radius_delta, double variance)
+{
+  if (!std::isfinite(radius_delta) || !std::isfinite(variance) || variance <= 0.0) {
+    throw std::invalid_argument("Invalid target radius delta constraint");
+  }
+  radius_delta_constraint_ = std::make_pair(radius_delta, variance);
+  apply_geometry_constraint();
+}
+
 void Target::set_measurement_bearing_variance(double variance)
 {
   if (!std::isfinite(variance) || variance <= 0.0) {
@@ -268,9 +277,8 @@ void Target::set_measurement_bearing_variance(double variance)
 
 void Target::apply_geometry_constraint()
 {
-  if (!geometry_constraint_.has_value()) return;
+  if (!geometry_constraint_.has_value() && !radius_delta_constraint_.has_value()) return;
 
-  const auto & constraint = geometry_constraint_.value();
   auto constrain_state = [&](Eigen::Index index, double value, double variance) {
     ekf_.x[index] = value;
     // 已知机械尺寸不应继续与中心、速度和角速度共同漂移，因此同时清除互协方差。
@@ -279,8 +287,14 @@ void Target::apply_geometry_constraint()
     ekf_.P(index, index) = variance;
   };
 
-  constrain_state(8, constraint.radius, constraint.radius_variance);
-  constrain_state(9, constraint.radius_delta, constraint.radius_delta_variance);
+  if (geometry_constraint_) {
+    const auto & constraint = geometry_constraint_.value();
+    constrain_state(8, constraint.radius, constraint.radius_variance);
+    constrain_state(9, constraint.radius_delta, constraint.radius_delta_variance);
+  }
+  if (radius_delta_constraint_) {
+    constrain_state(9, radius_delta_constraint_->first, radius_delta_constraint_->second);
+  }
 }
 
 bool Target::update_ypda(
