@@ -1052,12 +1052,12 @@ int main(int argc, char * argv[])
                         Json(plan.pitch_dual_residual_max) : Json(nullptr);
                 }
 
-                // 绝对角协议统一追踪 Planner 的目标参考角。TinyMPC 求解状态仅用于
-                // 诊断，不再在两套相差数度的角度之间切换发送目标；始终禁止开火。
+                // 参考角由目标轨迹独立计算；TinyMPC 的收敛状态不阻断有限参考角，
+                // 否则切板后的角度差会使指令持续保持在旧位置。继续限速且禁止开火。
                 // 限幅以上一条已提交命令为基准，按真实间隔换算角速度，并受旧单次上限约束。
                 const bool tx_ready = enable_tx && (measured_speed || tx_use_nominal_speed) &&
                                       has_measured_velocity && plan.diagnostic_valid &&
-                                      finite_target && plan.control;
+                                      finite_target;
                 if (tx_ready) {
                     const auto command_at = Clock::now();
                     // 长时间没有新命令时不能用累计 dt 一次性追赶；首次使用发送周期。
@@ -1098,8 +1098,8 @@ int main(int argc, char * argv[])
                     }
                 } else if (enable_tx && plan.diagnostic_valid && finite_target &&
                            (measured_speed || tx_use_nominal_speed) &&
-                           (!has_measured_velocity || !plan.control)) {
-                    // 速度估计缺失或 Planner 未收敛时保持；未收敛的角度仅用于诊断。
+                           !has_measured_velocity) {
+                    // 速度估计短时缺失时保持；求解状态单独记录用于诊断。
                     send_hold_command(feedback);
                 }
             } else if (enable_tx) {

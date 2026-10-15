@@ -328,8 +328,10 @@ TinyMPC 原始数值，不是角度误差。100 ms 角度只用于查看轨迹�
 将角速度置零，并标记 `planner_state_source=matched_pose_zero_velocity`；该状态只能
 用于静止场景诊断，`planner_control` 保持为 0。存在有效差分速度时，状态来源标记为
 `latest_pose_extrapolated`。
-Planner 输出的是下一 10 ms 规划步的
-绝对角；当前串口协议没有速度、加速度字段，日志中的规划速度与加速度不会发送。
+`planner_yaw_deg/pitch_deg` 是下一 10 ms 规划步的状态角；当前模型的首步角度
+由反馈角和角速度确定。检查 MPC 波形时应对比同为 100 ms 的
+`planner_*_100ms_deg` 与 `planner_target_*_100ms_deg`，并同时查看求解状态。
+实际下发角看 `tx_command_yaw_deg/pitch_deg`；串口协议没有速度、加速度字段。
 真机入口将本帧 Aimer 已选的装甲板 ID 传给 Planner，整条预测轨迹固定该物理板；
 当 Aimer 未给出有效瞄点时，Planner 保留原有最近距离选板行为。日志中的
 `aim_armor_id`、`planner_target_yaw_deg` 和 `diagnostic_yaw_deg` 可用于检查两者是否一致。

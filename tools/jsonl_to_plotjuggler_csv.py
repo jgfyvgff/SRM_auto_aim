@@ -38,6 +38,11 @@ PLANNER_COLUMNS = (
     "planner_pitch_deg",
     "planner_target_yaw_deg",
     "planner_target_pitch_deg",
+    # 用相同的 100 ms 时刻比较规划轨迹与参考波形。
+    "planner_yaw_100ms_deg",
+    "planner_pitch_100ms_deg",
+    "planner_target_yaw_100ms_deg",
+    "planner_target_pitch_100ms_deg",
     # 角速度：planner 期望的（MPC 速度项）与云台实测的，放在一起看滞后与超调。
     "planner_yaw_vel_rad_s",
     "planner_pitch_vel_rad_s",
