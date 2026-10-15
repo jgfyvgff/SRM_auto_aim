@@ -68,6 +68,7 @@ const std::string kKeys =
     "{gain|-1|临时覆盖 YAML 增益，负数表示沿用 YAML}"
     "{max-frames|0|采集指定数量的非空图像后退出，0 表示持续运行}"
     "{raw-frame-dir||保存未旋转、未绘制的原始 BGR 图像}"
+    "{replay-frame-dir||保存离线算法回放用的无损 PNG 帧序列；需同时启用 debug-jsonl}"
     "{quality-metrics|false|将亮度、裁剪比例和清晰度写入 JSONL}";
 
 double duration_ms(Clock::time_point begin, Clock::time_point end)
@@ -617,6 +618,11 @@ int main(int argc, char * argv[])
         const bool show = cli.get<bool>("show");
         const bool quality_metrics = cli.get<bool>("quality-metrics");
         real_auto_aim::DebugRecorder recorder(cli.get<std::string>("debug-jsonl"));
+        const auto replay_frame_dir = cli.get<std::string>("replay-frame-dir");
+        if (!replay_frame_dir.empty() && !recorder.enabled()) {
+            throw std::invalid_argument(
+                "--replay-frame-dir requires --debug-jsonl so each image has synchronized inputs");
+        }
         std::unique_ptr<tools::Plotter> udp_plotter;
         if (cli.get<bool>("debug-udp")) {
             // 复用仿真 PlotJuggler 的 UDP 接收端口，真机帧无需经过 ROS2 转发。
@@ -661,6 +667,23 @@ int main(int argc, char * argv[])
         std::uint64_t saved_frame_count = 0;
         std::uint64_t captured_frame_count = 0;
         const auto raw_frame_dir = cli.get<std::string>("raw-frame-dir");
+        const auto save_replay_frame =
+            [&replay_frame_dir, &captured_frame_count](const cv::Mat & image) {
+                if (replay_frame_dir.empty()) return std::string{};
+                const std::filesystem::path output_dir(replay_frame_dir);
+                std::filesystem::create_directories(output_dir);
+                std::ostringstream filename;
+                filename << "frame_" << std::setfill('0') << std::setw(6)
+                         << captured_frame_count << ".png";
+                const auto output_path = output_dir / filename.str();
+                // 回放帧必须与 JSONL 一一对应；写盘失败时中止采集，避免留下不完整数据集。
+                if (!cv::imwrite(output_path.string(), image)) {
+                    throw std::runtime_error(
+                        "Failed to save replay frame: " + output_path.string());
+                }
+                return filename.str();
+            };
+        std::optional<Clock::time_point> replay_time_origin;
         const auto save_raw_frame =
             [&raw_frame_dir, &captured_frame_count](const cv::Mat & image) {
                 if (raw_frame_dir.empty() || image.empty()) return;
@@ -783,12 +806,17 @@ int main(int argc, char * argv[])
             }
             ++captured_frame_count;
             save_raw_frame(image);
+            const auto replay_frame_file = save_replay_frame(image);
             if (image.cols != config.image_width || image.rows != config.image_height) {
                 throw std::runtime_error("Camera frame size differs from calibration image_size");
             }
             const auto frame_read_at = Clock::now();
             auto sample = timing_json(timing, frame_read_at);
             sample["captured_frame"] = captured_frame_count;
+            if (!replay_frame_file.empty()) {
+                sample["replay_schema_version"] = 1;
+                sample["replay_frame_file"] = replay_frame_file;
+            }
             sample["image_width"] = image.cols;
             sample["image_height"] = image.rows;
             sample["tx_enabled"] = enable_tx;
@@ -821,6 +849,12 @@ int main(int argc, char * argv[])
                 continue;
             }
             const auto image_timestamp = *image_time;
+            if (!replay_time_origin) replay_time_origin = image_timestamp;
+            if (!replay_frame_file.empty()) {
+                sample["replay_time_s"] =
+                    std::chrono::duration<double>(
+                        image_timestamp - *replay_time_origin).count();
+            }
             const auto received_at = Clock::now();
             if (image_timestamp > received_at ||
                 received_at - image_timestamp > config.max_image_age) {
@@ -889,6 +923,12 @@ int main(int argc, char * argv[])
                 continue;
             }
 
+            if (!replay_frame_file.empty()) {
+                sample["replay_gimbal_to_world_w"] = feedback->gimbal_to_world.w();
+                sample["replay_gimbal_to_world_x"] = feedback->gimbal_to_world.x();
+                sample["replay_gimbal_to_world_y"] = feedback->gimbal_to_world.y();
+                sample["replay_gimbal_to_world_z"] = feedback->gimbal_to_world.z();
+            }
             solver.set_gimbal_to_world(feedback->gimbal_to_world);
             // tracker_ms 必须只覆盖 tracker.track：检测与反馈等待已移到它之前，
             // 不能再沿用 detector_end 作为起点，否则等待时间会被误计入 Tracker。
@@ -923,6 +963,11 @@ int main(int argc, char * argv[])
             // 产生不可解释的诊断；真实弹速存在时始终优先使用反馈值。
             const double aimer_speed =
                 !measured_speed && tx_use_nominal_speed ? planner_debug_speed : bullet_speed;
+            if (!replay_frame_file.empty()) {
+                sample["replay_aimer_offset_ms"] =
+                    duration_ms(image_timestamp, aimer_start);
+                sample["replay_aimer_bullet_speed_mps"] = aimer_speed;
+            }
             const auto diagnostic = aimer.aim(targets, image_timestamp, aimer_speed);
             const auto finished_at = Clock::now();
 
@@ -932,6 +977,11 @@ int main(int argc, char * argv[])
             sample["planner_yaw_deg"] = nullptr;
             sample["planner_pitch_deg"] = nullptr;
             const auto planner_start = Clock::now();
+            if (!replay_frame_file.empty()) {
+                sample["replay_planner_offset_ms"] =
+                    duration_ms(image_timestamp, planner_start);
+                sample["replay_planner_enabled"] = false;
+            }
             // temp_lost 期间 Tracker 仍返回预测目标；默认保持最后的瞄准角。
             // 可选外推仅在短暂丢帧时使用，并降低角速度权限；是否减少恢复跳变需实车复验。
             // 外推帧 planner_control 记 0、fire_flag 恒 0。
@@ -984,6 +1034,15 @@ int main(int argc, char * argv[])
                     sample["planner_measured_pitch_deg"] = motion->pitch_rad * 180.0 / CV_PI;
                     sample["planner_measured_yaw_vel_rad_s"] = motion->yaw_vel_rad_s;
                     sample["planner_measured_pitch_vel_rad_s"] = motion->pitch_vel_rad_s;
+                }
+                if (!replay_frame_file.empty()) {
+                    sample["replay_planner_enabled"] = true;
+                    sample["replay_planner_state_yaw_rad"] = planner_state.yaw;
+                    sample["replay_planner_state_yaw_vel_rad_s"] = planner_state.yaw_vel;
+                    sample["replay_planner_state_pitch_rad"] = planner_state.pitch;
+                    sample["replay_planner_state_pitch_vel_rad_s"] = planner_state.pitch_vel;
+                    sample["replay_planner_has_measured_velocity"] = has_measured_velocity;
+                    sample["replay_planner_bullet_speed_mps"] = planning_speed;
                 }
                 sample["planner_state_yaw_deg"] = planner_state.yaw * 180.0 / CV_PI;
                 sample["planner_state_pitch_deg"] = planner_state.pitch * 180.0 / CV_PI;

@@ -58,6 +58,9 @@ target_link_libraries(real_serial_feedback PUBLIC io Eigen3::Eigen Threads::Thre
 add_executable(standard_srm src/standard_srm.cpp)
 target_link_libraries(standard_srm
     ${OpenCV_LIBS} fmt::fmt yaml-cpp auto_aim tools io real_serial_feedback)
+add_executable(standard_srm_replay src/standard_srm_replay.cpp)
+target_link_libraries(standard_srm_replay
+    ${OpenCV_LIBS} fmt::fmt yaml-cpp auto_aim tools io)
 
 add_executable(capture calibration/capture.cpp)
 add_executable(calibrate_camera calibration/calibrate_camera.cpp)

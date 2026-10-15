@@ -440,6 +440,38 @@ Tracker 字段可在 PlotJuggler 的数据列表中选择，例如
 `tracker_radius_variance_m2` 和 `tracker_observation_accepted`。
 该选项只发送诊断数据，不启用云台控制。
 
+### 真机视频帧离线重跑
+
+要在后续修改 Detector、Tracker、Aimer 或 Planner 后，基于同一批图像重新生成波形，
+采集时同时保存回放输入 JSONL 和无损 PNG 帧。帧目录与 JSONL 需要一起保留：
+
+```bash
+./build/standard_srm configs/real_auto_aim.yaml \
+  --port=/dev/ttyACM0 \
+  --max-frames=1500 \
+  --debug-jsonl=/tmp/real6_replay/input.jsonl \
+  --replay-frame-dir=/tmp/real6_replay/frames
+```
+
+离线回放不会打开相机或串口；它按采集时的图像时间、匹配云台姿态和规划状态，
+重新运行当前编译的视觉与瞄准代码：
+
+```bash
+./build/standard_srm_replay configs/real_auto_aim.yaml \
+  --input-jsonl=/tmp/real6_replay/input.jsonl \
+  --frames-dir=/tmp/real6_replay/frames \
+  --output-jsonl=/tmp/real6_replay/replayed.jsonl
+
+python3 tools/jsonl_to_plotjuggler_csv.py \
+  --input=/tmp/real6_replay/replayed.jsonl \
+  --output=/tmp/real6_replay/replayed.csv \
+  --preset=planner
+```
+
+也可以用现有 `tools/plot_planner_jsonl.py` 直接从回放 JSONL 生成曲线图。
+旧 JSONL 和 `--raw-frame-dir` 保存的 JPEG 没有逐帧匹配姿态，不能用于这种算法重跑；
+需要按上述选项重新采集。PNG 写盘是同步的，采集期间会增加磁盘 I/O。
+
 ### Tracker 自动分析
 
 启动 `sim_detector_probe` 后，可使用独立脚本订阅 `/sim_aim/debug`，自动比较静止与小陀螺阶段的车辆中心、速度、半径和装甲板 ID 切换情况：
