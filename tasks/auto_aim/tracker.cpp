@@ -645,7 +645,9 @@ bool Tracker::update_target(
       const auto distance_gate_passed = distance_error <= association_max_distance_error_;
       const auto mahalanobis_gate_passed =
         match.mahalanobis_distance <= association_max_mahalanobis_distance_;
-      // 只与物理相邻的两块板比较；背面板投影重合不能否决当前板。
+      // 相邻板的相对距离判断无法排除同号双板：所有模型预测都偏在一侧时，
+      // 远处的另一块板仍可能通过。误差超过一个检测框长边时宁可短时丢失，
+      // 不能让错误观测把 EKF 拉到另一块板。
       bool image_model_gate_passed = !check_image_model;
       if (check_image_model && predicted_centers.size() == 4 && observed_image_center) {
         const auto previous_id = (reference_id + 3) % 4;
@@ -655,7 +657,11 @@ bool Tracker::update_target(
         const auto adjacent_error = std::min(
           cv::norm(*observed_image_center - predicted_centers[previous_id]),
           cv::norm(*observed_image_center - predicted_centers[next_id]));
-        image_model_gate_passed = reference_error <= adjacent_error;
+        const int observed_extent_px = std::max(armor.box.width, armor.box.height);
+        image_model_gate_passed =
+          observed_extent_px > 0 &&
+          reference_error <= adjacent_error &&
+          reference_error <= observed_extent_px;
       }
       // 关联接受由综合分数、绝对空间误差和 EKF 创新协方差共同决定。
       // 固定 angle_gate 只用于诊断，避免在小陀螺状态下拒绝统计上合理的观测；
