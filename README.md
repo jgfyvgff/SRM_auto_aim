@@ -351,6 +351,9 @@ Tracker 捕获阶段的类别投票须通过当前目标关联与 EKF 后验后�
 `tracker_nis_fresh=true` 时，`tracker_last_nis` 属于本帧。
 `tracker_observation_accepted` 包含首次捕获，`tracker_model_name` 与
 `tracker_tracked_label` 分别表示保留的物理模型和当前接受的检测标签。
+`standard_radius` 与 `standard_radius_variance` 设置标准四装甲模型的半径初值和
+EKF 初始方差；关闭 `standard_geometry_constraint` 时，它们提供软先验，不会在每帧
+强制固定半径。半径差仍沿用现有设置，待取得实测尺寸后再处理。
 标准四装甲的候选还须满足图像中心误差不超过本帧检测框长边；
 同号相邻板即使通过三维关联评分，也不能从远处更新同一模型 ID。
 被拒绝的帧会进入现有暂失流程，可能增加短时保持帧，需用新采集复核。

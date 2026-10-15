@@ -54,8 +54,10 @@ relock_name_votes: 5
 max_temp_lost_count: 15
 outpost_max_temp_lost_count: 75
 tracker_max_prediction_gap: 0.3
-# 当前 real6 诊断关闭四装甲半径硬约束，以观察拟合半径。
-# 单块装甲观测下半径仍可能漂移；旧的 0.18 m 不是本车已确认的实测尺寸。
+# 实测标准四装甲旋转半径约 0.22 m，作为 EKF 初始软先验。
+# 方差单位为 m²，对应 2 cm 标准差；硬约束仍关闭，后续观测可以继续修正半径。
+standard_radius: 0.22
+standard_radius_variance: 0.0004
 standard_geometry_constraint: false
 # 倒装相机不使用固定俯仰、零滚转的逐点 yaw 重投影优化。
 yaw_optimization_enabled: false
