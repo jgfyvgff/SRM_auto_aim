@@ -76,6 +76,12 @@ PLANNER_COLUMNS = (
     "radius",
     "diagnostic_yaw_deg",
     "diagnostic_pitch_deg",
+    "aim_control",
+    "aim_armor_id",
+    "tracker_generation",
+    "tracker_observation_accepted",
+    "association_gate_passed_count",
+    "current_model_center_error_px",
     "planner_bullet_speed_mps",
     "planner_feedback_age_ms",
     "planner_feedback_interval_ms",
@@ -170,7 +176,18 @@ def build_table(records, columns, enum_columns=ENUM_COLUMNS, legend=None):
     rows = []
     for index, record in enumerate(records):
         row = [format_number(axis_ms[index] / 1000.0), str(index)]
-        row += [format_number(scalar(record.get(column))) for column in columns]
+        row += [
+            format_number(
+                math.nan
+                if record.get("aim_control") == 0
+                and column in (
+                    "diagnostic_yaw", "diagnostic_pitch",
+                    "diagnostic_yaw_deg", "diagnostic_pitch_deg", "aim_armor_id",
+                )
+                else scalar(record.get(column))
+            )
+            for column in columns
+        ]
         row += [
             str(legend[column].get(record.get(column), 0)) for column in enum_columns
         ]

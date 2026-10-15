@@ -312,6 +312,8 @@ python3 -m unittest tests/test_real_tracker_analyzer.py
 日志中的 `diagnostic_yaw/pitch` 只是 Aimer 计算结果；默认运行时 `tx_enabled=false`，
 无控制输出。启用发送后，应结合 `tx_command_sent` 和 `tx_command_mode` 判断上位机
 是否将无开火目标放入发送邮箱。
+无有效瞄点时这些角度和 `aim_armor_id` 记为 null；转换旧日志到 CSV 时，
+`aim_control=0` 的占位零角度也会转为 nan，避免出现虚假的 0° 尖峰。
 `planner_status=ok` 表示求解器收敛；`unconverged_diagnostic` 表示求解器未收敛，
 但仍记录有限的诊断轨迹。`planner_control` 只表示 MPC 控制判据，不是命令发送标志；
 实际发送统一使用有限的 `planner_target_yaw/pitch` 参考角。可比较 `planner_measured_*`、

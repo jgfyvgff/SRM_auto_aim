@@ -489,16 +489,21 @@ void append_aim_json(Json & sample, const auto_aim::Aimer & aimer, const io::Com
 {
     sample["aim_control"] = command.control ? 1 : 0;
     sample["aim_shoot"] = command.shoot ? 1 : 0;
-    sample["diagnostic_yaw"] = command.yaw;
-    sample["diagnostic_pitch"] = command.pitch;
-    sample["diagnostic_yaw_deg"] = command.yaw * 180.0 / CV_PI;
-    sample["diagnostic_pitch_deg"] = command.pitch * 180.0 / CV_PI;
+    // 无有效瞄点时的零角度只是返回占位值，不能画成真实的瞄准尖峰。
+    const bool aim_valid = command.control && aimer.debug_aim_point.valid;
+    sample["diagnostic_yaw"] = aim_valid ? Json(command.yaw) : Json(nullptr);
+    sample["diagnostic_pitch"] = aim_valid ? Json(command.pitch) : Json(nullptr);
+    sample["diagnostic_yaw_deg"] =
+        aim_valid ? Json(command.yaw * 180.0 / CV_PI) : Json(nullptr);
+    sample["diagnostic_pitch_deg"] =
+        aim_valid ? Json(command.pitch * 180.0 / CV_PI) : Json(nullptr);
     sample["prediction_dt"] = aimer.debug_prediction_dt;
     sample["delay_time"] = aimer.debug_delay_time;
     sample["base_prediction_dt"] = aimer.debug_base_prediction_dt;
     sample["fly_time"] = aimer.debug_fly_time;
-    sample["aim_armor_id"] = aimer.debug_aim_point.armor_id;
-    if (!aimer.debug_aim_point.valid) return;
+    sample["aim_armor_id"] =
+        aim_valid ? Json(aimer.debug_aim_point.armor_id) : Json(nullptr);
+    if (!aim_valid) return;
     const auto & future = aimer.debug_aim_point.xyza;
     sample["future_x"] = future[0];
     sample["future_y"] = future[1];
