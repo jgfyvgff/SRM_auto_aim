@@ -52,12 +52,35 @@ Tracker::Tracker(const std::string & config_path, Solver & solver)
   standard_height_delta_variance_ = yaml["standard_height_delta_variance"].IsDefined()
                                       ? yaml["standard_height_delta_variance"].as<double>()
                                       : 1.0;
+  standard_initial_velocity_variance_ =
+    yaml["standard_initial_velocity_variance"].IsDefined()
+      ? yaml["standard_initial_velocity_variance"].as<double>()
+      : 64.0;
+  standard_initial_angular_velocity_variance_ =
+    yaml["standard_initial_angular_velocity_variance"].IsDefined()
+      ? yaml["standard_initial_angular_velocity_variance"].as<double>()
+      : 0.1;
+  standard_capture_bootstrap_updates_ =
+    yaml["standard_capture_bootstrap_updates"].IsDefined()
+      ? yaml["standard_capture_bootstrap_updates"].as<int>()
+      : 0;
+  standard_translation_acceleration_variance_ =
+    yaml["standard_translation_acceleration_variance"].IsDefined()
+      ? yaml["standard_translation_acceleration_variance"].as<double>()
+      : 100.0;
+  if (yaml["standard_max_angular_velocity"].IsDefined()) {
+    standard_max_angular_velocity_ = yaml["standard_max_angular_velocity"].as<double>();
+  }
   association_max_angle_error_ = yaml["association_max_angle_error"].IsDefined()
                                    ? yaml["association_max_angle_error"].as<double>()
                                    : std::numeric_limits<double>::infinity();
   association_max_score_ = yaml["association_max_score"].IsDefined()
                              ? yaml["association_max_score"].as<double>()
                              : 0.8;
+  association_id_switch_score_margin_ =
+    yaml["association_id_switch_score_margin"].IsDefined()
+      ? yaml["association_id_switch_score_margin"].as<double>()
+      : 0.0;
   association_max_position_error_ = yaml["association_max_position_error"].IsDefined()
                                       ? yaml["association_max_position_error"].as<double>()
                                       : 0.45;
@@ -89,9 +112,28 @@ Tracker::Tracker(const std::string & config_path, Solver & solver)
   if (
     standard_radius_ <= 0.05 || standard_radius_ >= 0.5 ||
     standard_radius_variance_ <= 0 || standard_radius_delta_variance_ <= 0 ||
-    standard_height_delta_variance_ <= 0)
+    standard_height_delta_variance_ <= 0 ||
+    !std::isfinite(standard_initial_velocity_variance_) ||
+    standard_initial_velocity_variance_ <= 0 ||
+    !std::isfinite(standard_initial_angular_velocity_variance_) ||
+    standard_initial_angular_velocity_variance_ <= 0)
   {
     throw std::runtime_error("Invalid standard armor geometry configuration");
+  }
+  if (standard_capture_bootstrap_updates_ < 0 || standard_capture_bootstrap_updates_ > 100) {
+    throw std::runtime_error("Invalid standard_capture_bootstrap_updates");
+  }
+  if (
+    !std::isfinite(standard_translation_acceleration_variance_) ||
+    standard_translation_acceleration_variance_ <= 0.0)
+  {
+    throw std::runtime_error("Invalid standard_translation_acceleration_variance");
+  }
+  if (
+    standard_max_angular_velocity_ &&
+    (!std::isfinite(*standard_max_angular_velocity_) || *standard_max_angular_velocity_ <= 0.0))
+  {
+    throw std::runtime_error("Invalid standard_max_angular_velocity");
   }
   if (
     !std::isinf(association_max_angle_error_) &&
@@ -101,6 +143,13 @@ Tracker::Tracker(const std::string & config_path, Solver & solver)
   }
   if (association_max_score_ <= 0.0 || association_max_score_ > 3.141592653589793 * 3.0) {
     throw std::runtime_error("Invalid association_max_score configuration");
+  }
+  if (
+    !std::isfinite(association_id_switch_score_margin_) ||
+    association_id_switch_score_margin_ < 0.0 ||
+    association_id_switch_score_margin_ > association_max_score_)
+  {
+    throw std::runtime_error("Invalid association_id_switch_score_margin configuration");
   }
   if (
     !std::isfinite(association_max_position_error_) ||
@@ -474,9 +523,14 @@ bool Tracker::set_target(
     // 单块装甲无法同时确定车辆中心和半径，因此 r 保持软先验；
     // 半径差 l 可按实测尺寸单独约束，不必连带固定 r。
     Eigen::VectorXd P0_dig{
-      {1, 64, 1, 64, 1, 64, 0.4, 0.1, standard_radius_variance_,
+      {1, standard_initial_velocity_variance_,
+       1, standard_initial_velocity_variance_,
+       1, standard_initial_velocity_variance_, 0.4,
+       standard_initial_angular_velocity_variance_, standard_radius_variance_,
        standard_radius_delta_variance_, standard_height_delta_variance_}};
     target_ = Target(armor, t, standard_radius_, 4, P0_dig);
+    target_.set_translation_acceleration_variance(
+      standard_translation_acceleration_variance_);
     if (standard_geometry_constraint_) {
       // 整体几何约束会同时固定 r 和 l。
       target_.set_geometry_constraint(
@@ -494,6 +548,7 @@ bool Tracker::set_target(
   tracked_label_ = armor.name;
   observation_accepted_ = true;
   target_generation_++;
+  successful_capture_updates_ = 0;
   return true;
 }
 
@@ -524,12 +579,19 @@ bool Tracker::update_target(
     bool position_gate_passed;
     bool distance_gate_passed;
     bool mahalanobis_gate_passed;
+    bool image_model_gate_enabled;
     bool image_model_gate_passed;
     bool gate_passed;
+    double image_reference_error_px;
+    double image_adjacent_error_px;
+    double image_observed_extent_px;
   };
-  const auto rank_of = [](const Candidate & candidate) {
+  const auto rank_of = [this](const Candidate & candidate) {
     return AssociationRank{
-      candidate.gate_passed, candidate.association_score,
+      candidate.gate_passed,
+      association_score_for_ranking(
+        candidate.gate_passed, candidate.association_score, candidate.id,
+        target_.last_id, association_id_switch_score_margin_),
       candidate.mahalanobis_distance};
   };
 
@@ -545,6 +607,8 @@ bool Tracker::update_target(
     return center * 0.25F;
   };
   const bool check_image_model = geometry_branch_ == "standard_four";
+  const bool image_model_gate_enabled = association_image_model_gate_enabled(
+    check_image_model, successful_capture_updates_, standard_capture_bootstrap_updates_);
   std::vector<cv::Point2f> predicted_centers;
   if (check_image_model) {
     for (const auto & predicted : predicted_armors) {
@@ -573,7 +637,11 @@ bool Tracker::update_target(
     debug.position_gate_passed = candidate.position_gate_passed;
     debug.distance_gate_passed = candidate.distance_gate_passed;
     debug.mahalanobis_gate_passed = candidate.mahalanobis_gate_passed;
+    debug.image_model_gate_enabled = candidate.image_model_gate_enabled;
     debug.image_model_gate_passed = candidate.image_model_gate_passed;
+    debug.image_reference_error_px = candidate.image_reference_error_px;
+    debug.image_adjacent_error_px = candidate.image_adjacent_error_px;
+    debug.image_observed_extent_px = candidate.image_observed_extent_px;
     debug.score = candidate.association_score;
     debug.position_error = candidate.position_error;
     debug.distance_error = candidate.distance_error;
@@ -656,20 +724,26 @@ bool Tracker::update_target(
       // 相邻板的相对距离判断无法排除同号双板：所有模型预测都偏在一侧时，
       // 远处的另一块板仍可能通过。误差超过一个检测框长边时宁可短时丢失，
       // 不能让错误观测把 EKF 拉到另一块板。
-      bool image_model_gate_passed = !check_image_model;
+      bool image_model_gate_passed = !image_model_gate_enabled;
+      double image_reference_error_px = -1.0;
+      double image_adjacent_error_px = -1.0;
+      double image_observed_extent_px = -1.0;
       if (check_image_model && predicted_centers.size() == 4 && observed_image_center) {
         const auto previous_id = (reference_id + 3) % 4;
         const auto next_id = (reference_id + 1) % 4;
-        const auto reference_error =
+        image_reference_error_px =
           cv::norm(*observed_image_center - predicted_centers[reference_id]);
-        const auto adjacent_error = std::min(
+        image_adjacent_error_px = std::min(
           cv::norm(*observed_image_center - predicted_centers[previous_id]),
           cv::norm(*observed_image_center - predicted_centers[next_id]));
         const int observed_extent_px = std::max(armor.box.width, armor.box.height);
-        image_model_gate_passed =
-          observed_extent_px > 0 &&
-          reference_error <= adjacent_error &&
-          reference_error <= observed_extent_px;
+        image_observed_extent_px = static_cast<double>(observed_extent_px);
+        if (image_model_gate_enabled) {
+          image_model_gate_passed =
+            observed_extent_px > 0 &&
+            image_reference_error_px <= image_adjacent_error_px &&
+            image_reference_error_px <= image_observed_extent_px;
+        }
       }
       // 关联接受由综合分数、绝对空间误差和 EKF 创新协方差共同决定。
       // 固定 angle_gate 只用于诊断，避免在小陀螺状态下拒绝统计上合理的观测；
@@ -684,7 +758,9 @@ bool Tracker::update_target(
         position_error, distance_error, position_angle_error, distance_angle_error,
         association_score, orientation_error, bearing_error, angle_gate_passed,
         score_gate_passed, position_gate_passed, distance_gate_passed,
-        mahalanobis_gate_passed, image_model_gate_passed, gate_passed};
+        mahalanobis_gate_passed, image_model_gate_enabled, image_model_gate_passed,
+        gate_passed,
+        image_reference_error_px, image_adjacent_error_px, image_observed_extent_px};
       if (
         association_debug_.model_candidate_count <
         static_cast<int>(association_debug_.model_candidates.size()))
@@ -728,12 +804,16 @@ bool Tracker::update_target(
   const auto & best_candidate = candidates.front();
   // 通过关联门限后仍需检查 EKF 后验；拒绝时保持预测状态和诊断候选。
   // 预测关联和更新后验共用距离门限，避免候选虽通过门控却被一次 EKF 更新拉出门限。
+  const auto max_abs_angular_velocity =
+    geometry_branch_ == "standard_four" ? standard_max_angular_velocity_ : std::nullopt;
   const bool accepted = best_candidate.gate_passed && target_.update(
-    best_candidate.solved_armor, best_candidate.id, association_max_distance_error_);
+    best_candidate.solved_armor, best_candidate.id, association_max_distance_error_,
+    max_abs_angular_velocity);
   association_debug_.candidates[0].accepted = accepted;
   if (accepted) {
     association_debug_.accepted_count = 1;
     observation_accepted_ = true;
+    bool capture_rebuilt = false;
     if (relabel_vote) {
       const ArmorName previous = tracked_label_;
       const bool restore_standard_geometry =
@@ -747,6 +827,7 @@ bool Tracker::update_target(
         std::list<Armor> relabeled{best_candidate.solved_armor};
         relabeled.front().name = relabel_vote->name;
         set_target(relabeled, t, true);
+        capture_rebuilt = true;
         // 几何模型已更换，重新累计捕获帧，不能沿用旧模型的 tracking 状态。
         state_ = "detecting";
         detect_count_ = 0;
@@ -763,6 +844,9 @@ bool Tracker::update_target(
     }
     // 探针会从原始检测列表读取已接收的位姿，因此把选中的分支回填给原对象。
     *best_candidate.armor = best_candidate.solved_armor;
+    if (!capture_rebuilt && geometry_branch_ == "standard_four") {
+      ++successful_capture_updates_;
+    }
   }
 
   // 门限或后验拒绝时进入 temp_lost；持续拒绝由原状态机触发重捕获。

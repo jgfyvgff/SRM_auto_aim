@@ -52,4 +52,10 @@ void Camera::read_timed(cv::Mat & img, FrameTiming & timing)
   camera_->read_timed(img, timing);
 }
 
+bool Camera::read_timed_for(
+  cv::Mat & img, FrameTiming & timing, std::chrono::milliseconds timeout)
+{
+  return camera_->read_timed_for(img, timing, timeout);
+}
+
 }  // namespace io

@@ -33,7 +33,8 @@ public:
         std::chrono::milliseconds wait_after_image = std::chrono::milliseconds(30),
         bool enable_tx = false,
         std::chrono::milliseconds tx_period = std::chrono::milliseconds(20),
-        std::chrono::milliseconds tx_ttl = std::chrono::milliseconds(100));
+        std::chrono::milliseconds tx_ttl = std::chrono::milliseconds(100),
+        std::chrono::milliseconds hold_ttl = std::chrono::milliseconds(200));
     ~SerialFeedbackReader();
 
     SerialFeedbackReader(const SerialFeedbackReader &) = delete;
@@ -49,12 +50,15 @@ public:
     // 当发送未启用时仅记录请求，不触碰串口；调用方可用同一套代码做只读诊断。
     void set_command(const io::srm_auto_aim::CommandFrame & command);
 
-    // 暂时失去目标时保持最后的无开火角度；保持模式不受普通跟踪命令 TTL 限制。
-    // 仅调用 clear_command 或 stop 才会终止保持，不能用于真实开火。
+    // 暂时失去目标时保持最后的无开火角度；保持模式有独立的最长有效期。
+    // 每帧须刷新，避免视觉线程卡住时无限发送旧角度；不能用于真实开火。
     void set_hold_command(const io::srm_auto_aim::CommandFrame & command);
 
     // 清除当前目标。发送模式下后台线程会按周期发零命令，尽快使视觉目标失效。
     void clear_command();
+
+    // 退出或故障时禁止新的目标进入邮箱；重复调用安全，串口线程随后发送零命令。
+    void inhibit_commands() noexcept;
 
     // 获取成功写入串口的累计计数；只统计 transport::send 正常返回的帧。
     TxStats tx_stats();
@@ -72,6 +76,7 @@ private:
     const bool enable_tx_;
     const std::chrono::milliseconds tx_period_;
     const std::chrono::milliseconds tx_ttl_;
+    const std::chrono::milliseconds hold_ttl_;
     // mutex 只保护缓存、命令邮箱、发送计数、状态和异常；串口 I/O 与 join 均在锁外。
     std::mutex mutex_;
     std::condition_variable changed_;
@@ -79,6 +84,7 @@ private:
     std::exception_ptr failure_;
     std::optional<io::srm_auto_aim::CommandFrame> pending_command_;
     bool hold_command_ = false;
+    bool commands_inhibited_ = false;
     Clock::time_point command_updated_at_ = Clock::now();
     TxStats tx_stats_;
     std::atomic<bool> stop_requested_{false};

@@ -31,7 +31,8 @@ public:
   ArmorType armor_type;
   ArmorPriority priority;
   bool jumped;
-  int last_id;  // debug only
+  // 上一次成功吸收的模型 ID；关联排序和装甲切换计数共用，未吸收的帧不更新。
+  int last_id;
 
   Target() = default;
   Target(
@@ -50,11 +51,12 @@ public:
 
   // 已知几何目标按最大旋转直径检查后验；其他目标保持距离噪声检查。
   bool update(const Armor & armor);
-  // 使用已经完成关联的 ID 更新 EKF。可选后验距离门限与 Tracker 的关联门限同单位（m）；
-  // 超限时恢复更新前的完整滤波状态，避免方位观测把中心拉出已接受的距离范围。
+  // 使用已经完成关联的 ID 更新 EKF。可选后验距离门限单位为 m，角速度上限单位为 rad/s；
+  // 任一门限超限时恢复更新前的完整滤波状态，避免异常观测污染后续预测。
   bool update(
     const Armor & armor, int id,
-    std::optional<double> max_posterior_distance_error = std::nullopt);
+    std::optional<double> max_posterior_distance_error = std::nullopt,
+    std::optional<double> max_abs_angular_velocity = std::nullopt);
 
   // 对机械尺寸已知的车辆持续约束两组装甲半径。variance 的单位为 m²；
   // 该约束会清除几何量与运动状态的错误互协方差，避免不可观测半径退化。
@@ -65,6 +67,8 @@ public:
   void set_radius_delta_constraint(double radius_delta, double variance);
   // 方位观测噪声方差，单位 rad²；关联和 EKF 更新共用此值。
   void set_measurement_bearing_variance(double variance);
+  // 设置平移加速度方差，单位 m²/s⁴；用于控制中心速度预测协方差增长。
+  void set_translation_acceleration_variance(double variance);
 
   Eigen::VectorXd ekf_x() const;
   const tools::ExtendedKalmanFilter & ekf() const;
@@ -98,10 +102,12 @@ private:
   std::optional<GeometryConstraint> geometry_constraint_;
   std::optional<std::pair<double, double>> radius_delta_constraint_;
   double measurement_bearing_variance_ = 4e-3;
+  double translation_acceleration_variance_ = 100.0;
 
   bool update_ypda(
     const Armor & armor, int id,
-    std::optional<double> max_posterior_distance_error);  // yaw pitch distance angle
+    std::optional<double> max_posterior_distance_error,
+    std::optional<double> max_abs_angular_velocity);  // yaw pitch distance angle
   void apply_geometry_constraint();
   Eigen::Matrix4d measurement_noise(const Armor & armor) const;
 

@@ -1,6 +1,7 @@
 #include "hikrobot.hpp"
 
 #include <libusb-1.0/libusb.h>
+#include <utility>
 
 #include "device_clock_mapper.hpp"
 #include "tools/logger.hpp"
@@ -57,6 +58,16 @@ void HikRobot::read_timed(cv::Mat & img, FrameTiming & timing)
 
   img = data.img;
   timing = data.timing;
+}
+
+bool HikRobot::read_timed_for(
+  cv::Mat & img, FrameTiming & timing, std::chrono::milliseconds timeout)
+{
+  CameraData data;
+  if (!queue_.pop_for(data, timeout)) return false;
+  img = std::move(data.img);
+  timing = data.timing;
+  return true;
 }
 
 

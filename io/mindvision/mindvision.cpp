@@ -1,6 +1,7 @@
 #include "mindvision.hpp"
 
 #include <libusb-1.0/libusb.h>
+#include <utility>
 
 #include <stdexcept>
 
@@ -57,6 +58,17 @@ void MindVision::read(cv::Mat & img, std::chrono::steady_clock::time_point & tim
 
   img = data.img;
   timestamp = data.timestamp;
+}
+
+bool MindVision::read_timed_for(
+  cv::Mat & img, FrameTiming & timing, std::chrono::milliseconds timeout)
+{
+  CameraData data;
+  if (!queue_.pop_for(data, timeout)) return false;
+  img = std::move(data.img);
+  timing.host_received_at = data.timestamp;
+  timing.timestamp_source = FrameTimestampSource::HostReceive;
+  return true;
 }
 
 void MindVision::open()

@@ -12,13 +12,14 @@ SerialFeedbackReader::SerialFeedbackReader(
     std::chrono::milliseconds wait_after_image,
     bool enable_tx,
     std::chrono::milliseconds tx_period,
-    std::chrono::milliseconds tx_ttl)
+    std::chrono::milliseconds tx_ttl,
+    std::chrono::milliseconds hold_ttl)
     : transport_(std::move(transport)), buffer_(256, max_gap),
       wait_after_image_(wait_after_image), enable_tx_(enable_tx),
-      tx_period_(tx_period), tx_ttl_(tx_ttl)
+      tx_period_(tx_period), tx_ttl_(tx_ttl), hold_ttl_(hold_ttl)
 {
     if (!transport_ || wait_after_image_.count() <= 0 || tx_period_.count() <= 0 ||
-        tx_ttl_.count() <= 0) {
+        tx_ttl_.count() <= 0 || hold_ttl_.count() <= 0) {
         throw std::invalid_argument("Invalid serial feedback reader configuration");
     }
     // 全部共享成员构造完成后启动线程，避免线程访问半初始化的对象。
@@ -33,16 +34,16 @@ void SerialFeedbackReader::receive_loop() noexcept
         auto next_tx = Clock::now();
         while (!stop_requested_.load()) {
             // 发送与接收必须由同一线程访问 transport，避免 USB CDC 读写交叉破坏协议状态。
-            // 普通跟踪命令过期后回退零命令；显式保持角度用于暂时无目标，
-            // 直到调用方清空或恢复普通跟踪，不能把过期的跟踪命令自动当保持命令。
+            // 跟踪与保持分别限时；即使视觉线程卡住，串口线程也会独立回退零命令。
             const auto before_io = Clock::now();
             if (enable_tx_ && before_io >= next_tx) {
                 io::srm_auto_aim::CommandFrame command{};
                 bool has_fresh_command = false;
                 {
                     std::lock_guard<std::mutex> lock(mutex_);
-                    if (pending_command_ &&
-                        (hold_command_ || before_io - command_updated_at_ <= tx_ttl_)) {
+                    const auto ttl = hold_command_ ? hold_ttl_ : tx_ttl_;
+                    if (!commands_inhibited_ && pending_command_ &&
+                        before_io - command_updated_at_ <= ttl) {
                         command = *pending_command_;
                         has_fresh_command = true;
                     }
@@ -134,6 +135,9 @@ void SerialFeedbackReader::set_command(const io::srm_auto_aim::CommandFrame & co
     if (state_ != State::Running) {
         throw std::runtime_error("Serial feedback reader is stopped");
     }
+    if (commands_inhibited_) {
+        throw std::runtime_error("Serial commands inhibited during shutdown");
+    }
     pending_command_ = command;
     hold_command_ = false;
     command_updated_at_ = Clock::now();
@@ -151,6 +155,9 @@ void SerialFeedbackReader::set_hold_command(
     if (state_ != State::Running) {
         throw std::runtime_error("Serial feedback reader is stopped");
     }
+    if (commands_inhibited_) {
+        throw std::runtime_error("Serial commands inhibited during shutdown");
+    }
     pending_command_ = command;
     hold_command_ = true;
     command_updated_at_ = Clock::now();
@@ -164,6 +171,16 @@ void SerialFeedbackReader::clear_command()
     command_updated_at_ = Clock::now();
 }
 
+void SerialFeedbackReader::inhibit_commands() noexcept
+{
+    // 只改邮箱状态，不持锁访问串口。已经开始发送的单帧由 stop() 的零命令收尾。
+    std::lock_guard<std::mutex> lock(mutex_);
+    commands_inhibited_ = true;
+    pending_command_.reset();
+    hold_command_ = false;
+    command_updated_at_ = Clock::now();
+}
+
 TxStats SerialFeedbackReader::tx_stats()
 {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -172,6 +189,7 @@ TxStats SerialFeedbackReader::tx_stats()
 
 void SerialFeedbackReader::stop() noexcept
 {
+    inhibit_commands();
     stop_requested_.store(true);
     changed_.notify_all();
     if (worker_.joinable()) worker_.join();

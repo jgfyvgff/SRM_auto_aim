@@ -20,6 +20,8 @@ public:
   ~HikRobot() override;
   void read(cv::Mat & img, std::chrono::steady_clock::time_point & timestamp) override;
   void read_timed(cv::Mat & img, FrameTiming & timing) override;
+  bool read_timed_for(
+    cv::Mat & img, FrameTiming & timing, std::chrono::milliseconds timeout) override;
 
 private:
   struct CameraData

@@ -62,6 +62,9 @@ public:
   {
     read(img, timing.host_received_at);
   }
+  // 后台采集线程需定期检查停止请求；超时返回 false，图像和时标保持未定义。
+  virtual bool read_timed_for(
+    cv::Mat & img, FrameTiming & timing, std::chrono::milliseconds timeout) = 0;
 };
 
 class Camera
@@ -72,6 +75,8 @@ public:
     const CameraSettingsOverride & overrides = {});
   void read(cv::Mat & img, std::chrono::steady_clock::time_point & timestamp);
   void read_timed(cv::Mat & img, FrameTiming & timing);
+  bool read_timed_for(
+    cv::Mat & img, FrameTiming & timing, std::chrono::milliseconds timeout);
 
 private:
   std::unique_ptr<CameraBase> camera_;

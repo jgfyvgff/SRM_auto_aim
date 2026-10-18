@@ -2,7 +2,7 @@
 #include <cmath>
 #include <iostream>
 
-#include "src/sim_capture_time.hpp"
+#include "src/real_auto_aim/sim_capture_time.hpp"
 
 int main()
 {

@@ -55,7 +55,14 @@ add_library(serial_gimbal_pose STATIC calibration/serial_gimbal_pose.cpp)
 target_link_libraries(serial_gimbal_pose PUBLIC io Eigen3::Eigen Threads::Threads)
 add_library(real_serial_feedback STATIC src/real_auto_aim/serial_feedback_reader.cpp)
 target_link_libraries(real_serial_feedback PUBLIC io Eigen3::Eigen Threads::Threads)
-add_executable(standard_srm src/standard_srm.cpp)
+add_executable(standard_srm
+    src/standard_srm.cpp
+    src/real_auto_aim/standard_srm_app.cpp
+    src/real_auto_aim/frame_diagnostics.cpp
+    src/real_auto_aim/tx_command_controller.cpp
+    src/real_auto_aim/frame_processor.cpp
+    src/real_auto_aim/frame_pipeline.cpp
+    src/real_auto_aim/frame_stages.cpp)
 target_link_libraries(standard_srm
     ${OpenCV_LIBS} fmt::fmt yaml-cpp auto_aim tools io real_serial_feedback)
 add_executable(standard_srm_replay src/standard_srm_replay.cpp)
@@ -109,6 +116,10 @@ add_test(NAME device_clock_mapper_test COMMAND device_clock_mapper_test)
 add_executable(real_serial_feedback_test tests/real_serial_feedback_test.cpp)
 target_link_libraries(real_serial_feedback_test real_serial_feedback)
 add_test(NAME real_serial_feedback_test COMMAND real_serial_feedback_test)
+add_executable(frame_pipeline_test
+    tests/frame_pipeline_test.cpp src/real_auto_aim/frame_pipeline.cpp)
+target_link_libraries(frame_pipeline_test ${OpenCV_LIBS} Threads::Threads fmt::fmt)
+add_test(NAME frame_pipeline_test COMMAND frame_pipeline_test)
 add_executable(tx_command_limiter_test tests/tx_command_limiter_test.cpp)
 add_test(NAME tx_command_limiter_test COMMAND tx_command_limiter_test)
 add_executable(dynamic_roi_test tests/dynamic_roi_test.cpp)
@@ -118,6 +129,8 @@ add_executable(tracker_name_vote_test tests/tracker_name_vote_test.cpp)
 add_test(NAME tracker_name_vote_test COMMAND tracker_name_vote_test)
 add_executable(tracker_capture_test tests/tracker_capture_test.cpp)
 target_link_libraries(tracker_capture_test ${OpenCV_LIBS} fmt::fmt yaml-cpp tools io auto_aim)
+add_executable(tracker_association_policy_test tests/tracker_association_policy_test.cpp)
+add_test(NAME tracker_association_policy_test COMMAND tracker_association_policy_test)
 add_test(
     NAME tracker_capture_test
     COMMAND tracker_capture_test ${PROJECT_SOURCE_DIR}/configs/real_auto_aim.yaml)

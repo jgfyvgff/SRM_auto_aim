@@ -100,8 +100,9 @@ int main(int argc, char ** argv)
     require(relabel.target_generation() == 1, "relabel rebuilt EKF");
     require(relabel.geometry_branch() == "standard_four" &&
             relabel.geometry_constraint_active(), "relabel lost geometry constraint");
-    require(std::abs(targets.front().ekf_x()[8] - 0.18) < 1e-9,
-            "relabel changed constrained radius");
+    // 真机配置只硬约束两组半径差；半径本身是允许更新的软先验。
+    require(std::abs(targets.front().ekf_x()[9]) < 1e-9,
+            "relabel changed constrained radius delta");
     require(relabel.association_debug().accepted_count == 1 &&
             relabel.observation_accepted(), "continuous observation was not accepted");
 

@@ -127,7 +127,7 @@ void Target::predict(double dt)
     v1 = 10;   // 前哨站加速度方差
     v2 = 0.1;  // 前哨站角加速度方差
   } else {
-    v1 = 100;  // 加速度方差
+    v1 = translation_acceleration_variance_;
     v2 = 100;  // 角加速度方差
   }
   auto a = dt * dt * dt * dt / 4;
@@ -216,7 +216,8 @@ bool Target::update(const Armor & armor)
 }
 
 bool Target::update(
-  const Armor & armor, int id, std::optional<double> max_posterior_distance_error)
+  const Armor & armor, int id, std::optional<double> max_posterior_distance_error,
+  std::optional<double> max_abs_angular_velocity)
 {
   if (
     max_posterior_distance_error &&
@@ -224,10 +225,18 @@ bool Target::update(
   {
     throw std::invalid_argument("Invalid posterior distance error limit");
   }
+  if (
+    max_abs_angular_velocity &&
+    (!std::isfinite(*max_abs_angular_velocity) || *max_abs_angular_velocity <= 0.0))
+  {
+    throw std::invalid_argument("Invalid angular velocity limit");
+  }
   if (id < 0 || id >= armor_num_) return false;
 
   // 状态机计数只在 EKF 更新成功后提交；失败帧不应伪装成一次装甲切换。
-  if (!update_ypda(armor, id, max_posterior_distance_error)) return false;
+  if (!update_ypda(armor, id, max_posterior_distance_error, max_abs_angular_velocity)) {
+    return false;
+  }
 
   if (id != 0) jumped = true;//如果id不为0，说明跳过了
 
@@ -275,6 +284,14 @@ void Target::set_measurement_bearing_variance(double variance)
   measurement_bearing_variance_ = variance;
 }
 
+void Target::set_translation_acceleration_variance(double variance)
+{
+  if (!std::isfinite(variance) || variance <= 0.0) {
+    throw std::invalid_argument("Invalid translation acceleration variance");
+  }
+  translation_acceleration_variance_ = variance;
+}
+
 void Target::apply_geometry_constraint()
 {
   if (!geometry_constraint_.has_value() && !radius_delta_constraint_.has_value()) return;
@@ -298,7 +315,8 @@ void Target::apply_geometry_constraint()
 }
 
 bool Target::update_ypda(
-  const Armor & armor, int id, std::optional<double> max_posterior_distance_error)
+  const Armor & armor, int id, std::optional<double> max_posterior_distance_error,
+  std::optional<double> max_abs_angular_velocity)
 {
   const double prior_error =
     (armor.xyz_in_world - h_armor_xyz(ekf_.x, id)).norm();
@@ -347,6 +365,9 @@ bool Target::update_ypda(
       !std::isfinite(posterior_distance_error) ||
       posterior_distance_error > *max_posterior_distance_error;
   }
+  // 仿真车辆的物理转速有已知上限；拒绝超限后验，避免错误 ID 将角速度状态推高。
+  const bool angular_velocity_limit_exceeded = max_abs_angular_velocity &&
+    (!std::isfinite(ekf_.x[7]) || std::abs(ekf_.x[7]) > *max_abs_angular_velocity);
   // 仿真中机械尺寸已知时，一次更新若让三维残差恶化超过整个装甲旋转直径，
   // 就不能再用相邻装甲切换解释；其他目标保持原距离观测噪声判据。
   const double allowed_growth = geometry_constraint_
@@ -358,7 +379,7 @@ bool Target::update_ypda(
                                   : std::sqrt(R(2, 2));
   if (
     !ekf_.x.allFinite() || !ekf_.P.allFinite() || !std::isfinite(posterior_error) ||
-    posterior_distance_limit_exceeded ||
+    posterior_distance_limit_exceeded || angular_velocity_limit_exceeded ||
     posterior_error > prior_error + allowed_growth)
   {
     ekf_ = prior_ekf;

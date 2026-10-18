@@ -32,7 +32,12 @@ struct AssociationCandidateDebug
   bool distance_gate_passed = false;
   bool mahalanobis_gate_passed = false;
   // 四装甲模型中仅与相邻板比较图像距离，防止沿用旧 ID 或被背面板误拒绝。
+  bool image_model_gate_enabled = false;
   bool image_model_gate_passed = false;
+  // 图像门限的三个比较量，单位 px；未完成投影或不使用该门限时为 -1。
+  double image_reference_error_px = -1.0;
+  double image_adjacent_error_px = -1.0;
+  double image_observed_extent_px = -1.0;
   double score = 0.0;
   // 关联候选与预测装甲板的三维位置残差，单位为 m，仅用于诊断。
   double position_error = 0.0;
@@ -130,10 +135,22 @@ private:
   double standard_radius_variance_;
   double standard_radius_delta_variance_;
   double standard_height_delta_variance_;
+  // 标准四装甲捕获时的平移速度初始方差，单位 m²/s²。
+  double standard_initial_velocity_variance_;
+  // 标准四装甲捕获时的角速度初始方差，单位 (rad/s)²。
+  double standard_initial_angular_velocity_variance_;
+  // 捕获后累计多少次有效更新才启用图像选板门；0 表示保持原有立即启用行为。
+  int standard_capture_bootstrap_updates_;
+  // 标准四装甲目标的平移加速度方差，单位 m²/s⁴。
+  double standard_translation_acceleration_variance_;
+  // 可选标准四装甲角速度上限，单位 rad/s；只由仿真配置启用。
+  std::optional<double> standard_max_angular_velocity_;
   // 固定角度诊断阈值，单位为 rad；实际接受由综合分数和 EKF 协方差门控决定。
   double association_max_angle_error_;
   // 综合关联分数门限，单位为等效 rad；用于拒绝其他机器人同名装甲板。
   double association_max_score_;
+  // 旧 ID 仍通过门限时，新 ID 的排序附加分数，单位为等效 rad；只影响排序。
+  double association_id_switch_score_margin_;
   // 远距离下角度归一化可能掩盖较大的三维误差，单位为 m。
   double association_max_position_error_;
   double association_max_distance_error_;
@@ -155,6 +172,8 @@ private:
   bool observation_accepted_ = false;
   // 每次 set_target 成功后递增，用于区分真实 ID 跳变和 Tracker 重初始化。
   std::uint64_t target_generation_ = 0;
+  // set_target 的首帧只初始化状态；仅累计其后的成功关联更新。
+  int successful_capture_updates_ = 0;
   // 捕获阶段的类别投票窗口；只在还没进入 tracking 时用于改判类别。
   int relock_name_window_;
   int relock_name_votes_;

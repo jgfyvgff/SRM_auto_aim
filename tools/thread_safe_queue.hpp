@@ -1,6 +1,7 @@
 #ifndef TOOLS__THREAD_SAFE_QUEUE_HPP
 #define TOOLS__THREAD_SAFE_QUEUE_HPP
 
+#include <chrono>
 #include <condition_variable>
 #include <functional>
 #include <iostream>
@@ -49,6 +50,18 @@ public:
 
     value = queue_.front();
     queue_.pop();
+  }
+
+  // 限时等待仅用于可停止的采集循环；超时不改变队列内容。
+  bool pop_for(T & value, std::chrono::milliseconds timeout)
+  {
+    std::unique_lock<std::mutex> lock(mutex_);
+    if (!not_empty_condition_.wait_for(lock, timeout, [this] { return !queue_.empty(); })) {
+      return false;
+    }
+    value = std::move(queue_.front());
+    queue_.pop();
+    return true;
   }
 
   T pop()

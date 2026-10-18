@@ -46,6 +46,8 @@ tracker_max_prediction_gap: 0.3
 # 装甲板姿态与视线方位诊断阈值，单位为 rad；不单独拒绝 EKF 协方差门控通过的观测。
 association_max_angle_error: 0.35
 association_max_score: 0.8
+# 旧 ID 仍通过门限时，新 ID 排序分数增加此值；单位等效 rad，不改变门限。
+association_id_switch_score_margin: 0.05
 # 远距离下角度归一化可能掩盖较大的空间误差，绝对误差单位为 m。
 association_max_position_error: 0.45
 association_max_distance_error: 0.45
@@ -58,6 +60,17 @@ measurement_bearing_variance: 4e-5
 # 实际前后半径约 0.21177m，左右半径约 0.21117m。
 standard_geometry_constraint: true
 standard_radius: 0.21147
+# 标准四装甲目标初次捕获时的中心速度先验方差，单位 m²/s²。
+# 0.04 对应 0.2 m/s 标准差，适配固定位置旋转场景；仅仿真配置覆盖，其他配置保留代码默认值 64。
+standard_initial_velocity_variance: 0.04
+# 捕获时角速度先验方差，单位 (rad/s)²；64 对应 8 rad/s 标准差，覆盖高速转动初值。
+standard_initial_angular_velocity_variance: 64.0
+# 前 4 次成功关联只用空间与统计门限，待角速度有观测支撑后再启用图像选板门。
+standard_capture_bootstrap_updates: 4
+# 平移加速度方差，单位 m²/s⁴；当前固定位置旋转仿真先设为 1.0。
+standard_translation_acceleration_variance: 1.0
+# Daedalus 模拟器底盘转速为 7.42 rad/s；略留余量，拒绝不符合物理范围的滤波后验。
+standard_max_angular_velocity: 8.0
 standard_radius_variance: 1e-4
 standard_radius_delta_variance: 1e-4
 standard_height_delta_variance: 1e-4

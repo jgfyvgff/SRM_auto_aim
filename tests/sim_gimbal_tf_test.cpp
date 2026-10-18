@@ -6,7 +6,7 @@
 #include <iostream>
 #include <memory>
 
-#include "src/sim_gimbal_tf.hpp"
+#include "src/real_auto_aim/sim_gimbal_tf.hpp"
 
 int main()
 {

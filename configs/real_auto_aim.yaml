@@ -54,6 +54,10 @@ relock_name_votes: 5
 max_temp_lost_count: 15
 outpost_max_temp_lost_count: 75
 tracker_max_prediction_gap: 0.3
+# EKF 观测方位角噪声方差，单位 rad²。
+measurement_bearing_variance: 4e-3
+# 旧 ID 仍通过门限时，新 ID 排序分数增加此值；单位等效 rad，不改变门限。
+association_id_switch_score_margin: 0.05
 # 实测标准四装甲旋转半径约 0.22 m，作为 EKF 初始软先验。
 # 方差单位为 m²，对应 2 cm 标准差；硬约束仍关闭，后续观测可以继续修正半径。
 standard_radius: 0.22
@@ -62,6 +66,13 @@ standard_geometry_constraint: false
 # 两组装甲的实测旋转半径差为 0；方差单位 m²，对应 1 mm 标准差。
 standard_radius_delta_constraint: true
 standard_radius_delta_variance: 1e-6
+# EKF 初始状态协方差与平移过程噪声；数值沿用当前代码默认值。
+# 中心速度方差单位 m²/s²，角速度方差单位 (rad/s)²。
+standard_initial_velocity_variance: 64.0
+standard_initial_angular_velocity_variance: 0.1
+# 平移加速度过程噪声方差单位 m²/s⁴，高度差初始方差单位 m²。
+standard_translation_acceleration_variance: 100.0
+standard_height_delta_variance: 1.0
 # 倒装相机不使用固定俯仰、零滚转的逐点 yaw 重投影优化。
 yaw_optimization_enabled: false
 

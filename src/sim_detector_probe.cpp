@@ -25,8 +25,8 @@
 #include "tasks/auto_aim/planner/planner.hpp"
 #include "tasks/auto_aim/shooter.hpp"
 #include "tools/math_tools.hpp"
-#include "src/sim_capture_time.hpp"
-#include "src/sim_gimbal_tf.hpp"
+#include "src/real_auto_aim/sim_capture_time.hpp"
+#include "src/real_auto_aim/sim_gimbal_tf.hpp"
 
 class SimDetectorProbe final : public rclcpp::Node
 {
@@ -870,6 +870,7 @@ private:
             get_logger(),
             "[Probe] association rejected: candidates=%d primary_id=%d "
             "gate=%d angle=%d score=%d position=%d distance=%d mahalanobis=%d "
+            "image_model_enabled=%d image_model=%d "
             "mahalanobis_distance=%.3f score=%.3f position_error=%.3f distance_error=%.3f "
             "raw_yaw=%.3f optimized_yaw=%.3f yaw_correction=%.3f model_yaw=%.3f "
             "orientation_error=%.3f bearing_error=%.3f",
@@ -881,6 +882,8 @@ private:
             primary.position_gate_passed,
             primary.distance_gate_passed,
             primary.mahalanobis_gate_passed,
+            primary.image_model_gate_enabled,
+            primary.image_model_gate_passed,
             primary.mahalanobis_distance,
             primary.score,
             primary.position_error,
@@ -915,6 +918,16 @@ private:
             candidate.distance_gate_passed ? 1 : 0;
           plot_data[prefix + "_mahalanobis_gate_passed"] =
             candidate.mahalanobis_gate_passed ? 1 : 0;
+          plot_data[prefix + "_image_model_gate_enabled"] =
+            candidate.image_model_gate_enabled ? 1 : 0;
+          plot_data[prefix + "_image_model_gate_passed"] =
+            candidate.image_model_gate_passed ? 1 : 0;
+          plot_data[prefix + "_image_reference_error_px"] =
+            candidate.image_reference_error_px;
+          plot_data[prefix + "_image_adjacent_error_px"] =
+            candidate.image_adjacent_error_px;
+          plot_data[prefix + "_image_observed_extent_px"] =
+            candidate.image_observed_extent_px;
           plot_data[prefix + "_score"] = candidate.score;
           plot_data[prefix + "_position_error"] = candidate.position_error;
           plot_data[prefix + "_distance_error"] = candidate.distance_error;
@@ -951,9 +964,22 @@ private:
                 static_cast<float>(candidate.image_x),
                 static_cast<float>(candidate.image_y)))
               : std::nullopt;
+          const cv::Point2f observed_center(
+            static_cast<float>(candidate.image_x),
+            static_cast<float>(candidate.image_y));
+          const auto * matched_armor = find_associated_armor(
+            tracker_armors, target.name, target.armor_type, observed_center);
           plot_data[prefix + "_truth_corner_error"] = -1.0;
+          // 同时保存检测器原始角点和 TF 真值投影，便于离线区分点序与定位偏差。
           for (int corner_id = 0; corner_id < 4; ++corner_id) {
-            plot_data[prefix + "_truth_corner_error_" + std::to_string(corner_id)] = -1.0;
+            const auto suffix = std::to_string(corner_id);
+            plot_data[prefix + "_truth_corner_error_" + suffix] = -1.0;
+            plot_data[prefix + "_detected_corner_" + suffix + "_x"] =
+              matched_armor != nullptr ? matched_armor->points[corner_id].x : -1.0;
+            plot_data[prefix + "_detected_corner_" + suffix + "_y"] =
+              matched_armor != nullptr ? matched_armor->points[corner_id].y : -1.0;
+            plot_data[prefix + "_truth_projected_corner_" + suffix + "_x"] = -1.0;
+            plot_data[prefix + "_truth_projected_corner_" + suffix + "_y"] = -1.0;
           }
           plot_data[prefix + "_truth_valid"] = truth ? 1 : 0;
           if (truth) {
@@ -971,21 +997,23 @@ private:
               truth->second_image_error;
             plot_data[prefix + "_truth_match_margin"] =
               truth->second_image_error - truth->image_error;
-            const cv::Point2f observed_center(
-              static_cast<float>(candidate.image_x),
-              static_cast<float>(candidate.image_y));
-            const auto * matched_armor = find_associated_armor(
-              tracker_armors, target.name, target.armor_type, observed_center);
-            if (matched_armor != nullptr) {
-              const auto truth_points = solver_.reproject_armor_pose(
-                truth->position, truth->orientation, target.armor_type);
-              if (truth_points.size() == 4) {
-                plot_data[prefix + "_truth_corner_error"] =
-                  mean_corner_error(matched_armor->points, truth_points);
-                for (std::size_t corner_id = 0; corner_id < truth_points.size(); ++corner_id) {
-                  plot_data[prefix + "_truth_corner_error_" + std::to_string(corner_id)] =
+            const auto truth_points = solver_.reproject_armor_pose(
+              truth->position, truth->orientation, target.armor_type);
+            if (truth_points.size() == 4) {
+              for (std::size_t corner_id = 0; corner_id < truth_points.size(); ++corner_id) {
+                const auto suffix = std::to_string(corner_id);
+                plot_data[prefix + "_truth_projected_corner_" + suffix + "_x"] =
+                  truth_points[corner_id].x;
+                plot_data[prefix + "_truth_projected_corner_" + suffix + "_y"] =
+                  truth_points[corner_id].y;
+                if (matched_armor != nullptr) {
+                  plot_data[prefix + "_truth_corner_error_" + suffix] =
                     cv::norm(matched_armor->points[corner_id] - truth_points[corner_id]);
                 }
+              }
+              if (matched_armor != nullptr) {
+                plot_data[prefix + "_truth_corner_error"] =
+                  mean_corner_error(matched_armor->points, truth_points);
               }
             }
             // armor_N 的局部法向可能与 PnP 装甲板坐标相反，因此同时检查
@@ -1019,6 +1047,11 @@ private:
             {"score", candidate.score},
             {"position_error", candidate.position_error},
             {"distance_error", candidate.distance_error},
+            {"image_model_gate_enabled", candidate.image_model_gate_enabled},
+            {"image_model_gate_passed", candidate.image_model_gate_passed},
+            {"image_reference_error_px", candidate.image_reference_error_px},
+            {"image_adjacent_error_px", candidate.image_adjacent_error_px},
+            {"image_observed_extent_px", candidate.image_observed_extent_px},
             {"orientation_error", candidate.orientation_error},
             {"bearing_error", candidate.bearing_error},
             {"raw_yaw", candidate.raw_yaw},

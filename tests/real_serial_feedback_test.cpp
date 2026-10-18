@@ -396,6 +396,68 @@ void test_hold_survives_ttl_and_returns_to_normal_expiry()
     reader.stop();
 }
 
+void test_inhibit_clears_hold_and_rejects_new_targets()
+{
+    using namespace std::chrono_literals;
+    auto stream = std::make_unique<CapturingStream>();
+    auto * fake = stream.get();
+    auto transport = std::make_unique<SrmAutoAimTransport>(std::move(stream));
+    SerialFeedbackReader reader(
+        std::move(transport), 100ms, 10ms, true, 5ms, 20ms);
+
+    reader.set_hold_command({12.5F, -3.0F, 0});
+    reader.inhibit_commands();
+    reader.inhibit_commands();
+    bool rejected = false;
+    try {
+        reader.set_command({5.0F, 0.0F, 0});
+    } catch (const std::runtime_error &) {
+        rejected = true;
+    }
+    require(rejected, "Inhibited TX accepted a new target");
+    require(fake->wait_for_write_count(2), "Inhibited TX did not continue sending");
+    io::srm_auto_aim::CommandFrame command;
+    require(io::srm_auto_aim::decode(fake->latest_write(), command) &&
+                command.yaw_deg == 0.0F && command.pitch_deg == 0.0F &&
+                command.fire_flag == 0,
+            "Inhibited TX did not clear the held target");
+    reader.stop();
+}
+
+void test_hold_expires_when_visual_worker_stalls()
+{
+    using namespace std::chrono_literals;
+    auto stream = std::make_unique<CapturingStream>();
+    auto * fake = stream.get();
+    auto transport = std::make_unique<SrmAutoAimTransport>(std::move(stream));
+    SerialFeedbackReader reader(
+        std::move(transport), 100ms, 10ms, true, 5ms, 20ms, 40ms);
+
+    reader.set_hold_command({12.5F, -3.0F, 0});
+    bool observed_hold = false;
+    const auto deadline = Clock::now() + 500ms;
+    while (Clock::now() < deadline) {
+        io::srm_auto_aim::CommandFrame command;
+        if (io::srm_auto_aim::decode(fake->latest_write(), command) &&
+            std::abs(command.yaw_deg - 12.5F) < 1e-4F) {
+            observed_hold = true;
+            break;
+        }
+        std::this_thread::sleep_for(1ms);
+    }
+    require(observed_hold, "Held target was never sent");
+    std::this_thread::sleep_for(50ms);
+    const auto before_write = fake->write_count();
+    require(fake->wait_for_write_count(before_write + 1),
+            "TX worker stopped sending after hold expired");
+    io::srm_auto_aim::CommandFrame command;
+    require(io::srm_auto_aim::decode(fake->latest_write(), command) &&
+                command.yaw_deg == 0.0F && command.pitch_deg == 0.0F &&
+                command.fire_flag == 0,
+            "Expired hold target did not become a zero command");
+    reader.stop();
+}
+
 // 发送周期必须跟绝对时间表对齐，不能把每次串口读的耗时相位逐周期累加到间隔里。
 void test_tx_period_does_not_accumulate_read_phase()
 {
@@ -430,6 +492,8 @@ int main()
     test_no_data_and_background_failure();
     test_tx_is_no_fire_and_expires_to_zero();
     test_hold_survives_ttl_and_returns_to_normal_expiry();
+    test_inhibit_clears_hold_and_rejects_new_targets();
+    test_hold_expires_when_visual_worker_stalls();
     test_tx_period_does_not_accumulate_read_phase();
     std::cout << "real_serial_feedback_test passed\n";
 }
