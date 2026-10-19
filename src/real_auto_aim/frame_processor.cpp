@@ -113,16 +113,19 @@ FrameProcessResult FrameProcessor::process(
         return result;
     }
     const auto aimer_start = Clock::now();
-    // 名义弹速只在显式无开火测试中替代 0 弹速，避免 Aimer/Planner 因飞行时间无效
-    // 产生不可解释的诊断；真实弹速存在时始终优先使用反馈值。
-    const double aimer_speed =
-        !measured_speed && tx_controller.nominal() ? planner_debug_speed : bullet_speed;
+    // Aimer 只生成诊断结果：有效反馈原样使用；反馈无效时用配置的名义弹速继续诊断。
+    // 这不改变 Planner/TX 的控制门控，且将实际输入速度和来源写入 JSONL 供离线核对。
+    const double aimer_speed = measured_speed ? bullet_speed : planner_debug_speed;
+    sample["aimer_speed_source"] =
+        measured_speed ? "feedback" : "diagnostic_nominal";
+    sample["aimer_bullet_speed_mps"] = aimer_speed;
     if (replay_enabled) {
         sample["replay_aimer_offset_ms"] =
             duration_ms(image_timestamp, aimer_start);
         sample["replay_aimer_bullet_speed_mps"] = aimer_speed;
     }
-    const auto diagnostic = aimer_.aim(targets, image_timestamp, aimer_speed);
+    const auto diagnostic =
+        aimer_.aim_with_explicit_speed(targets, image_timestamp, aimer_speed);
     const auto finished_at = Clock::now();
 
     sample["planner_status"] = "no_tracking_target";

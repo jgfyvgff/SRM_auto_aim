@@ -3,6 +3,7 @@
 #include <yaml-cpp/yaml.h>
 
 #include <cmath>
+#include <utility>
 #include <vector>
 
 #include "tools/logger.hpp"
@@ -31,6 +32,20 @@ io::Command Aimer::aim(
   std::list<Target> targets, std::chrono::steady_clock::time_point timestamp, double bullet_speed,
   bool to_now)
 {
+  return aim_impl(std::move(targets), timestamp, bullet_speed, to_now, true);
+}
+
+io::Command Aimer::aim_with_explicit_speed(
+  std::list<Target> targets, std::chrono::steady_clock::time_point timestamp, double bullet_speed,
+  bool to_now)
+{
+  return aim_impl(std::move(targets), timestamp, bullet_speed, to_now, false);
+}
+
+io::Command Aimer::aim_impl(
+  std::list<Target> targets, std::chrono::steady_clock::time_point timestamp, double bullet_speed,
+  bool to_now, bool allow_legacy_speed_fallback)
+{
   debug_prediction_dt = -1.0;
   debug_high_speed_mode = false;
   debug_delay_time = 0.0;
@@ -41,6 +56,11 @@ io::Command Aimer::aim(
     lock_id_ = -1;
     return {false, false, 0, 0};
   }
+  if (!allow_legacy_speed_fallback &&
+      (!std::isfinite(bullet_speed) || bullet_speed <= 0.0)) {
+    debug_aim_point.valid = false;
+    return {false, false, 0, 0};
+  }
   auto target = targets.front();
 
   // 高速标记只服务于选板策略；它不再决定一个人为指定的预测延迟。
@@ -49,7 +69,8 @@ io::Command Aimer::aim(
   const auto aim_start = std::chrono::steady_clock::now();
   debug_delay_time = to_now ? tools::delta_time(aim_start, timestamp) : 0.0;
 
-  if (bullet_speed < 14) bullet_speed = 23;
+  // 旧调用者保留历史行为；真机显式弹速接口不会把有效低速反馈替换成 23 m/s。
+  if (allow_legacy_speed_fallback && bullet_speed < 14) bullet_speed = 23;
 
   // timestamp 是观测时间；to_now 模式直接预测到当前实际计算时刻。
   // 不再叠加高低速固定延迟，也不在离线模式中伪造 5ms 算法耗时。
