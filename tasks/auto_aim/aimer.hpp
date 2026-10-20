@@ -44,6 +44,8 @@ public:
   io::Command aim_with_explicit_speed(
     std::list<Target> targets, std::chrono::steady_clock::time_point timestamp, double bullet_speed,
     bool to_now = true);
+  // 仅更新调用方持有的预测锁；规划未来选板时不会改变真实 Aimer 的跨帧锁。
+  AimPoint preview_aim_point(const Target & target, int & preview_lock_id) const;
 
   io::Command aim(
     std::list<Target> targets, std::chrono::steady_clock::time_point timestamp, double bullet_speed,
@@ -63,7 +65,7 @@ private:
   int lock_id_ = -1;
   double decision_speed_;
 
-  AimPoint choose_aim_point(const Target & target, int & lock_id);
+  AimPoint choose_aim_point(const Target & target, int & lock_id) const;
 };
 
 }  // namespace auto_aim

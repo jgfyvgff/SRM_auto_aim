@@ -24,9 +24,10 @@ inline RealConfig validate_real_config(const YAML::Node & yaml)
     if (yaml["pose_frame"].as<std::string>() != "gimbal") {
         throw std::invalid_argument("Real pose_frame must be gimbal");
     }
+    const auto yolo_name = yaml["yolo_name"].as<std::string>();
     if (yaml["camera_name"].as<std::string>() != "hikrobot" ||
-        yaml["yolo_name"].as<std::string>() != "yolov5") {
-        throw std::invalid_argument("Real entry requires hikrobot camera and yolov5");
+        (yolo_name != "yolov5" && yolo_name != "yolov8")) {
+        throw std::invalid_argument("Real entry requires hikrobot camera and yolov5/yolov8");
     }
     const auto color = yaml["enemy_color"].as<std::string>();
     if (color != "red" && color != "blue") {

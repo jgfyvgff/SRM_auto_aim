@@ -35,7 +35,19 @@ int main(int argc, char * argv[])
     require(config.max_image_age == std::chrono::milliseconds(200),
             "Unexpected image age gate");
 
+    auto v5 = YAML::Load(YAML::Dump(yaml));
+    v5["yolo_name"] = "yolov5";
+    real_auto_aim::validate_real_config(v5);
+
+    auto v8 = YAML::Load(YAML::Dump(yaml));
+    v8["yolo_name"] = "yolov8";
+    real_auto_aim::validate_real_config(v8);
+
     auto bad = YAML::Load(YAML::Dump(yaml));
+    bad["yolo_name"] = "unknown";
+    require_rejected(bad, "Unknown real detector was accepted");
+
+    bad = YAML::Load(YAML::Dump(yaml));
     bad["camera_matrix"] = YAML::Load("[1, 2]");
     require_rejected(bad, "Short camera_matrix was accepted");
 

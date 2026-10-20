@@ -23,6 +23,7 @@ FrameDetections FrameDetector::detect(const cv::Mat & image, Json & sample)
     FrameDetections result;
     const auto detector_start = Clock::now();
     auto armors = detector_.detect(image);
+    append_detector_debug_json(sample, detector_.debug_info(), armors);
     const auto detector_end = Clock::now();
     const auto detected = armors.size();
     // Tracker 会原地过滤装甲板；诊断必须保留检测器原始结果，避免把过滤后的列表当作检测结果。
@@ -152,9 +153,8 @@ FrameProcessResult FrameProcessor::process(
             duration_ms(image_timestamp, planner_start);
         sample["replay_planner_enabled"] = false;
     }
-    // temp_lost 期间 Tracker 仍返回预测目标；默认保持最后的瞄准角。
-    // 可选外推仅在短暂丢帧时使用，并降低角速度权限；是否减少恢复跳变需实车复验。
-    // 外推帧 planner_control 记 0、fire_flag 恒 0。
+    // temp_lost 短暂丢帧时继续使用 Tracker 预测目标规划；超过上限后保持上一条命令。
+    // temp_lost 外推直接使用 Tracker 预测角；fire_flag 始终为 0。
     const int temp_lost_frames = tracker_.temp_lost_count();
     const bool tx_extrapolating =
         tx_controller.follow_lost() && tracker_.state() == "temp_lost" &&
@@ -185,8 +185,8 @@ FrameProcessResult FrameProcessor::process(
         sample["planner_measured_yaw_vel_rad_s"] = 0.0;
         sample["planner_measured_pitch_vel_rad_s"] = 0.0;
         if (motion) {
-            // 串口只带主机收帧时间；将最近姿态按短时差分速度外推到规划时刻，
-            // 与同一时刻的 Target 状态对齐，仍不等同于下位机真实采样时刻。
+            // 差分速度仅保留作诊断；参考轨迹规划不依赖它作为控制初态。
+            // 串口只有主机收帧时间，不能视为下位机真实速度。
             const double motion_age_s =
                 std::chrono::duration<double>(planner_start - motion->received_at).count();
             planner_state = {
@@ -218,19 +218,23 @@ FrameProcessResult FrameProcessor::process(
         sample["planner_state_pitch_deg"] = planner_state.pitch * 180.0 / CV_PI;
         auto target = targets.front();
         target.predict(planner_start);
-        // 参考轨迹沿用 Aimer 的选板结果，避免近等距相邻板逐步互换。
+        // 当前板沿用 Aimer 的锁；未来板由同一选板规则在预测副本上决定。
         const std::optional<int> planner_armor_id =
-            diagnostic.control && aimer_.debug_aim_point.valid
+            diagnostic.control && aimer_.debug_aim_point.valid &&
+                    aimer_.debug_aim_point.armor_id >= 0
                 ? std::optional<int>{aimer_.debug_aim_point.armor_id}
                 : std::nullopt;
         const auto plan = planner_.plan(
-            target, planning_speed, planner_state, planner_armor_id);
+            target, planning_speed, planner_state, planner_armor_id,
+            planner_armor_id ? &aimer_ : nullptr);
+        sample["planner_preview_switch_ms"] = plan.preview_switch_step >= 0
+            ? Json(plan.preview_switch_step * auto_aim::DT * 1000.0)
+            : Json(nullptr);
         sample["planner_status"] =
             !plan.diagnostic_valid ? "invalid" :
             plan.solver_converged ? "ok" : "unconverged_diagnostic";
-        // 外推帧不进入控制判据，只用于把恢复阶跃摊平。
         sample["planner_control"] =
-            plan.control && has_measured_velocity && !tx_extrapolating ? 1 : 0;
+            plan.control && planner_armor_id.has_value() ? 1 : 0;
         sample["planner_solver_converged"] = plan.solver_converged;
         sample["planner_yaw_solver_status"] = plan.yaw_solver_status;
         sample["planner_pitch_solver_status"] = plan.pitch_solver_status;
@@ -241,6 +245,11 @@ FrameProcessResult FrameProcessor::process(
             sample["planner_target_pitch_deg"] = plan.target_pitch * 180.0 / CV_PI;
             sample["planner_yaw_deg"] = plan.yaw * 180.0 / CV_PI;
             sample["planner_pitch_deg"] = plan.pitch * 180.0 / CV_PI;
+            sample["planner_yaw_20ms_deg"] =
+                tools::limit_rad(plan.yaw + auto_aim::DT * plan.yaw_vel) *
+                    180.0 / CV_PI;
+            sample["planner_pitch_20ms_deg"] =
+                (plan.pitch + auto_aim::DT * plan.pitch_vel) * 180.0 / CV_PI;
             sample["planner_yaw_vel_rad_s"] = plan.yaw_vel;
             sample["planner_pitch_vel_rad_s"] = plan.pitch_vel;
             sample["planner_yaw_acc_rad_s2"] = plan.yaw_acc;
@@ -276,15 +285,19 @@ FrameProcessResult FrameProcessor::process(
         }
 
         if (command_allowed()) {
-            tx_controller.apply(
-                plan, planner_state, feedback, measured_speed,
-                has_measured_velocity, tx_extrapolating);
+            if (planner_armor_id) {
+                tx_controller.apply(
+                    plan, feedback, measured_speed, tx_extrapolating);
+            } else {
+                tx_controller.hold(feedback);
+            }
         }
     } else if (tx_controller.enabled() && command_allowed()) {
         tx_controller.hold(feedback);
     }
     sample["tx_command_sent"] = tx_controller.sent();
     sample["tx_command_mode"] = tx_controller.mode();
+    sample["tx_command_source"] = tx_controller.source();
     sample["tx_extrapolating"] = tx_controller.extrapolating();
     if (tx_controller.sent()) {
         sample["tx_command_yaw_deg"] = tx_controller.yaw();

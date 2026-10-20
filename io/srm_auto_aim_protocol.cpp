@@ -166,7 +166,7 @@ bool decode(const Bytes & bytes, FeedbackFrame & output)
 {
   if (bytes.size() != kFeedbackFrameSize || read_u16_le(bytes, 0) != kFeedbackBodyLength) {
     return false;
-  }//确保数据长度正确，且前两个字节表示的反馈体长度为26
+  }//确保数据长度正确，且前两个字节表示的反馈体长度为28
 
   if (read_i16_le(bytes, 2) != kGimbalRecordId || read_i16_le(bytes, 24) != kShootRecordId) {
     return false;

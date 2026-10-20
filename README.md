@@ -316,14 +316,21 @@ python3 -m unittest tests/test_real_tracker_analyzer.py
 `aim_control=0` 的占位零角度也会转为 nan，避免出现虚假的 0° 尖峰。
 `planner_status=ok` 表示求解器收敛；`unconverged_diagnostic` 表示求解器未收敛，
 但仍记录有限的诊断轨迹。`planner_control` 只表示 MPC 控制判据，不是命令发送标志；
-实际发送统一使用有限的 `planner_target_yaw/pitch` 参考角。可比较 `planner_measured_*`、
+当前 Aimer 选板有效且求解收敛时，Planner 以参考轨迹为初态，预览未来换板，
+发送 20 ms 规划角；未收敛时继续跟随有限的 `planner_target_yaw/pitch`。
+差分估计的云台速度只作诊断，不再是发送条件。选中的 MPC 规划角或目标参考角直接进入 TX，
+发送链路不再叠加速率或单步限幅。
+可比较 `planner_measured_*`、
 `planner_state_*`、`planner_target_*` 与 `planner_yaw_deg/pitch_deg`，并查看
 `planner_feedback_age_ms`、`planner_feedback_interval_ms`、`planner_ms`。
 `planner_feedback_interval_ms` 是用于速度差分的收帧时间跨度，不是串口或相机硬件时间。
 另有 `planner_*_100ms_deg`（参考与解算后 100 ms 角度）、每轴
 `planner_{yaw,pitch}_solver_status`、`planner_{yaw,pitch}_solver_iterations` 和
 `planner_{yaw,pitch}_{primal,dual}_residual_max`；状态 0 表示该轴收敛，残差为
-TinyMPC 原始数值，不是角度误差。100 ms 角度只用于查看轨迹趋势，不是下发命令；
+TinyMPC 原始数值，不是角度误差。100 ms 角度只用于查看轨迹趋势，不是下发命令；新增
+planner_yaw_20ms_deg/pitch_20ms_deg 用于核对 MPC 规划角与 TX 指令。
+`planner_preview_switch_ms` 记录预测窗口内首次换板距当前的时间；无换板时为 null。
+`tx_command_source` 标记 `mpc_reference_20ms`、`target_reference` 或 `hold`；
 `planner_control=0` 不代表没有发送角度命令，实际发送状态由 `tx_command_sent` 标记，
 普通跟踪命令使用 `tx_command_mode=tracking`。
 云台静止且无法形成可靠差分速度时，Planner 使用图像时刻已匹配的串口 yaw/pitch，
@@ -334,6 +341,16 @@ TinyMPC 原始数值，不是角度误差。100 ms 角度只用于查看轨迹�
 由反馈角和角速度确定。检查 MPC 波形时应对比同为 100 ms 的
 `planner_*_100ms_deg` 与 `planner_target_*_100ms_deg`，并同时查看求解状态。
 实际下发角看 `tx_command_yaw_deg/pitch_deg`；串口协议没有速度、加速度字段。
+启用 `--debug-jsonl` 后，每帧另附 `wire_trace_events`：`tx_target/tx_zero`
+记录主机串口写入的起止时间与实际写入角度，`rx_feedback` 逐条记录一次
+读取所解析出的全部反馈帧，包括 yaw/pitch/roll、原始 mode/color、弹速和
+批内顺序。同批帧共用一次读取的主机时间区间；控制缓存仍只取最后一帧，
+避免为没有协议时间戳的反馈编造采样间隔。`*_steady_ns` 只用于本次进程内
+的时间差计算；`wire_trace_dropped_total` 非零表示有界事件缓存曾丢弃旧事件。
+这些字段可估计“主机写入到主机收到反馈”的整体滞后，不能单独证明下位机
+采样时刻或电机执行延迟；`tx_command_sent` 仍只表示命令进入邮箱。
+规则定义 `color` 字段承载机器人 ID，并称参考固件的 `mode` 固定为 0；
+这两个字段原样记录，不用 `mode` 推断云台是否上电或进入视觉控制。
 真机入口将本帧 Aimer 已选的装甲板 ID 传给 Planner，整条预测轨迹固定该物理板；
 当 Aimer 未给出有效瞄点时，Planner 保留原有最近距离选板行为。日志中的
 `aim_armor_id`、`planner_target_yaw_deg` 和 `diagnostic_yaw_deg` 可用于检查两者是否一致。
@@ -376,36 +393,34 @@ UDP 诊断与显示。采集到算法只缓存 1 帧，算法到主线程只缓�
 新目标入串口邮箱，再等待工作线程结束和关闭串口。以上为源码和假数据验证，
 相机断线及真实云台停止时序仍需真机复验。
 
-启用上位机无开火控制时，`standard_srm` 始终以 Planner 的目标参考角作为发送目标；
-TinyMPC 求解状态保留在 `planner_status` 等字段中用于诊断，不会在两套角度之间切换。
-命令从上一条已提交角度按实际间隔限速，再受旧的单次步进参数约束。默认角速度上限为
-yaw 60 deg/s、pitch 30 deg/s；单次命令上限仍为 yaw 2 deg、pitch 1 deg。跟踪命令进入
-邮箱后跨帧保留，避免视觉处理期间交替发送目标与零命令。Tracker 未跟踪时，正常有图像
-和新鲜反馈的帧会保持最后一次有效目标角；首次跟踪前保持当前反馈角，`fire_flag` 恒为 0。
+启用上位机无开火控制时，`standard_srm` 在 TinyMPC 收敛帧使用参考初态的
+20 ms 规划角；
+未收敛帧使用目标参考角，来源由 `tx_command_source` 记录。
+选中的 MPC 规划角或目标参考角直接进入串口命令邮箱，不再按上一条命令做速率或单步裁剪。
+命令进入邮箱后跨帧保留，避免视觉处理期间交替发送目标与零命令。Tracker 未跟踪时，正常有图像
+和新鲜反馈的帧会保持最后一条已提交命令；首次跟踪前使用当前反馈角，
+`fire_flag` 恒为 0。
 保持角需要由视觉帧持续刷新；超过 `max_image_age_ms` 未刷新时，串口线程回退零命令，
 即使检测或规划线程卡住也不会无限发送旧角度。
-速度估计短时不可用时也发送保持角；图像时间戳无效、串口反馈缺失或轨迹非法等硬故障
+速度估计短时不可用时仍可跟随有效参考轨迹；图像时间戳无效、串口反馈缺失或轨迹非法等硬故障
 会清空命令邮箱，随后发送 yaw=0、pitch=0、fire=0。
 反馈弹速在 10–25 m/s 时使用实测值；若反馈为 0，可显式设置
 `--tx-use-nominal-speed=1`，让无开火控制计算使用配置中的名义弹速。有效反馈弹速
 始终优先，`fire_flag` 始终为 0。JSONL 的 `tx_speed_source` 会标明本帧来源。
-默认情况下 `temp_lost` 帧保持最后一次有效角。`--tx-follow-temp-lost=1` 会在连续丢失
+默认情况下 `temp_lost` 帧会在连续丢失
 帧数不超过 `--tx-temp-lost-frames`（默认 5 帧）时允许用 Tracker 预测目标继续跟随，
-并将角速度上限乘以 `--tx-temp-lost-rate-scale`（默认 0.35，范围 (0,1]）。帧数对应的
-实际时长随视觉帧率变化；该选项默认关闭，其抖动改善需要在实车上验证。成功提交的
+帧数对应的实际时长随视觉帧率变化；可用 `--tx-follow-temp-lost=0` 关闭预测跟随，
+其抖动改善需要在实车上验证。成功提交的
 外推命令标记为 `tx_command_mode=extrapolate` 和 `tx_extrapolating=true`；没有实际发送
 的外推尝试不会计入。`planner_control` 仅描述 Planner 求解状态，不等同于命令是否已发送；
 以 `tx_command_sent` 和 `tx_command_mode` 为准。超出帧数上限、解算无效或进入 `lost`
-时回到保持角，`fire_flag` 仍恒为 0。
+时保持上一条已提交命令，`fire_flag` 仍恒为 0。
 `tx_command_sent` 只表示命令进入邮箱；`tx_wire_target_frames` 和
 `tx_wire_zero_frames` 是串口线程成功写入的累计帧数，不等于下位机执行回执。
-默认参数为 20 ms 发送周期、100 ms 命令有效期、yaw/pitch 角速度上限分别 60/30 deg/s，
-单次命令变化上限分别为 2/1 deg，均可通过 `--tx-max-yaw-rate-deg-s`、
-`--tx-max-pitch-rate-deg-s`、`--tx-max-yaw-step-deg` 和 `--tx-max-pitch-step-deg` 覆盖。
-`--tx-temp-lost-rate-scale` 控制暂失外推的角速度比例。当前版本的 `tracking` 表示普通
-目标参考指令；TinyMPC 是否收敛单独看 `planner_status`。旧日志里的 `acquire` 表示旧版
-未收敛接近阶段。`hold_last_aim` 表示保持上次有效角，`hold_current` 表示首次跟踪前保持
-反馈角。
+默认参数为 20 ms 发送周期和 100 ms 命令有效期。`tracking` 表示普通
+跟踪命令，具体角度来源看 `tx_command_source`；TinyMPC 是否收敛看 `planner_status`。
+`hold_last_aim` 表示保持上一条命令；旧日志里的 `acquire`、`follow_state` 和
+`hold_current` 是旧版模式。
 
 首次只建议进行无开火短时测试：
 
@@ -469,7 +484,48 @@ Tracker 字段可在 PlotJuggler 的数据列表中选择，例如
 ```
 
 离线回放不会打开相机或串口；它按采集时的图像时间、匹配云台姿态和规划状态，
-重新运行当前编译的视觉与瞄准代码：
+重新运行当前编译的视觉与瞄准代码。Planner 会使用当帧 Aimer 选中的装甲板做未来换板预览，
+结果写入 `planner_preview_switch_ms` 和 `planner_yaw_20ms_deg`。
+逐帧 JSONL 还会记录 `detector_roi_*` 裁剪窗口与先验状态，以及 `detector_outputs` 检测框信息；
+对比采集和回放时应使用相同的模型与推理设备配置。
+切换 YOLOv8 时，检测模型输出装甲框、蓝红类别和四个灯条端点；
+`assets/tiny_resnet.onnx` 继续从原图裁块识别数字。`detector_model`、
+`detector_score_candidates`、`detector_nms_candidates` 和
+`detector_classifier_rejected` 可区分 YOLO 无候选与 Tiny 分类拒绝。
+倒装相机可用 `classifier_rotate_180` 转正数字，并用 `classifier_gamma`（小于 1
+时提亮）处理暗图；旧配置缺少这两个键时仍按原图分类。
+YOLOv8 的动态 ROI 参数独立于 YOLOv5：`yolov8_dynamic_roi_scale` 默认 10.4，
+`yolov8_dynamic_roi_min_width` 默认 208 像素；这只是按输入尺寸换算的初值。
+真机配置用 `yolov8_dynamic_roi: false` 独立关闭 YOLOv8 裁剪；
+当前 701 帧回放里整帧比动态 ROI 少暂失。切回 `yolo_name: yolov5` 时，
+原有 `dynamic_roi: true` 和 YOLOv5 参数继续生效。
+旧异步 `MultiThreadDetector` 从模型读取输入尺寸，但仍只走整帧推理；
+真机 `standard_srm` 和离线回放使用检测器自己的动态 ROI 路径。
+
+回放的 replay_tx_command_* 直接记录与真机相同来源的 Planner TX 参考角，不叠加
+发送端速率或单步限幅；回放不访问串口，也不代表云台实际运动。可用
+--simulate-tx=false 关闭该输出。可选的五次曲线诊断仍有独立的离线速度、加速度约束，
+不参与真机发送。
+
+需要边回放边看波形时，先在 PlotJuggler 启动 JSON UDP Server，
+监听 `127.0.0.1:9871`，再给 `standard_srm_replay` 加 `--debug-udp`。
+它按 `replay_time_s` 以一倍速发送新计算的逐帧结果；推理赶不上采集帧率时
+会自然变慢，但不会为画图丢帧。不加该选项时仍按原来的速度完成离线计算。
+UDP 使用 PlotJuggler 的接收时间作为横轴；`replay_time_s` 也作为数值字段保留。
+可加 `--compare-centered-mpc` 同时输出 `centered_target_yaw_deg` 和
+`centered_yaw_deg`，与现有 `planner_*` 曲线比较。该诊断会枚举过去半秒
+可能的 Aimer 选板锁；若无法唯一重建，`centered_valid=false`，不伪造
+居中轨迹。居中结果只写回放 JSONL/UDP，不参与 `replay_tx_command_*`，
+也不改变真机发送。
+
+可加 `--compare-quintic` 计算因果五次多项式选板过渡：连续两帧预报同一换板
+时间与目标板后，尝试在新板首个参考点结束的 120–280 ms 曲线，只保留符合 yaw 速度、加速度限制的
+候选。`--quintic-frame-ms`（默认 65 ms）用于将单条 TX 步长上限换算成曲线
+速度上限。`quintic_reference_yaw_deg` 是曲线参考，`quintic_mode` 表示跟随、
+预定、过渡或约束不可用，`quintic_transition_ms` 是选中的过渡长度；
+`quintic_tx_command_yaw_deg` 用独立的限速状态模拟这条参考。原有
+`replay_tx_command_*` 不受影响。两组均为离线诊断，不代表云台反馈，
+也不改变真机控制或开火决策。
 
 ```bash
 ./build/standard_srm_replay configs/real_auto_aim.yaml \

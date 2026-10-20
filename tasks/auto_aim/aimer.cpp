@@ -182,7 +182,12 @@ io::Command Aimer::aim(
   return command;
 }
 
-AimPoint Aimer::choose_aim_point(const Target & target, int & lock_id)
+AimPoint Aimer::preview_aim_point(const Target & target, int & preview_lock_id) const
+{
+  return choose_aim_point(target, preview_lock_id);
+}
+
+AimPoint Aimer::choose_aim_point(const Target & target, int & lock_id) const
 {
   Eigen::VectorXd ekf_x = target.ekf_x();
   std::vector<Eigen::Vector4d> armor_xyza_list = target.armor_xyza_list();

@@ -5,15 +5,26 @@
 #include <yaml-cpp/yaml.h>
 
 #include <algorithm>
+#include <cmath>
 #include <filesystem>
+#include <optional>
 #include <random>
+#include <stdexcept>
 
 #include "tasks/auto_aim/classifier.hpp"
+#include "tasks/auto_aim/dynamic_roi.hpp"
 #include "tools/img_tools.hpp"
 #include "tools/logger.hpp"
 
 namespace auto_aim
 {
+namespace
+{
+// 连续漏检约五帧后重回整帧，避免先验窗口长期留在目标原位置。
+constexpr int kRoiMissTolerance = 5;
+constexpr int kInputSize = 416;
+}  // namespace
+
 YOLOV8::YOLOV8(const std::string & config_path, bool debug)
 : classifier_(config_path), detector_(config_path), debug_(debug)
 {
@@ -29,6 +40,25 @@ YOLOV8::YOLOV8(const std::string & config_path, bool debug)
   width = yaml["roi"]["width"].as<int>();
   height = yaml["roi"]["height"].as<int>();
   use_roi_ = yaml["use_roi"].as<bool>();
+  dynamic_roi_ = yaml["yolov8_dynamic_roi"].IsDefined()
+                   ? yaml["yolov8_dynamic_roi"].as<bool>()
+                   : (yaml["dynamic_roi"].IsDefined() ? yaml["dynamic_roi"].as<bool>() : false);
+  dynamic_roi_scale_ = yaml["yolov8_dynamic_roi_scale"].IsDefined()
+                         ? yaml["yolov8_dynamic_roi_scale"].as<double>()
+                         : 10.4;
+  dynamic_roi_min_width_ = yaml["yolov8_dynamic_roi_min_width"].IsDefined()
+                             ? yaml["yolov8_dynamic_roi_min_width"].as<int>()
+                             : 208;
+  score_threshold_ = yaml["yolov8_score_threshold"].IsDefined()
+                       ? yaml["yolov8_score_threshold"].as<float>()
+                       : 0.7F;
+  if (!std::isfinite(dynamic_roi_scale_) || dynamic_roi_scale_ <= 0.0 ||
+      dynamic_roi_min_width_ <= 0 || !std::isfinite(score_threshold_) ||
+      score_threshold_ <= 0.0F || score_threshold_ > 1.0F ||
+      !std::isfinite(min_confidence_) || min_confidence_ < 0.0 ||
+      min_confidence_ > 1.0) {
+    throw std::invalid_argument("Invalid YOLOv8 ROI or confidence parameter");
+  }
   roi_ = cv::Rect(x, y, width, height);
   offset_ = cv::Point2f(x, y);
 
@@ -41,7 +71,7 @@ YOLOV8::YOLOV8(const std::string & config_path, bool debug)
 
   input.tensor()
     .set_element_type(ov::element::u8)
-    .set_shape({1, 416, 416, 3})
+    .set_shape({1, kInputSize, kInputSize, 3})
     .set_layout("NHWC")
     .set_color_format(ov::preprocess::ColorFormat::BGR);
 
@@ -60,44 +90,89 @@ YOLOV8::YOLOV8(const std::string & config_path, bool debug)
 
 std::list<Armor> YOLOV8::detect(const cv::Mat & raw_img, int frame_count)
 {
+  debug_info_ = {};
+  debug_info_.model_name = "yolov8";
+  debug_info_.roi_active = dynamic_roi_ || use_roi_;
+  debug_info_.roi_miss_streak_before = roi_miss_streak_;
   if (raw_img.empty()) {
+    debug_info_.roi_miss_streak_after = roi_miss_streak_;
     tools::logger()->warn("Empty img!, camera drop!");
     return std::list<Armor>();
   }
 
-  cv::Mat bgr_img;
-  if (use_roi_) {
-    if (roi_.width == -1) {  // -1 表示该维度不裁切
-      roi_.width = raw_img.cols;
+  cv::Mat crop_img = raw_img;
+  offset_ = {};
+  if (dynamic_roi_) {
+    const bool use_prior = last_target_box_.has_value() && roi_miss_streak_ <= kRoiMissTolerance;
+    debug_info_.prior_used = use_prior;
+    debug_info_.prior_box_valid = use_prior;
+    if (use_prior) debug_info_.prior_box = *last_target_box_;
+    applied_roi_ = dynamic_roi_rect(
+      use_prior ? last_target_box_ : std::nullopt, dynamic_roi_scale_,
+      dynamic_roi_min_width_, raw_img.cols, raw_img.rows);
+    crop_img = raw_img(applied_roi_);
+    offset_ = cv::Point2f(applied_roi_.x, applied_roi_.y);
+  } else if (use_roi_) {
+    auto rect = roi_;
+    if (rect.width == -1) rect.width = raw_img.cols - rect.x;
+    if (rect.height == -1) rect.height = raw_img.rows - rect.y;
+    if (rect.width <= 0 || rect.height <= 0 || rect.x < 0 || rect.y < 0 ||
+        rect.x + rect.width > raw_img.cols || rect.y + rect.height > raw_img.rows) {
+      throw std::invalid_argument("YOLOv8 static ROI exceeds image bounds");
     }
-    if (roi_.height == -1) {  // -1 表示该维度不裁切
-      roi_.height = raw_img.rows;
-    }
-    bgr_img = raw_img(roi_);
-  } else {
-    bgr_img = raw_img;
+    applied_roi_ = rect;
+    crop_img = raw_img(rect);
+    offset_ = cv::Point2f(rect.x, rect.y);
   }
 
-  auto x_scale = static_cast<double>(416) / bgr_img.rows;
-  auto y_scale = static_cast<double>(416) / bgr_img.cols;
+  auto armors = infer_and_parse(crop_img, raw_img, frame_count);
+  if (dynamic_roi_) {
+    if (!armors.empty()) {
+      const auto best = std::max_element(
+        armors.begin(), armors.end(),
+        [](const Armor & a, const Armor & b) { return a.confidence < b.confidence; });
+      // box 的宽度不随裁剪原点变化；center 已由 Armor 构造函数回填原图坐标。
+      const float width = static_cast<float>(best->box.width);
+      if (width > 0.0F) {
+        last_target_box_ = cv::Rect2f(
+          best->center.x - width / 2.0F, best->center.y - width * 0.375F,
+          width, width * 0.75F);
+        roi_miss_streak_ = 0;
+      } else {
+        ++roi_miss_streak_;
+      }
+    } else {
+      ++roi_miss_streak_;
+    }
+  }
+  if (debug_info_.roi_active) debug_info_.applied_roi = applied_roi_;
+  debug_info_.roi_miss_streak_after = roi_miss_streak_;
+  return armors;
+}
+
+std::list<Armor> YOLOV8::infer_and_parse(
+  const cv::Mat & crop_img, const cv::Mat & raw_img, int frame_count)
+{
+  auto x_scale = static_cast<double>(kInputSize) / crop_img.rows;
+  auto y_scale = static_cast<double>(kInputSize) / crop_img.cols;
   auto scale = std::min(x_scale, y_scale);
-  auto h = static_cast<int>(bgr_img.rows * scale);
-  auto w = static_cast<int>(bgr_img.cols * scale);
+  auto h = static_cast<int>(crop_img.rows * scale);
+  auto w = static_cast<int>(crop_img.cols * scale);
 
-  // preproces
-  auto input = cv::Mat(416, 416, CV_8UC3, cv::Scalar(0, 0, 0));
+  auto input = cv::Mat(kInputSize, kInputSize, CV_8UC3, cv::Scalar(0, 0, 0));
   auto roi = cv::Rect(0, 0, w, h);
-  cv::resize(bgr_img, input(roi), {w, h});
-  ov::Tensor input_tensor(ov::element::u8, {1, 416, 416, 3}, input.data);
+  cv::resize(crop_img, input(roi), {w, h});
+  ov::Tensor input_tensor(ov::element::u8, {1, kInputSize, kInputSize, 3}, input.data);
 
-  /// infer
   auto infer_request = compiled_model_.create_infer_request();
   infer_request.set_input_tensor(input_tensor);
   infer_request.infer();
 
-  // postprocess
   auto output_tensor = infer_request.get_output_tensor();
   auto output_shape = output_tensor.get_shape();
+  if (output_shape.size() != 3 || output_shape[0] != 1 || output_shape[1] != 14) {
+    throw std::runtime_error("YOLOv8 output must have shape [1,14,N]");
+  }
   cv::Mat output(output_shape[1], output_shape[2], CV_32F, output_tensor.data());
 
   return parse(scale, output, raw_img, frame_count);
@@ -124,36 +199,47 @@ std::list<Armor> YOLOV8::parse(
     cv::Point max_point;
     cv::minMaxLoc(scores, nullptr, &score, nullptr, &max_point);
 
-    if (score < score_threshold_) continue;
+    if (!std::isfinite(score) || score < score_threshold_) continue;
 
     auto x = xywh.at<float>(0);
     auto y = xywh.at<float>(1);
     auto w = xywh.at<float>(2);
     auto h = xywh.at<float>(3);
+    if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(w) ||
+        !std::isfinite(h) || w <= 0.0F || h <= 0.0F) continue;
     auto left = static_cast<int>((x - 0.5 * w) / scale);
     auto top = static_cast<int>((y - 0.5 * h) / scale);
     auto width = static_cast<int>(w / scale);
     auto height = static_cast<int>(h / scale);
 
+    bool valid_points = true;
     for (int i = 0; i < 4; i++) {
       float x = one_key_points.at<float>(0, i * 2 + 0) / scale;
       float y = one_key_points.at<float>(0, i * 2 + 1) / scale;
+      if (!std::isfinite(x) || !std::isfinite(y)) {
+        valid_points = false;
+        break;
+      }
       cv::Point2f kp = {x, y};
       armor_key_points.push_back(kp);
     }
+    if (!valid_points || width <= 0 || height <= 0) continue;
     ids.emplace_back(max_point.x);
     confidences.emplace_back(score);
     boxes.emplace_back(left, top, width, height);
     armors_key_points.emplace_back(armor_key_points);
   }
+  debug_info_.score_candidates = static_cast<int>(boxes.size());
 
   std::vector<int> indices;
   cv::dnn::NMSBoxes(boxes, confidences, score_threshold_, nms_threshold_, indices);
+  debug_info_.nms_candidates = static_cast<int>(indices.size());
+  debug_info_.classifier_rejected = 0;
 
   std::list<Armor> armors;
   for (const auto & i : indices) {
     sort_keypoints(armors_key_points[i]);
-    if (use_roi_) {
+    if (use_roi_ || dynamic_roi_) {
       armors.emplace_back(ids[i], confidences[i], boxes[i], armors_key_points[i], offset_);
     } else {
       armors.emplace_back(ids[i], confidences[i], boxes[i], armors_key_points[i]);
@@ -165,6 +251,7 @@ std::list<Armor> YOLOV8::parse(
     classifier_.classify(*it);
 
     if (!check_name(*it)) {
+      ++debug_info_.classifier_rejected;
       it = armors.erase(it);
       continue;
     }
@@ -285,9 +372,9 @@ void YOLOV8::draw_detections(
     tools::draw_text(detection, info, armor.center, {0, 255, 0});
   }
 
-  if (use_roi_) {
+  if (use_roi_ || dynamic_roi_) {
     cv::Scalar green(0, 255, 0);
-    cv::rectangle(detection, roi_, green, 2);
+    cv::rectangle(detection, applied_roi_, green, 2);
   }
   cv::resize(detection, detection, {}, 0.5, 0.5);  // 显示时缩小图片尺寸
   cv::imshow("detection", detection);
@@ -324,6 +411,11 @@ void YOLOV8::sort_keypoints(std::vector<cv::Point2f> & keypoints)
 std::list<Armor> YOLOV8::postprocess(
   double scale, cv::Mat & output, const cv::Mat & bgr_img, int frame_count)
 {
+  // 旧异步检测入口始终处理整帧；清除静态或动态 ROI 留下的裁剪原点。
+  offset_ = {};
+  applied_roi_ = cv::Rect(0, 0, bgr_img.cols, bgr_img.rows);
+  debug_info_ = {};
+  debug_info_.model_name = "yolov8";
   return parse(scale, output, bgr_img, frame_count);
 }
 

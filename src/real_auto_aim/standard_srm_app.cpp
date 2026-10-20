@@ -48,13 +48,8 @@ const std::string kKeys =
     "{tx-use-nominal-speed|false|弹速反馈无效时允许使用配置名义弹速，仅无开火}"
     "{tx-period-ms|20|控制发送周期，单位 ms}"
     "{tx-command-ttl-ms|100|命令有效期，单位 ms}"
-    "{tx-max-yaw-step-deg|2.0|单条命令 yaw 最大变化量，单位 deg}"
-    "{tx-max-pitch-step-deg|1.0|单条命令 pitch 最大变化量，单位 deg}"
-    "{tx-max-yaw-rate-deg-s|60.0|yaw 最大角速度，单位 deg/s}"
-    "{tx-max-pitch-rate-deg-s|30.0|pitch 最大角速度，单位 deg/s}"
-    "{tx-follow-temp-lost|false|temp_lost 期间继续发送受限外推跟随指令，默认关闭}"
+    "{tx-follow-temp-lost|true|temp_lost 期间继续发送预测跟随指令，默认开启}"
     "{tx-temp-lost-frames|5|允许外推的最大连续丢失帧数，超出后回到保持角}"
-    "{tx-temp-lost-rate-scale|0.35|外推角速度比例，范围 (0,1]}"
     "{save-frame|imgs/real_srm_frame.jpg|按 s 保存当前显示帧（相对运行目录，默认 imgs/；不带扩展名时按 .jpg 保存）}"
     "{debug-jsonl||保存逐帧真机诊断 JSONL}"
     "{debug-udp|false|通过 UDP 将逐帧诊断 JSON 发到 127.0.0.1:9871}"
@@ -94,13 +89,8 @@ int run_standard_srm(int argc, char * argv[])
         const bool tx_use_nominal_speed = cli.get<bool>("tx-use-nominal-speed");
         const int tx_period_ms = cli.get<int>("tx-period-ms");
         const int tx_command_ttl_ms = cli.get<int>("tx-command-ttl-ms");
-        const double tx_max_yaw_step_deg = cli.get<double>("tx-max-yaw-step-deg");
-        const double tx_max_pitch_step_deg = cli.get<double>("tx-max-pitch-step-deg");
-        const double tx_max_yaw_rate_deg_s = cli.get<double>("tx-max-yaw-rate-deg-s");
-        const double tx_max_pitch_rate_deg_s = cli.get<double>("tx-max-pitch-rate-deg-s");
         const bool tx_follow_temp_lost = cli.get<bool>("tx-follow-temp-lost");
         const int tx_temp_lost_max_frames = cli.get<int>("tx-temp-lost-frames");
-        const double tx_temp_lost_rate_scale = cli.get<double>("tx-temp-lost-rate-scale");
         const double exposure_override = cli.get<double>("exposure-ms");
         const double gain_override = cli.get<double>("gain");
         const int max_frames = cli.get<int>("max-frames");
@@ -113,14 +103,8 @@ int run_standard_srm(int argc, char * argv[])
         if (max_frames < 0) {
             throw std::invalid_argument("--max-frames must be non-negative");
         }
-        if (tx_period_ms <= 0 || tx_command_ttl_ms <= 0 ||
-            !std::isfinite(tx_max_yaw_step_deg) || tx_max_yaw_step_deg <= 0.0 ||
-            !std::isfinite(tx_max_pitch_step_deg) || tx_max_pitch_step_deg <= 0.0 ||
-            !std::isfinite(tx_max_yaw_rate_deg_s) || tx_max_yaw_rate_deg_s <= 0.0 ||
-            !std::isfinite(tx_max_pitch_rate_deg_s) || tx_max_pitch_rate_deg_s <= 0.0 ||
-            !std::isfinite(tx_temp_lost_rate_scale) || tx_temp_lost_rate_scale <= 0.0 ||
-            tx_temp_lost_rate_scale > 1.0) {
-            throw std::invalid_argument("Invalid TX timing, rate or step configuration");
+        if (tx_period_ms <= 0 || tx_command_ttl_ms <= 0) {
+            throw std::invalid_argument("Invalid TX timing configuration");
         }
         if (tx_temp_lost_max_frames < 0) {
             throw std::invalid_argument("--tx-temp-lost-frames must be non-negative");
@@ -154,7 +138,8 @@ int run_standard_srm(int argc, char * argv[])
         real_auto_aim::SerialFeedbackReader serial_feedback(
             std::move(transport), std::chrono::milliseconds(100), std::chrono::milliseconds(30),
             enable_tx, std::chrono::milliseconds(tx_period_ms),
-            std::chrono::milliseconds(tx_command_ttl_ms), config.max_image_age);
+            std::chrono::milliseconds(tx_command_ttl_ms), config.max_image_age,
+            recorder.enabled());
         if (enable_tx) {
             tools::logger()->warn(
                 "[standard_srm/TX] enabled: yaw/pitch only, fire_flag is forced to 0; "
@@ -174,9 +159,7 @@ int run_standard_srm(int argc, char * argv[])
                 config_path,
                 real_auto_aim::TxCommandOptions{
                     enable_tx, tx_use_nominal_speed, tx_period_ms, tx_command_ttl_ms,
-                    tx_max_yaw_rate_deg_s, tx_max_pitch_rate_deg_s,
-                    tx_max_yaw_step_deg, tx_max_pitch_step_deg,
-                    tx_follow_temp_lost, tx_temp_lost_max_frames, tx_temp_lost_rate_scale},
+                    tx_follow_temp_lost, tx_temp_lost_max_frames},
                 config.max_image_age, planner_debug_speed, !replay_frame_dir.empty()},
             serial_feedback);
         // 只读采集可等待较慢的磁盘；启用 TX 时以命令 TTL 和图像时效较小者为上限。
@@ -269,7 +252,37 @@ int run_standard_srm(int argc, char * argv[])
             const auto tx_stats = serial_feedback.tx_stats();
             sample["tx_wire_target_frames"] = tx_stats.target_frames;
             sample["tx_wire_zero_frames"] = tx_stats.zero_frames;
-            recorder.write(sample);
+            if (recorder.enabled()) {
+                // 串口线程只存有界事件；JSON 构造和落盘均在结果消费者线程完成。
+                Json recorded = sample;
+                const auto batch = serial_feedback.take_wire_events();
+                recorded["wire_trace_dropped_total"] = batch.dropped_total;
+                recorded["wire_trace_events"] = Json::array();
+                for (const auto & event : batch.events) {
+                    const char * kind =
+                        event.kind == real_auto_aim::WireEventKind::TxTarget ? "tx_target" :
+                        event.kind == real_auto_aim::WireEventKind::TxZero ? "tx_zero" :
+                        "rx_feedback";
+                    Json wire_record = {
+                        {"kind", kind},
+                        {"sequence", event.sequence},
+                        {"started_steady_ns", event.started_ns},
+                        {"completed_steady_ns", event.completed_ns},
+                        {"yaw_deg", event.yaw_deg},
+                        {"pitch_deg", event.pitch_deg}
+                    };
+                    if (event.kind == real_auto_aim::WireEventKind::RxFeedback) {
+                        wire_record["roll_deg"] = event.roll_deg;
+                        wire_record["mode_raw"] = event.mode;
+                        wire_record["color_raw"] = event.color_raw;
+                        wire_record["bullet_speed_mps"] = event.bullet_speed_mps;
+                        wire_record["batch_index"] = event.batch_index;
+                        wire_record["batch_frames"] = event.batch_frames;
+                    }
+                    recorded["wire_trace_events"].push_back(std::move(wire_record));
+                }
+                recorder.write(recorded);
+            }
             if (udp_plotter) udp_plotter->plot(sample);
         };
         const auto consume_output = [&](real_auto_aim::FrameOutput output) {

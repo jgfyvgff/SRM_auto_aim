@@ -34,8 +34,8 @@ struct FeedbackFrame
   float yaw_deg = 0.0F;
   float pitch_deg = 0.0F;
   float roll_deg = 0.0F;
-  std::int32_t mode = 0;
-  std::int32_t color = 0;
+  std::int32_t mode = 0;   // 原样保留；不得据此判断云台使能状态。
+  std::int32_t color = 0;  // 协议沿用此字段名；规则定义其内容为机器人 ID。
   float bullet_speed_mps = 0.0F;
 };
 

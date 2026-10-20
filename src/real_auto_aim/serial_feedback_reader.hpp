@@ -1,7 +1,9 @@
 #pragma once
 
 #include <atomic>
+#include <array>
 #include <chrono>
+#include <cstddef>
 #include <condition_variable>
 #include <cstdint>
 #include <exception>
@@ -9,6 +11,7 @@
 #include <mutex>
 #include <optional>
 #include <thread>
+#include <vector>
 
 #include "io/srm_auto_aim_transport.hpp"
 #include "src/real_auto_aim/feedback_buffer.hpp"
@@ -20,6 +23,29 @@ struct TxStats
 {
     std::uint64_t target_frames = 0;
     std::uint64_t zero_frames = 0;
+};
+
+// 主机侧串口事件；时间使用同一 steady_clock，不能当作下位机采样时刻。
+enum class WireEventKind { TxTarget, TxZero, RxFeedback };
+struct WireEvent
+{
+    WireEventKind kind = WireEventKind::TxZero;
+    std::int64_t started_ns = 0;
+    std::int64_t completed_ns = 0;
+    float yaw_deg = 0.0F;
+    float pitch_deg = 0.0F;
+    float roll_deg = 0.0F;
+    std::int32_t mode = 0;
+    std::int32_t color_raw = 0;
+    float bullet_speed_mps = 0.0F;
+    std::size_t batch_index = 0;
+    std::size_t batch_frames = 1;
+    std::uint64_t sequence = 0;
+};
+struct WireEventBatch
+{
+    std::vector<WireEvent> events;
+    std::uint64_t dropped_total = 0;
 };
 
 // 独占串口的反馈/命令协调器：后台线程收反馈并按固定周期发送最新命令。
@@ -34,7 +60,8 @@ public:
         bool enable_tx = false,
         std::chrono::milliseconds tx_period = std::chrono::milliseconds(20),
         std::chrono::milliseconds tx_ttl = std::chrono::milliseconds(100),
-        std::chrono::milliseconds hold_ttl = std::chrono::milliseconds(200));
+        std::chrono::milliseconds hold_ttl = std::chrono::milliseconds(200),
+        bool capture_wire_trace = false);
     ~SerialFeedbackReader();
 
     SerialFeedbackReader(const SerialFeedbackReader &) = delete;
@@ -62,6 +89,8 @@ public:
 
     // 获取成功写入串口的累计计数；只统计 transport::send 正常返回的帧。
     TxStats tx_stats();
+    // 取走有界事件缓存；仅复制内存，JSON 序列化由调用线程在锁外完成。
+    WireEventBatch take_wire_events();
 
     // 由拥有者线程调用；重复停止安全。停止后不能再调用 sample_at。
     void stop() noexcept;
@@ -69,6 +98,8 @@ public:
 private:
     enum class State { Running, Failed, Stopped };
     void receive_loop() noexcept;
+    void push_wire_event_locked(WireEvent event) noexcept;
+    static constexpr std::size_t kWireEventCapacity = 1024;
 
     std::unique_ptr<io::srm_auto_aim::SrmAutoAimTransport> transport_;
     FeedbackBuffer buffer_;
@@ -77,6 +108,7 @@ private:
     const std::chrono::milliseconds tx_period_;
     const std::chrono::milliseconds tx_ttl_;
     const std::chrono::milliseconds hold_ttl_;
+    const bool capture_wire_trace_;
     // mutex 只保护缓存、命令邮箱、发送计数、状态和异常；串口 I/O 与 join 均在锁外。
     std::mutex mutex_;
     std::condition_variable changed_;
@@ -87,6 +119,12 @@ private:
     bool commands_inhibited_ = false;
     Clock::time_point command_updated_at_ = Clock::now();
     TxStats tx_stats_;
+    // mutex 同时保护事件环；满时丢最旧事件并累加计数。
+    std::array<WireEvent, kWireEventCapacity> wire_events_{};
+    std::size_t wire_event_head_ = 0;
+    std::size_t wire_event_size_ = 0;
+    std::uint64_t wire_event_sequence_ = 0;
+    std::uint64_t wire_event_dropped_total_ = 0;
     std::atomic<bool> stop_requested_{false};
     std::thread worker_;
 };

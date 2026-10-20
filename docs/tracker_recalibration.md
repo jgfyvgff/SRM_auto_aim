@@ -49,20 +49,18 @@ Tracker 只预测 / temp_lost 保持角
 
 ---
 
-## 2. 链路一：控制指令是帧率上的离散阶梯
+## 2. 链路一：旧版 TX 速率和步长限幅分析
 
-### 2.1 事实
+### 2.1 旧版事实
 
-- `standard_srm` 每帧只调用一次限幅器：
-  [standard_srm.cpp:909-931](../src/standard_srm.cpp#L909-L931) 计算 `elapsed_s` 并调用
-  `limit_tx_angles`，每帧产生**一条**命令。
-- 串口线程只是按 `tx_period_ms`（默认 20 ms）把**同一条**命令重复写出：
-  [serial_feedback_reader.cpp:44-50](../src/real_auto_aim/serial_feedback_reader.cpp#L44-L50)。
-  命令内容只在视觉帧到达时变化。
-- 默认 `--tx-max-yaw-rate-deg-s=60`、`--tx-max-yaw-step-deg=2.0`，
-  单条命令的步长 = `min(tx_max_yaw_step_deg, tx_max_yaw_rate_deg_s × 帧间隔)`。
+以下量化记录对应曾经使用发送端限幅器的版本。当前 standard_srm 已移除这层
+速率/步长限幅，Planner 选择的角度参考直接写入 TX 命令邮箱；串口线程仍按
+tx_period_ms（默认 20 ms）重复发送邮箱中的最新命令。
 
-**结论：命令参考是"帧率采样的阶梯"，不是连续参考。** 两个上限谁起作用取决于实际帧率：
+旧版本每帧调用一次限幅器，命令步长为
+min(tx_max_yaw_step_deg, tx_max_yaw_rate_deg_s × 帧间隔)。
+
+历史结论：旧版命令参考是帧率采样的阶梯，不是连续参考。两个上限谁起作用取决于实际帧率：
 
 | 视觉帧率 | 速率上限给出的步长 | 单次步长上限 | 实际约束 |
 | --- | --- | --- | --- |

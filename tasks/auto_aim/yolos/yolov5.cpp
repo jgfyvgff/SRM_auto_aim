@@ -73,7 +73,12 @@ YOLOV5::YOLOV5(const std::string & config_path, bool debug)
 
 std::list<Armor> YOLOV5::detect(const cv::Mat & raw_img, int frame_count)
 {
+  debug_info_ = {};
+  debug_info_.model_name = "yolov5";
+  debug_info_.roi_active = dynamic_roi_ || use_roi_;
+  debug_info_.roi_miss_streak_before = roi_miss_streak_;
   if (raw_img.empty()) {
+    debug_info_.roi_miss_streak_after = roi_miss_streak_;
     tools::logger()->warn("Empty img!, camera drop!");
     return std::list<Armor>();
   }
@@ -82,6 +87,9 @@ std::list<Armor> YOLOV5::detect(const cv::Mat & raw_img, int frame_count)
   if (dynamic_roi_) {
     // 先验来自上一帧检测；连续漏检超限就用整帧重新捕获。
     const bool use_prior = last_target_box_.has_value() && roi_miss_streak_ <= kRoiMissTolerance;
+    debug_info_.prior_used = use_prior;
+    debug_info_.prior_box_valid = use_prior;
+    if (use_prior) debug_info_.prior_box = *last_target_box_;
     auto rect = dynamic_roi_rect(
       use_prior ? last_target_box_ : std::nullopt, dynamic_roi_scale_, dynamic_roi_min_width_,
       raw_img.cols, raw_img.rows);
@@ -143,6 +151,8 @@ std::list<Armor> YOLOV5::detect(const cv::Mat & raw_img, int frame_count)
       ++roi_miss_streak_;
     }
   }
+  if (debug_info_.roi_active) debug_info_.applied_roi = applied_roi_;
+  debug_info_.roi_miss_streak_after = roi_miss_streak_;
   return armors;
 }
 

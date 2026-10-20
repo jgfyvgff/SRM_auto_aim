@@ -20,6 +20,7 @@ public:
   YOLOV5(const std::string & config_path, bool debug);
 
   std::list<Armor> detect(const cv::Mat & bgr_img, int frame_count) override;
+  DetectorDebugInfo debug_info() const override { return debug_info_; }
 
   std::list<Armor> postprocess(
     double scale, cv::Mat & output, const cv::Mat & bgr_img, int frame_count) override;
@@ -49,6 +50,7 @@ private:
   cv::Point2f offset_;
   cv::Mat tmp_img_;
   cv::Rect applied_roi_;  // 本帧实际裁剪区域（原图坐标），仅供调试绘制
+  DetectorDebugInfo debug_info_{};
 
   Detector detector_;
   friend class MultiThreadDetector;

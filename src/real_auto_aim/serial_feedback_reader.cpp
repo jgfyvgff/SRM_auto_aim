@@ -6,6 +6,15 @@
 
 namespace real_auto_aim
 {
+namespace
+{
+std::int64_t steady_ns(Clock::time_point time)
+{
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+        time.time_since_epoch()).count();
+}
+}
+
 SerialFeedbackReader::SerialFeedbackReader(
     std::unique_ptr<io::srm_auto_aim::SrmAutoAimTransport> transport,
     std::chrono::milliseconds max_gap,
@@ -13,10 +22,12 @@ SerialFeedbackReader::SerialFeedbackReader(
     bool enable_tx,
     std::chrono::milliseconds tx_period,
     std::chrono::milliseconds tx_ttl,
-    std::chrono::milliseconds hold_ttl)
+    std::chrono::milliseconds hold_ttl,
+    bool capture_wire_trace)
     : transport_(std::move(transport)), buffer_(256, max_gap),
       wait_after_image_(wait_after_image), enable_tx_(enable_tx),
-      tx_period_(tx_period), tx_ttl_(tx_ttl), hold_ttl_(hold_ttl)
+      tx_period_(tx_period), tx_ttl_(tx_ttl), hold_ttl_(hold_ttl),
+      capture_wire_trace_(capture_wire_trace)
 {
     if (!transport_ || wait_after_image_.count() <= 0 || tx_period_.count() <= 0 ||
         tx_ttl_.count() <= 0 || hold_ttl_.count() <= 0) {
@@ -48,7 +59,9 @@ void SerialFeedbackReader::receive_loop() noexcept
                         has_fresh_command = true;
                     }
                 }
+                const auto write_started = Clock::now();
                 transport_->send(command);
+                const auto write_completed = Clock::now();
                 {
                     std::lock_guard<std::mutex> lock(mutex_);
                     if (has_fresh_command) {
@@ -56,6 +69,14 @@ void SerialFeedbackReader::receive_loop() noexcept
                     } else {
                         ++tx_stats_.zero_frames;
                     }
+                    WireEvent event;
+                    event.kind = has_fresh_command
+                        ? WireEventKind::TxTarget : WireEventKind::TxZero;
+                    event.started_ns = steady_ns(write_started);
+                    event.completed_ns = steady_ns(write_completed);
+                    event.yaw_deg = command.yaw_deg;
+                    event.pitch_deg = command.pitch_deg;
+                    push_wire_event_locked(event);
                 }
                 // 发送节拍对齐绝对时间表，而不是"本次发送时刻 + 周期"：后者会把每次串口读
                 // 的相位误差逐周期累加，实测把 20ms 周期拖成 21.4ms。但线程被长期拖住后
@@ -66,6 +87,7 @@ void SerialFeedbackReader::receive_loop() noexcept
                 }
             }
 
+            const auto read_started = Clock::now();
             const auto frames = transport_->poll_feedback();
             const auto received_at = Clock::now();
             if (frames.empty()) {
@@ -75,10 +97,26 @@ void SerialFeedbackReader::receive_loop() noexcept
                 });
                 continue;
             }
-            // 同批反馈没有独立采样时刻；只保留最后一帧，不能伪造批内时间戳。
+            // 协议没有采样时间戳：控制缓存取同批最新帧，诊断日志保留每帧及顺序。
             {
                 std::lock_guard<std::mutex> lock(mutex_);
                 buffer_.push(received_at, frames.back());
+                for (std::size_t index = 0; index < frames.size(); ++index) {
+                    const auto & frame = frames[index];
+                    WireEvent event;
+                    event.kind = WireEventKind::RxFeedback;
+                    event.started_ns = steady_ns(read_started);
+                    event.completed_ns = steady_ns(received_at);
+                    event.yaw_deg = frame.yaw_deg;
+                    event.pitch_deg = frame.pitch_deg;
+                    event.roll_deg = frame.roll_deg;
+                    event.mode = frame.mode;
+                    event.color_raw = frame.color;
+                    event.bullet_speed_mps = frame.bullet_speed_mps;
+                    event.batch_index = index;
+                    event.batch_frames = frames.size();
+                    push_wire_event_locked(event);
+                }
             }
             changed_.notify_all();
         }
@@ -185,6 +223,35 @@ TxStats SerialFeedbackReader::tx_stats()
 {
     std::lock_guard<std::mutex> lock(mutex_);
     return tx_stats_;
+}
+
+void SerialFeedbackReader::push_wire_event_locked(WireEvent event) noexcept
+{
+    if (!capture_wire_trace_) return;
+    event.sequence = ++wire_event_sequence_;
+    if (wire_event_size_ == kWireEventCapacity) {
+        wire_event_head_ = (wire_event_head_ + 1) % kWireEventCapacity;
+        --wire_event_size_;
+        ++wire_event_dropped_total_;
+    }
+    wire_events_[(wire_event_head_ + wire_event_size_) % kWireEventCapacity] = event;
+    ++wire_event_size_;
+}
+
+WireEventBatch SerialFeedbackReader::take_wire_events()
+{
+    WireEventBatch batch;
+    if (!capture_wire_trace_) return batch;
+    batch.events.reserve(kWireEventCapacity);
+    std::lock_guard<std::mutex> lock(mutex_);
+    batch.dropped_total = wire_event_dropped_total_;
+    for (std::size_t i = 0; i < wire_event_size_; ++i) {
+        batch.events.push_back(
+            wire_events_[(wire_event_head_ + i) % kWireEventCapacity]);
+    }
+    wire_event_head_ = 0;
+    wire_event_size_ = 0;
+    return batch;
 }
 
 void SerialFeedbackReader::stop() noexcept
