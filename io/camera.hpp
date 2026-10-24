@@ -65,6 +65,15 @@ public:
   // 后台采集线程需定期检查停止请求；超时返回 false，图像和时标保持未定义。
   virtual bool read_timed_for(
     cv::Mat & img, FrameTiming & timing, std::chrono::milliseconds timeout) = 0;
+  // 需要离线重做去马赛克时，可同时取得原始 Bayer8；不支持的相机返回空图像和空编码。
+  virtual bool read_timed_for(
+    cv::Mat & img, FrameTiming & timing, std::chrono::milliseconds timeout,
+    cv::Mat & raw_bayer, std::string & raw_bayer_encoding)
+  {
+    raw_bayer.release();
+    raw_bayer_encoding.clear();
+    return read_timed_for(img, timing, timeout);
+  }
 };
 
 class Camera
@@ -72,11 +81,15 @@ class Camera
 public:
   Camera(
     const std::string & config_path,
-    const CameraSettingsOverride & overrides = {});
+    const CameraSettingsOverride & overrides = {},
+    bool capture_raw_bayer = false);
   void read(cv::Mat & img, std::chrono::steady_clock::time_point & timestamp);
   void read_timed(cv::Mat & img, FrameTiming & timing);
   bool read_timed_for(
     cv::Mat & img, FrameTiming & timing, std::chrono::milliseconds timeout);
+  bool read_timed_for(
+    cv::Mat & img, FrameTiming & timing, std::chrono::milliseconds timeout,
+    cv::Mat & raw_bayer, std::string & raw_bayer_encoding);
 
 private:
   std::unique_ptr<CameraBase> camera_;

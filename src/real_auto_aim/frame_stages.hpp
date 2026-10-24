@@ -24,6 +24,7 @@ struct FrameCaptureOptions
     bool tx_enabled = false;
     bool quality_metrics = false;
     bool replay_enabled = false;
+    bool capture_bayer_for_rosbag = false;
 };
 
 // 采集线程独占相机和 YOLO；timeout 使相机无帧时仍可响应停止请求。

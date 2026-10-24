@@ -16,22 +16,31 @@ namespace io
 class HikRobot : public CameraBase
 {
 public:
-  HikRobot(double exposure_ms, double gain, const std::string & vid_pid);
+  HikRobot(
+    double exposure_ms, double gain, const std::string & vid_pid,
+    bool capture_raw_bayer = false);
   ~HikRobot() override;
   void read(cv::Mat & img, std::chrono::steady_clock::time_point & timestamp) override;
   void read_timed(cv::Mat & img, FrameTiming & timing) override;
   bool read_timed_for(
     cv::Mat & img, FrameTiming & timing, std::chrono::milliseconds timeout) override;
+  bool read_timed_for(
+    cv::Mat & img, FrameTiming & timing, std::chrono::milliseconds timeout,
+    cv::Mat & raw_bayer, std::string & raw_bayer_encoding) override;
 
 private:
   struct CameraData
   {
     cv::Mat img;
     FrameTiming timing;
+    cv::Mat raw_bayer;
+    std::string raw_bayer_encoding;
   };
 
   double exposure_us_;//曝光时间
   double gain_;//增益
+  // 仅 rosbag 录制时复制 SDK 帧，避免普通跟踪运行增加每帧内存拷贝。
+  bool capture_raw_bayer_ = false;
 
   std::thread daemon_thread_;
   std::atomic<bool> daemon_quit_;

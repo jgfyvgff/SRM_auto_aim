@@ -11,7 +11,8 @@ namespace io
 {
 Camera::Camera(
   const std::string & config_path,
-  const CameraSettingsOverride & overrides)
+  const CameraSettingsOverride & overrides,
+  bool capture_raw_bayer)
 {
   auto yaml = tools::load(config_path);
   auto camera_name = tools::read<std::string>(yaml, "camera_name");
@@ -34,7 +35,8 @@ Camera::Camera(
       throw std::invalid_argument("Camera gain must be finite and non-negative");
     }
     auto vid_pid = tools::read<std::string>(yaml, "vid_pid");
-    camera_ = std::make_unique<HikRobot>(exposure_ms, gain, vid_pid);
+    camera_ = std::make_unique<HikRobot>(
+      exposure_ms, gain, vid_pid, capture_raw_bayer);
   }
 
   else {
@@ -56,6 +58,14 @@ bool Camera::read_timed_for(
   cv::Mat & img, FrameTiming & timing, std::chrono::milliseconds timeout)
 {
   return camera_->read_timed_for(img, timing, timeout);
+}
+
+bool Camera::read_timed_for(
+  cv::Mat & img, FrameTiming & timing, std::chrono::milliseconds timeout,
+  cv::Mat & raw_bayer, std::string & raw_bayer_encoding)
+{
+  return camera_->read_timed_for(
+    img, timing, timeout, raw_bayer, raw_bayer_encoding);
 }
 
 }  // namespace io

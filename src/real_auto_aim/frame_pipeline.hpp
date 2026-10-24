@@ -26,6 +26,8 @@ namespace real_auto_aim
 struct FrameInput
 {
     cv::Mat image;
+    cv::Mat raw_bayer;
+    std::string raw_bayer_encoding;
     io::FrameTiming timing;
     Json sample;
     FrameDetections detections;
@@ -39,6 +41,8 @@ struct FrameInput
 struct FrameOutput
 {
     cv::Mat image;
+    cv::Mat raw_bayer;
+    std::string raw_bayer_encoding;
     io::FrameTiming timing;
     Json sample;
     std::optional<Clock::time_point> image_timestamp;

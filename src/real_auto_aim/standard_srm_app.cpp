@@ -27,6 +27,9 @@
 #include "src/real_auto_aim/frame_pipeline.hpp"
 #include "src/real_auto_aim/frame_stages.hpp"
 #include "src/real_auto_aim/serial_feedback_reader.hpp"
+#ifdef SRM_HAS_ROSBAG2
+#include "src/real_auto_aim/rosbag_recorder.hpp"
+#endif
 #include "src/real_auto_aim/tx_command_controller.hpp"
 #include "src/real_auto_aim/standard_srm_app.hpp"
 #include "tools/exiter.hpp"
@@ -58,6 +61,7 @@ const std::string kKeys =
     "{max-frames|0|采集指定数量的非空图像后退出，0 表示持续运行}"
     "{raw-frame-dir||保存未旋转、未绘制的原始 BGR 图像}"
     "{replay-frame-dir||保存离线算法回放用的无损 PNG 帧序列；需同时启用 debug-jsonl}"
+    "{rosbag-dir||将原始 Bayer8 图像及匹配云台姿态异步写入 ROS2 bag}"
     "{quality-metrics|false|将亮度、裁剪比例和清晰度写入 JSONL}";
 
 }
@@ -125,6 +129,19 @@ int run_standard_srm(int argc, char * argv[])
             throw std::invalid_argument(
                 "--replay-frame-dir requires --debug-jsonl so each image has synchronized inputs");
         }
+        const auto rosbag_dir = cli.get<std::string>("rosbag-dir");
+#ifdef SRM_HAS_ROSBAG2
+        std::unique_ptr<real_auto_aim::RosbagRecorder> rosbag_recorder;
+        if (!rosbag_dir.empty()) {
+            rosbag_recorder =
+                std::make_unique<real_auto_aim::RosbagRecorder>(rosbag_dir);
+        }
+#else
+        if (!rosbag_dir.empty()) {
+            throw std::invalid_argument(
+                "--rosbag-dir requires ROS2 rosbag2_cpp and rosbag2_storage at build time");
+        }
+#endif
         std::unique_ptr<tools::Plotter> udp_plotter;
         if (cli.get<bool>("debug-udp")) {
             // 复用仿真 PlotJuggler 的 UDP 接收端口，真机帧无需经过 ROS2 转发。
@@ -153,7 +170,7 @@ int run_standard_srm(int argc, char * argv[])
             real_auto_aim::FrameCaptureOptions{
                 config_path, camera_overrides, config.image_width, config.image_height,
                 config.max_image_age, max_frames, enable_tx, quality_metrics,
-                !replay_frame_dir.empty()});
+                !replay_frame_dir.empty(), !rosbag_dir.empty()});
         const auto algorithm_stage = std::make_shared<real_auto_aim::FrameAlgorithmStage>(
             real_auto_aim::FrameAlgorithmOptions{
                 config_path,
@@ -179,6 +196,9 @@ int run_standard_srm(int argc, char * argv[])
         std::uint64_t saved_frame_count = 0;
         auto next_report = Clock::now();
         bool window_exit = false;
+#ifdef SRM_HAS_ROSBAG2
+        bool rosbag_error_logged = false;
+#endif
         cv::Mat last_display;
         const auto save_raw_frame = [&raw_frame_dir](const real_auto_aim::FrameOutput & output) {
             if (raw_frame_dir.empty() || output.image.empty()) return;
@@ -286,6 +306,27 @@ int run_standard_srm(int argc, char * argv[])
             if (udp_plotter) udp_plotter->plot(sample);
         };
         const auto consume_output = [&](real_auto_aim::FrameOutput output) {
+#ifdef SRM_HAS_ROSBAG2
+            if (rosbag_recorder && !output.image.empty() &&
+                output.image_timestamp && output.feedback) {
+                const bool has_raw_bayer = !output.raw_bayer.empty();
+                const auto & bag_image =
+                    has_raw_bayer ? output.raw_bayer : output.image;
+                const std::string bag_encoding = has_raw_bayer
+                    ? output.raw_bayer_encoding
+                    : "bgr8";
+                const bool queued = rosbag_recorder->enqueue(
+                    bag_image, bag_encoding, *output.image_timestamp,
+                    output.feedback->gimbal_to_world);
+                if (!queued && !rosbag_error_logged) {
+                    const auto error = rosbag_recorder->error();
+                    tools::logger()->error(
+                        "[standard_srm/rosbag] recording stopped: {}",
+                        error.empty() ? "writer is no longer accepting frames" : error);
+                    rosbag_error_logged = true;
+                }
+            }
+#endif
             save_raw_frame(output);
             save_replay_frame(output);
             record_sample(output.sample);
@@ -388,6 +429,19 @@ int run_standard_srm(int argc, char * argv[])
             pipeline.join();
             throw;
         }
+#ifdef SRM_HAS_ROSBAG2
+        if (rosbag_recorder) {
+            rosbag_recorder->close();
+            tools::logger()->info(
+                "[standard_srm/rosbag] written={} dropped={} uri={}",
+                rosbag_recorder->frames_written(), rosbag_recorder->frames_dropped(),
+                rosbag_dir);
+            const auto error = rosbag_recorder->error();
+            if (!error.empty() && !rosbag_error_logged) {
+                tools::logger()->error("[standard_srm/rosbag] {}", error);
+            }
+        }
+#endif
         if (show) cv::destroyWindow("standard_srm");
         serial_feedback.stop();
         if (max_frames > 0 && !window_exit && !exiter.exit()) {

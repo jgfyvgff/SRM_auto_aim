@@ -65,7 +65,9 @@ add_executable(standard_srm
     src/real_auto_aim/frame_stages.cpp)
 target_link_libraries(standard_srm
     ${OpenCV_LIBS} fmt::fmt yaml-cpp auto_aim tools io real_serial_feedback)
-add_executable(standard_srm_replay src/standard_srm_replay.cpp)
+add_executable(standard_srm_replay
+    src/standard_srm_replay.cpp
+    src/real_auto_aim/frame_diagnostics.cpp)
 target_link_libraries(standard_srm_replay
     ${OpenCV_LIBS} fmt::fmt yaml-cpp auto_aim tools io)
 
@@ -203,6 +205,8 @@ find_package(tf2 QUIET)
 find_package(tf2_msgs QUIET)
 find_package(tf2_ros QUIET)
 find_package(rm_interfaces QUIET)
+find_package(rosbag2_cpp QUIET)
+find_package(rosbag2_storage QUIET)
 # 只有在找到 ROS 环境时才会添加 sentry 和 publish_test
 if(ament_cmake_FOUND AND rclcpp_FOUND AND std_msgs_FOUND AND rosidl_typesupport_cpp_FOUND AND sp_msgs_FOUND)
     # 编译 sentry 和 publish_test
@@ -223,6 +227,27 @@ if(ament_cmake_FOUND AND rclcpp_FOUND AND std_msgs_FOUND AND rosidl_typesupport_
     target_link_libraries(topic_loop_test ${OpenCV_LIBS} fmt::fmt tools io)
 else()
     message(STATUS "ROS2 environment not found, skipping ROS2-related code.")
+endif()
+
+# rosbag 记录为可选依赖；缺少 ROS2 时 standard_srm 仍可按原方式构建。
+if(
+  ament_cmake_FOUND AND rclcpp_FOUND AND sensor_msgs_FOUND AND geometry_msgs_FOUND AND
+  rosbag2_cpp_FOUND AND rosbag2_storage_FOUND)
+    target_sources(standard_srm PRIVATE src/real_auto_aim/rosbag_recorder.cpp)
+    ament_target_dependencies(
+      standard_srm rclcpp sensor_msgs geometry_msgs rosbag2_cpp rosbag2_storage)
+    target_compile_definitions(standard_srm PRIVATE SRM_HAS_ROSBAG2=1)
+else()
+    message(STATUS "ROS2 rosbag2 dependencies not found, --rosbag-dir is unavailable.")
+endif()
+
+# 从 ros2 bag play 订阅 Bayer 图像和云台姿态，生成 standard_srm_replay 输入。
+if(ament_cmake_FOUND AND rclcpp_FOUND AND sensor_msgs_FOUND AND geometry_msgs_FOUND)
+    add_executable(standard_srm_bayer_prepare src/standard_srm_bayer_prepare.cpp)
+    target_link_libraries(
+      standard_srm_bayer_prepare ${OpenCV_LIBS} nlohmann_json::nlohmann_json)
+    ament_target_dependencies(
+      standard_srm_bayer_prepare rclcpp sensor_msgs geometry_msgs)
 endif()
 
 # 仿真自瞄探针：运行检测、跟踪、瞄准和 Shooter，并发布模拟器云台指令。

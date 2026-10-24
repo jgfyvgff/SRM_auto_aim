@@ -1,6 +1,7 @@
 #include "hikrobot.hpp"
 
 #include <libusb-1.0/libusb.h>
+#include <unordered_map>
 #include <utility>
 
 #include "device_clock_mapper.hpp"
@@ -10,8 +11,10 @@ using namespace std::chrono_literals;
 
 namespace io
 {
-HikRobot::HikRobot(double exposure_ms, double gain, const std::string & vid_pid)
-: exposure_us_(exposure_ms * 1e3), gain_(gain), queue_(1), daemon_quit_(false), vid_(-1), pid_(-1)
+HikRobot::HikRobot(
+  double exposure_ms, double gain, const std::string & vid_pid, bool capture_raw_bayer)
+: exposure_us_(exposure_ms * 1e3), gain_(gain),
+  capture_raw_bayer_(capture_raw_bayer), queue_(1), daemon_quit_(false), vid_(-1), pid_(-1)
 {
   set_vid_pid(vid_pid);
   if (libusb_init(NULL)) tools::logger()->warn("Unable to init libusb!");
@@ -63,10 +66,21 @@ void HikRobot::read_timed(cv::Mat & img, FrameTiming & timing)
 bool HikRobot::read_timed_for(
   cv::Mat & img, FrameTiming & timing, std::chrono::milliseconds timeout)
 {
+  cv::Mat raw_bayer;
+  std::string raw_bayer_encoding;
+  return read_timed_for(img, timing, timeout, raw_bayer, raw_bayer_encoding);
+}
+
+bool HikRobot::read_timed_for(
+  cv::Mat & img, FrameTiming & timing, std::chrono::milliseconds timeout,
+  cv::Mat & raw_bayer, std::string & raw_bayer_encoding)
+{
   CameraData data;
   if (!queue_.pop_for(data, timeout)) return false;
   img = std::move(data.img);
   timing = data.timing;
+  raw_bayer = std::move(data.raw_bayer);
+  raw_bayer_encoding = std::move(data.raw_bayer_encoding);
   return true;
 }
 
@@ -210,11 +224,16 @@ void HikRobot::capture_start()
       // 「第二行第二、三列」，GenICam 取「第一行第一、二列」，因此必须交叉映射，
       // 同名对同名会让 R/B 互换（曾使 imshow 与 YOLO 都看到反色图）。
       //Bayer格式转换映射表
-      const static std::unordered_map<MvGvspPixelType, cv::ColorConversionCodes> type_map = {
-        {PixelType_Gvsp_BayerGR8, cv::COLOR_BayerGB2BGR},
-        {PixelType_Gvsp_BayerRG8, cv::COLOR_BayerBG2BGR},
-        {PixelType_Gvsp_BayerGB8, cv::COLOR_BayerGR2BGR},
-        {PixelType_Gvsp_BayerBG8, cv::COLOR_BayerRG2BGR}};
+      struct BayerFormat
+      {
+        cv::ColorConversionCodes conversion;
+        const char * ros_encoding;
+      };
+      const static std::unordered_map<MvGvspPixelType, BayerFormat> type_map = {
+        {PixelType_Gvsp_BayerGR8, {cv::COLOR_BayerGB2BGR, "bayer_grbg8"}},
+        {PixelType_Gvsp_BayerRG8, {cv::COLOR_BayerBG2BGR, "bayer_rggb8"}},
+        {PixelType_Gvsp_BayerGB8, {cv::COLOR_BayerGR2BGR, "bayer_gbrg8"}},
+        {PixelType_Gvsp_BayerBG8, {cv::COLOR_BayerRG2BGR, "bayer_bggr8"}}};
       const auto conversion = type_map.find(pixel_type);
       if (conversion == type_map.end()) {
         tools::logger()->error(
@@ -223,10 +242,15 @@ void HikRobot::capture_start()
         MV_CC_FreeImageBuffer(handle_, &raw);
         break;
       }
-      cv::cvtColor(img, dst_image, conversion->second);
+      // SDK 缓冲区会在本轮结束时释放；只在录制时复制原始 Bayer，算法仍用原有 BGR 转换。
+      cv::Mat raw_bayer;
+      if (capture_raw_bayer_) raw_bayer = img.clone();
+      cv::cvtColor(img, dst_image, conversion->second.conversion);
       img = dst_image;
 
-      queue_.push({img, timing});
+      queue_.push({
+        img, timing, std::move(raw_bayer),
+        capture_raw_bayer_ ? conversion->second.ros_encoding : ""});
 
       ret = MV_CC_FreeImageBuffer(handle_, &raw);
       if (ret != MV_OK) {

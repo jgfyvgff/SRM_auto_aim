@@ -15,7 +15,9 @@ using namespace diagnostics;
 
 FrameCaptureStage::FrameCaptureStage(FrameCaptureOptions options)
     : options_(std::move(options)),
-      camera_(options_.config_path, options_.camera_overrides),
+      camera_(
+          options_.config_path, options_.camera_overrides,
+          options_.capture_bayer_for_rosbag),
       detector_(options_.config_path)
 {
     if (options_.image_width <= 0 || options_.image_height <= 0 ||
@@ -31,9 +33,16 @@ CaptureResult FrameCaptureStage::next()
         return {CaptureKind::Done, {}};
     }
     cv::Mat image;
+    cv::Mat raw_bayer;
+    std::string raw_bayer_encoding;
     io::FrameTiming timing;
     // 相机驱动内部已有取图线程；这里只取缓存帧，限时等待避免断流时无法 join。
-    if (!camera_.read_timed_for(image, timing, std::chrono::milliseconds(50))) {
+    const bool frame_read = options_.capture_bayer_for_rosbag
+        ? camera_.read_timed_for(
+            image, timing, std::chrono::milliseconds(50),
+            raw_bayer, raw_bayer_encoding)
+        : camera_.read_timed_for(image, timing, std::chrono::milliseconds(50));
+    if (!frame_read) {
         return {CaptureKind::Retry, {}};
     }
     if (image.empty()) {
@@ -51,6 +60,8 @@ CaptureResult FrameCaptureStage::next()
 
     FrameInput input;
     input.image = std::move(image);
+    input.raw_bayer = std::move(raw_bayer);
+    input.raw_bayer_encoding = std::move(raw_bayer_encoding);
     input.timing = timing;
     input.captured_frame = captured_frames_;
     const auto frame_read_at = Clock::now();
@@ -124,6 +135,8 @@ FrameOutput FrameAlgorithmStage::process(
 {
     FrameOutput output;
     output.image = std::move(input.image);
+    output.raw_bayer = std::move(input.raw_bayer);
+    output.raw_bayer_encoding = std::move(input.raw_bayer_encoding);
     output.timing = input.timing;
     output.image_timestamp = input.image_timestamp;
     output.sample = std::move(input.sample);

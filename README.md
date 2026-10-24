@@ -283,10 +283,79 @@ MPC 初始状态，并从当前时刻生成参考轨迹。协议没有真实采�
   --debug-jsonl=/tmp/real_srm_debug.jsonl
 ```
 
-窗口中黄色为 YOLO 检测框，蓝色为当前 Tracker/EKF 装甲板投影，洋红色为 Aimer
-未来瞄准投影；按 `s` 保存当前正立显示帧，按 `q` 或 `Esc` 退出。默认保存到
+需要现场录制图像及对应的云台四元数时，可增加 `--rosbag-dir`。HikRobot 相机写入
+传感器原始 Bayer8 图像，其他相机写入 BGR8；目录必须尚不存在。离线转换 Bayer 图像时，
+应按消息的 `encoding` 去马赛克；HikRobot 使用的 Bayer 排列映射与实时 OpenCV 转换一致。
+图像和 `/gimbal/orientation` 使用同一个 ROS 时间戳，姿态是按图像时间从串口反馈缓存
+插值得到的 `gimbal_to_world`：
+
+```bash
+./build/standard_srm configs/real_auto_aim.yaml \
+  --port=/dev/ttyACM0 \
+  --rosbag-dir=/tmp/real_srm_capture
+ros2 bag info /tmp/real_srm_capture
+ros2 bag play /tmp/real_srm_capture
+```
+
+录制队列上限为 16 帧；磁盘写入在后台线程执行。队列满或写盘失败时停止 rosbag 录制并报告，
+视觉跟踪继续运行。没有有效图像时间或匹配串口姿态的帧不会写入。时间戳保留 steady clock
+的帧间隔，并映射到进程启动时的系统时钟基准；串口协议没有下位机采样时刻，因此该姿态
+仍是主机反馈插值，不代表曝光瞬间的硬件同步姿态。rosbag 可供 ROS2 工具和订阅节点回放；
+本仓库的 `standard_srm_replay` 仍读取 `--debug-jsonl` 与 `--replay-frame-dir` 配套数据，
+不会直接从 rosbag 重跑算法。
+
+#### Bayer rosbag 转换与离线重跑
+
+`standard_srm_bayer_prepare` 订阅 `/camera/image_raw` 和 `/gimbal/orientation`，
+按消息 Header 时间戳配对，生成无损 BGR PNG、回放输入 JSONL，并补齐 Aimer 与
+Planner 的回放输入。bag 播放结束且超过空闲超时后，节点会检查配对数量和 JSONL
+帧数；不一致会失败退出。订阅队列深度为 64 并使用 Reliable QoS；仍建议低速播放，
+让大图像的转换和写盘有足够余量。
+
+终端一启动转换订阅节点：
+
+```bash
+source /opt/ros/humble/setup.bash
+./build/standard_srm_bayer_prepare \
+  --source-jsonl=/home/ljq/Documents/ChatGPT/sim_aim/captures/bayer_20261023_051143.jsonl \
+  --frames-dir=/home/ljq/Documents/ChatGPT/sim_aim/captures/bayer_20261023_051143_bgr \
+  --output-jsonl=/home/ljq/Documents/ChatGPT/sim_aim/captures/bayer_20261023_051143_replay.jsonl
+```
+
+终端二播放原始 bag：
+
+```bash
+source /opt/ros/humble/setup.bash
+ros2 bag play /home/ljq/Documents/ChatGPT/sim_aim/captures/bayer_20261023_051143 --rate 0.05
+```
+
+转换成功后，在 PlotJuggler 启动 JSON UDP Server 并监听 `127.0.0.1:9871`，
+然后运行离线算法回放：
+
+如果当前机器没有可用的 OpenVINO GPU，将配置副本中的 `device` 改为 `CPU`，
+再把下面命令的配置路径指向该副本；不要修改真机配置。
+
+```bash
+./build/standard_srm_replay configs/real_auto_aim.yaml \
+  --input-jsonl=/home/ljq/Documents/ChatGPT/sim_aim/captures/bayer_20261023_051143_replay.jsonl \
+  --frames-dir=/home/ljq/Documents/ChatGPT/sim_aim/captures/bayer_20261023_051143_bgr \
+  --output-jsonl=/home/ljq/Documents/ChatGPT/sim_aim/captures/bayer_20261023_051143_result.jsonl \
+  --show=1 --debug-udp
+```
+
+离线回放不打开相机或串口；它从头运行当前 Detector、Tracker、Aimer 和可重建
+Planner 输入的代码。`--show=1` 打开叠图窗口，`--debug-udp` 将逐帧结果发送给
+PlotJuggler。PNG 和结果 JSONL 会占用额外磁盘空间，输出路径须预先留空.
+
+窗口中黄色为检测框，绿色为依据同帧 PnP 和半径先验拟合的四板整车模型；两块检测框
+会共同约束车体中心和姿态，并显示两者的中心差、姿态差。只有一块检测时会标记为
+`single (unverified)`，表示缺少第二块板的独立几何校验。按 `q` 或 `Esc` 退出。默认保存到
 `/tmp/real_srm_frame.jpg`，也可以使用 `--save-frame=/path/to/frame.jpg` 指定路径。
 `--show=0`（默认）适用于无桌面环境。
+
+只核对一帧双检测的整车几何时，可设置 `--model-frame-id=88`。回放仍从头处理完整数据，
+但只在指定帧显示四个绿色板框，不叠检测框或状态文字；窗口会停在该帧，按非 `q`/`Esc` 键后继续。
+使用 `--model-frame-output=/path/to/model.png` 可另存这张单帧图；指定帧必须有两块可联合拟合的检测。
 标准四装甲首次捕获时，Aimer 的低速选板锁从直接观测的 ID0 开始；目标丢失后清锁。
 这避免捕获初期短暂关联相邻板后长期瞄向该板。相邻板自身的模型投影偏差仍需单独核查。
 程序会同时记录成功帧和被跳过的帧，避免只分析检测成功样本。运行结束后在任意
