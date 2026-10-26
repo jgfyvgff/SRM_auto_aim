@@ -43,6 +43,30 @@ int main()
     return 1;
   }
 
+  // 降低距离更新增益时仍用基准 R 做 NIS，避免倍率本身放宽 Tracker 的漏检灵敏度。
+  auto distance_scaled_filter = make_filter(4);
+  Eigen::VectorXd distance_measurement = Eigen::VectorXd::Zero(4);
+  distance_measurement[2] = 2.0;
+  Eigen::MatrixXd distance_update_R = R4;
+  distance_update_R(2, 2) = 9.0;
+  const Eigen::MatrixXd distance_nis_R = R4;
+  const auto subtract = [](const Eigen::VectorXd & a, const Eigen::VectorXd & b) {
+    return a - b;
+  };
+  distance_scaled_filter.update(
+    distance_measurement, H4, distance_update_R,
+    [](const Eigen::VectorXd & x) { return x; }, subtract, &distance_nis_R);
+  if (
+    !nearly_equal(distance_scaled_filter.last_kalman_gain(2, 2), 0.1) ||
+    !nearly_equal(distance_scaled_filter.last_nis, 2.0) ||
+    distance_scaled_filter.recent_nis_failures.back() != 0 ||
+    (distance_scaled_filter.last_measurement_noise - distance_update_R).norm() > 1e-9 ||
+    (distance_scaled_filter.last_nis_measurement_noise - R4).norm() > 1e-9)
+  {
+    std::cerr << "距离更新 R 与 NIS 基准 R 未正确解耦\n";
+    return 1;
+  }
+
   // 四维观测的 NIS=12.5，超过 9.488，应被判定为异常创新。
   auto outlier_filter = make_filter(4);
   Eigen::VectorXd outlier_measurement = Eigen::VectorXd::Zero(4);

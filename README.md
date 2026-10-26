@@ -253,8 +253,11 @@ Tracker 使用。该映射仍带有未知的
 
 真机自瞄入口 `standard_srm` 复用海康图像、串口反馈、YOLOv5、PnP、Tracker
 和 Aimer；默认只读，同时用已有 Planner 计算诊断轨迹，不发送串口控制帧。
-只有显式指定 `--enable-tx=1` 才会通过现有 USB CDC 协议发送 yaw/pitch，且
-`fire_flag` 永远固定为 0。本次只修改上位机仓库，不修改下位机固件。
+只有显式指定 `--enable-tx=1` 才会通过现有 USB CDC 协议发送 yaw/pitch。
+开火请求还需额外指定 `--enable-fire=1`；默认关闭。启用后，仅当 Planner 收敛、
+`fire_thresh` 判据通过且未处于 temp_lost 外推时发送 `fire_flag=1`。反馈弹速无效时，
+仅启用 `--tx-use-nominal-speed=1` 才允许命令发送；此时开火判据使用配置中的名义弹速。
+保持角和异常回退不会请求开火。本次只修改上位机仓库，不修改下位机固件。
 Planner 从串口缓存有效窗口内相距较远的两帧主机接收时间估计当前角速度，按当前云台姿态建立
 MPC 初始状态，并从当前时刻生成参考轨迹。协议没有真实采样时刻或速度，所以该估计
 不能视作硬件同步测量。弹速反馈为 0 时，Planner 使用配置中的
@@ -468,14 +471,14 @@ UDP 诊断与显示。采集到算法只缓存 1 帧，算法到主线程只缓�
 选中的 MPC 规划角或目标参考角直接进入串口命令邮箱，不再按上一条命令做速率或单步裁剪。
 命令进入邮箱后跨帧保留，避免视觉处理期间交替发送目标与零命令。Tracker 未跟踪时，正常有图像
 和新鲜反馈的帧会保持最后一条已提交命令；首次跟踪前使用当前反馈角，
-`fire_flag` 恒为 0。
+默认 `fire_flag` 为 0；显式启用开火后，仅符合 Planner 和实测弹速条件的跟踪命令可置为 1。
 保持角需要由视觉帧持续刷新；超过 `max_image_age_ms` 未刷新时，串口线程回退零命令，
 即使检测或规划线程卡住也不会无限发送旧角度。
 速度估计短时不可用时仍可跟随有效参考轨迹；图像时间戳无效、串口反馈缺失或轨迹非法等硬故障
 会清空命令邮箱，随后发送 yaw=0、pitch=0、fire=0。
 反馈弹速在 10–25 m/s 时使用实测值；若反馈为 0，可显式设置
-`--tx-use-nominal-speed=1`，让无开火控制计算使用配置中的名义弹速。有效反馈弹速
-始终优先，`fire_flag` 始终为 0。JSONL 的 `tx_speed_source` 会标明本帧来源。
+`--tx-use-nominal-speed=1`，让云台控制和开火判据在反馈弹速无效时使用配置中的名义弹速。
+有效反馈弹速始终优先。JSONL 的 `tx_speed_source` 会标明本帧来源。
 默认情况下 `temp_lost` 帧会在连续丢失
 帧数不超过 `--tx-temp-lost-frames`（默认 5 帧）时允许用 Tracker 预测目标继续跟随，
 帧数对应的实际时长随视觉帧率变化；可用 `--tx-follow-temp-lost=0` 关闭预测跟随，
@@ -483,7 +486,7 @@ UDP 诊断与显示。采集到算法只缓存 1 帧，算法到主线程只缓�
 外推命令标记为 `tx_command_mode=extrapolate` 和 `tx_extrapolating=true`；没有实际发送
 的外推尝试不会计入。`planner_control` 仅描述 Planner 求解状态，不等同于命令是否已发送；
 以 `tx_command_sent` 和 `tx_command_mode` 为准。超出帧数上限、解算无效或进入 `lost`
-时保持上一条已提交命令，`fire_flag` 仍恒为 0。
+时保持上一条已提交命令，并清除 `fire_flag`。
 `tx_command_sent` 只表示命令进入邮箱；`tx_wire_target_frames` 和
 `tx_wire_zero_frames` 是串口线程成功写入的累计帧数，不等于下位机执行回执。
 默认参数为 20 ms 发送周期和 100 ms 命令有效期。`tracking` 表示普通
@@ -568,6 +571,56 @@ YOLOv8 的动态 ROI 参数独立于 YOLOv5：`yolov8_dynamic_roi_scale` 默认 
 真机配置用 `yolov8_dynamic_roi: false` 独立关闭 YOLOv8 裁剪；
 当前 701 帧回放里整帧比动态 ROI 少暂失。切回 `yolo_name: yolov5` 时，
 原有 `dynamic_roi: true` 和 YOLOv5 参数继续生效。
+
+回放可加 `--endpoint-range-shadow=1` 做端点测距影子对照。它在原分辨率图像上重新拟合灯条边缘，
+记录原始/拟合长度、亮度覆盖率、饱和像素比例、最大暗缺口、PnP 距离和重投影误差。
+只有端点检测成功、PnP 结果有限且沿原始 YOLO 灯条跨度采样的两侧亮度覆盖率都不低于 0.90 时，
+才把拟合距离用于目标初始化或
+已经选中的观测更新；关联选择仍使用原始 YOLO 角点和原始距离，方位、俯仰、板面 yaw 保留原始值，
+yaw 噪声也沿用原始距离对应的值。最大暗缺口和饱和比例只作诊断，重投影误差不作为正确测距的证明。
+该选项默认关闭，只用于离线回放，不改变 `standard_srm` 真机路径。
+先用 `--endpoint-edge-probe=1 --endpoint-range-shadow=0` 做只读对照：
+逐检测记录左右灯条的灰度、蓝红通道对比、目标颜色通道截顶比例，
+以及灰度和颜色梯度给出的上下端点候选。端点候选不是可靠性结论；
+该模式仍记录现有轮廓拟合及其 PnP 结果，但不替换 Tracker 的距离观测。
+诊断按 Tracker 处理后的检测索引写入 `association_detections`。
+`--roi-depth-probe=1` 要求 `yolo_name: yolov8`，会为每个原始检测框建立局部 ROI，
+再用独立 YOLOv8 实例运行完整 C++ 检测、NMS 和分类流程。结果记录 ROI 范围、各阶段候选数、
+全部候选的类别/置信度/中心偏移、灯条长度和角点偏移，以及按最小重投影误差 IPPE 分支计算的
+相机系距离和重投影误差；多个同标签候选会明确标记，
+不强行认定为同一块物理装甲板。该探针不替换初始化或更新距离，也不传入 Tracker，
+因此只用于离线测量对照。可用 `--roi-depth-probe-scale` 分别取 `8`、`12`、`16`
+扫描 ROI 边长倍率（默认 `12`）；`--roi-depth-probe-min-side` 和
+`--roi-depth-probe-max-side` 分别设定边长上下限（默认 `160` 和 `320` px）；
+结果会逐检测记录配置和 `roi_inference_ms`。该耗时覆盖一次完整 `YOLOV8::detect()` 调用，
+包含预处理、推理和后处理，不是单独的模型内核耗时，也不代表真机运行时性能。
+完整角点 A/B 时，两组都启用 `--roi-depth-probe=1`，仅 ROI 组再启用
+`--roi-corners-into-tracker=1`。只有唯一同标签且 PnP 距离有效的候选角点会进入 Tracker；
+候选歧义或无效时回退原角点。该开关仅供 `standard_srm_replay` 离线使用。
+距离条件降权实验使用 `--distance-quality-mode=record|adaptive`，默认 `off`。
+`record` 在固定相机姿态、固定 IPPE 分支下对 8 个角点坐标做 ±0.25 px 中心差分，
+记录 EKF 所用世界系径向距离的灵敏度 `s=||J_d||`（m/px），不改观测和更新。
+分支用完整姿态的一对一连续性匹配，不能以 OpenCV 输出索引认定身份；分支不明或 PnP 失败回退倍率 1。
+
+先从主序列记录组所有有效更新尝试的 s 取中位数并冻结，再将同一个值传给两段完整回放：
+`--distance-quality-mode=adaptive --distance-quality-reference=<冻结值>`。
+此时仅更新用距离方差乘以 `clamp((s/reference)^2,1,4)`；其它 R 分量、初始化、
+关联规则、NIS 基准 R 和后验容限不变。P 与后续关联会随轨迹改变，因此 NIS 数值不会保证相同。
+实验拒绝与 ROI 替换、其它关联策略或固定 R 扫描混用，不读取或修改生产 YAML。
+
+每次更新的 `distance_quality` 记录有效性、失败原因、分支、8 维距离导数、倍率和计算耗时；
+`distance_r_base_m2/used_m2` 与已有创新、中心增益、更新前后中心组成逐次更新核查记录。
+s 只描述局部几何敏感性，没有测量实际角点误差，倍率上限 4 也未完成噪声标定；
+必须同时比较两段序列的跳变尾部、收敛、旋转速度、多板投影和暂失恢复，不能仅凭更新变小认定有效。
+
+距离观测降权敏感性可用 `--distance-update-r-scale` 做离线扫描，默认 `1`，允许范围 `1` 到 `1e6`。
+倍率只用于 EKF 更新的距离方差；目标初始化、关联噪声、NIS/lost 判据和后验残差容限保持基准值。
+`1e6` 可近似表示初始化后不再依赖距离更新，但不能撤销初始化时使用的 PnP 距离。
+回放 JSONL 逐帧记录倍率、基准/实际距离方差，以及本次更新中距离观测对中心 x/y/z 修正的 Kalman 增益。
+该参数不进入 YAML，也不改变真机 `standard_srm`。
+板面 yaw 更新标准差可用 `--yaw-update-sigma-deg=25|35|45` 做离线敏感性扫描；默认 `0`
+保持当前距离相关的基准方差。该参数只替换 EKF 更新 R 的 yaw 对角项；关联和 NIS 使用的基准 R 不变，
+参数不进入 YAML，也不改变真机 `standard_srm`。每帧 JSONL 记录该扫描值及更新 R、基准 NIS 下的 yaw 创新诊断。
 旧异步 `MultiThreadDetector` 从模型读取输入尺寸，但仍只走整帧推理；
 真机 `standard_srm` 和离线回放使用检测器自己的动态 ROI 路径。
 
@@ -635,52 +688,58 @@ Tracker 世代变化和状态消息序列缺口。分析脚本会同时订阅该
 对该样本产生了正收益。默认允许的时间对齐误差为 `0.03 s`，可通过
 `--prediction-match-tolerance` 调整。
 
-Tracker 对每个同名检测框分别以各模型 ID 的预测 yaw 选择 IPPE 姿态分支，再计算
-该分支与模型 ID 的关联误差。标准四装甲的图像门启用后，还要求当前 ID 的预测中心比
-其两块物理相邻板更接近检测中心，且中心误差不超过检测框长边；背面板不参与比较。
-仿真 `demo.yaml` 捕获后的前 4 次成功更新暂缓图像门，帮助角速度从初值收敛；综合分数、
-空间残差、Mahalanobis 门和角速度物理上限仍有效。预热结束后若投影无效，本帧关联失败，
-短时丢失按原状态机保持。
-通过全部门限后，同一帧按综合关联分数选择候选。旧 ID 仍通过门限时，其他 ID
-的排序分数增加 `association_id_switch_score_margin`（真机与仿真配置为 0.05 等效 rad）；
-该值只影响排序，不改变接收门限。旧 ID 被拒绝或新 ID 的原始分数优势超过该值时仍可
-切换；排序分数相同时再按马氏距离比较，避免两个机器人同时进入画面时把同名装甲板
-一起写入同一个目标；其余检测候选仍会发布到 `/sim_aim/debug` 供诊断。
-`association_model_candidates` 额外记录每个检测框对各模型 ID 的门限、马氏距离、
-位置/姿态误差和该 ID 所选的 IPPE yaw，按检测框与模型 ID 的遍历顺序保存；
-最多保留八项，超出时只丢弃诊断记录，不影响实际关联。它用于分析初始
-模型 ID 锁定，不参与 Tracker 决策，也不能当作物理装甲板编号。
-真机 JSONL 中的 `association_primary_predicted_center_error_px`、
-`association_secondary_predicted_center_error_px` 和各
-`association_model_candidates[].predicted_center_error_px` 是各候选在 EKF 更新前
-按继承的物理模型回投影所得中心，与检测四角点均值的像素距离。对应的
-`predicted_center_error_valid` 字段为 0 时误差为 `null`。该数值用于诊断；
-`image_model_gate_passed` 记录相邻预测模型 ID 比较是否通过。投影误差同时包含
-模型、姿态和标定误差，不能单凭它修改外参或指定固定像素门限。
-真机 JSONL 与仿真探针还记录 `image_reference_error_px`、
-`image_adjacent_error_px` 和 `image_observed_extent_px`，分别对应当前模型中心误差、
-两块相邻板中较小的中心误差和检测框长边；未计算图像门限时为 `-1`。
-仿真 `/sim_aim/debug` 还记录 `association_primary_detected_corner_{0..3}_{x,y}` 和
-`association_primary_truth_projected_corner_{0..3}_{x,y}`，单位为 px；前者是回查到的
-检测框角点，后者是 TF 真值姿态经相机模型投影的角点。坐标不可用时为 `-1`。
-关联门限通过后，还会比较同一块装甲板更新前后的三维位置残差。已知几何目标
-使用两组装甲中较大半径的旋转直径作为残差恶化上限；超过时恢复本帧预测状态与
-EKF 统计。其他目标仍使用本帧距离观测噪声的一个标准差。拒绝帧不增加装甲切换计数。
-`/sim_aim/debug` 中该候选可表现为 `gate_passed=true`、`accepted=false`。
-`configs/demo.yaml` 中的
-`association_max_score` 以等效弧度为单位，综合装甲板角度误差、按目标距离归一化的
-位置误差和距离误差，超限时保留预测状态而不吸收坏观测。为避免远距离下角度归一化
-掩盖较大的米制误差，`association_max_position_error` 和
-`association_max_distance_error` 还分别限制三维位置、距离残差，单位为 m。
-`association_max_angle_error` 仅用于记录固定角度诊断结果，单位为 rad，不再单独拒绝
-观测。实际关联接受由综合分数、位置/距离绝对误差和 `S = HPHᵀ + R` 的 Mahalanobis
-门控共同决定；角度误差仍参与综合分数，因此明显错误的姿态仍会被拒绝。
+Tracker 对每个同名同类型检测框枚举当前预测距离最近的三个板号，并针对每个检测框与板号
+候选，以该板预测 yaw 选择 IPPE 姿态分支。预测四边形与检测四边形允许循环移位和反向绕序
+后再比较，避免角点数组起点不同造成错误的大 RMS。图像几何代价由检测对角线归一化的中心
+偏差、四边方向差和四边相对长度差相加；角点 RMS 与最优排列编号只作为诊断输出。
 
-Tracker 还会计算 4 维观测创新的马氏距离：`S = HPHᵀ + R`。该距离仍用于统计门控；
-通过全部门限的候选按带 ID 连续性偏好的关联分数排序，排序分数相同时才比较马氏距离。
-`association_max_mahalanobis_distance` 是无量纲统计门限；位置
-和距离绝对误差门限仍保留作为安全门；固定角度门降级为诊断项。它不是固定处理延迟，
-也不替代基于真实时间戳的延迟测量与预测时间对齐。
+综合分数、三维位置、距离、Mahalanobis、固定角度和旧图像中心门都记录为诊断量，不用这些
+阈值提前锁死候选板号。每帧精确枚举最多三个可见模型板的组合，先最大化一对一匹配数，再
+最小化图像几何代价；无可用图像投影的候选只在同等匹配数下靠后，NIS 和 Tongji 复合分数
+用于打破平局。每个检测框和模型板号最多使用一次，超出可分配板数的检测框保持未匹配。
+只有图像几何量全部不可用时才按 NIS 与 Tongji 复合分数回退，避免固定像素门或现有物理
+阈值把旋转时的正确 ID 排除。所有候选都基于同一帧 EKF 更新前状态，分配完成后按检测顺序
+更新；Target::update 原有的后验有限性、距离和角速度约束保持不变。
+
+真机 JSONL 的 association_detections 按 Tracker 实际过滤、排序后的顺序记录框和四角点；
+association_assignment_mode 记录使用全局图像几何分配还是 Tongji 分数回退，
+association_physical_candidate_count 记录通过旧物理阈值的诊断候选数，
+association_unmatched_detection_count 记录未匹配框数。association_selected_candidates 用同一
+detection_index 记录分配结果、物理可行性、几何代价、角点排列和 EKF 接收状态。
+association_model_candidates 记录
+检测框与候选板号的组合，最多保留八项；超出容量只截断诊断，不影响分配。association_primary
+和 association_secondary 继续保留前两个分配候选的向后兼容字段。
+
+第一阶段排序实验可用 `--association-image-cost=legacy|corner-rms`；默认 `legacy` 保持原行为。
+`corner-rms` 对循环移位及反向绕序独立寻找最小四角 RMS，再除以检测框包围盒对角线长度，
+只替换分配器的图像代价。匹配数量优先级、PnP 分支选择、观测更新顺序和滤波参数保持不变。
+本阶段禁止同时开启下述关联过滤实验。`association_image_cost_mode` 记录模式；
+完整候选中的 `image_min_corner_rms_px/norm`、`image_min_corner_point_permutation`
+记录独立最优 RMS 及其对应，`image_ranking_cost` 记录实际分配代价。
+`predicted_yaw` 和 `predicted_corners_px` 保存同帧更新前候选投影，供叠图复核。
+旧 `image_geometry_cost`、`image_corner_rms_px` 仍属于旧三项代价最优对应，不能混读。
+各组从首帧独立回放；RMS 参与排序后，其下降不能单独作为成功证据，还需检查旋转收敛、
+多板一致性、暂失恢复和初始/重建阶段的中心修正。
+
+`standard_srm_replay` 可用 `--association-image-corner-rms-max-px=20|40|80` 进行
+允许未匹配的图像几何代价消融：阈值作用于旧三项几何代价所选角点对应的 RMS（px），
+不是独立最小角点 RMS，也不是综合图像代价。
+所有组合都超过上限时该帧只预测，不会走旧分数兜底。单独用
+`--association-physical-feasible-gate=true` 可将 `physical_feasible` 作为对照资格条件；
+图像 RMS、单独物理可行性、完整旧门三种实验过滤每轮只能选一种。可用
+`--association-require-gate-passed=true` 测试全部现有关联门作为候选资格条件；它包含综合评分、
+位置、距离、马氏距离，以及启用阶段的图像模型门。若整帧候选都未通过，该组只预测、不使用旧分数兜底。
+每帧会在 `association_experiment_model_candidates` 记录完整候选、门状态和拒绝原因，并在
+`association_experiment_updates` 记录每次 EKF 更新的四维创新、中心状态各观测通道的
+增益行、更新前中心、尝试中心和最终提交中心。各组必须从首帧独立完整回放。
+
+真机 JSONL 中的 association_primary_predicted_center_error_px、
+association_secondary_predicted_center_error_px 和各
+association_model_candidates[].predicted_center_error_px 仍记录更新前模型投影中心与检测四角
+均值的距离。image_reference_error_px、image_adjacent_error_px 和
+image_observed_extent_px 仅供回看旧图像中心门诊断；它们不参与当前板号排序。
+角点误差、中心误差和位置残差都同时受模型、PnP、姿态时序和标定影响，不能单凭某一项
+误差直接修改外参或新增固定像素门限。
 
 该指标使用仿真视觉观测作为近似真值，适合比较预测前后的相对效果；它仍包含 PnP
 噪声、时间戳误差和装甲板短时不可见造成的影响，不能替代真实弹丸落点测试。

@@ -47,8 +47,9 @@ const std::string kKeys =
     "{port|/dev/ttyACM0|USB CDC 串口设备}"
     "{check-config|false|只校验配置，不打开相机和串口}"
     "{show|false|显示实时调试窗口}"
-    "{enable-tx|false|启用无开火 yaw/pitch 控制发送，默认关闭}"
-    "{tx-use-nominal-speed|false|弹速反馈无效时允许使用配置名义弹速，仅无开火}"
+    "{enable-tx|false|启用 yaw/pitch 控制发送，默认关闭}"
+    "{enable-fire|false|允许 Planner 满足开火条件时发送 fire_flag=1，默认关闭}"
+    "{tx-use-nominal-speed|false|反馈弹速无效时允许名义弹速驱动云台和开火判据}"
     "{tx-period-ms|20|控制发送周期，单位 ms}"
     "{tx-command-ttl-ms|100|命令有效期，单位 ms}"
     "{tx-follow-temp-lost|true|temp_lost 期间继续发送预测跟随指令，默认开启}"
@@ -90,6 +91,7 @@ int run_standard_srm(int argc, char * argv[])
         const double planner_debug_speed =
             real_yaml["planner_debug_bullet_speed_mps"].as<double>();
         const bool enable_tx = cli.get<bool>("enable-tx");
+        const bool enable_fire = cli.get<bool>("enable-fire");
         const bool tx_use_nominal_speed = cli.get<bool>("tx-use-nominal-speed");
         const int tx_period_ms = cli.get<int>("tx-period-ms");
         const int tx_command_ttl_ms = cli.get<int>("tx-command-ttl-ms");
@@ -109,6 +111,9 @@ int run_standard_srm(int argc, char * argv[])
         }
         if (tx_period_ms <= 0 || tx_command_ttl_ms <= 0) {
             throw std::invalid_argument("Invalid TX timing configuration");
+        }
+        if (enable_fire && !enable_tx) {
+            throw std::invalid_argument("--enable-fire requires --enable-tx");
         }
         if (tx_temp_lost_max_frames < 0) {
             throw std::invalid_argument("--tx-temp-lost-frames must be non-negative");
@@ -159,9 +164,9 @@ int run_standard_srm(int argc, char * argv[])
             recorder.enabled());
         if (enable_tx) {
             tools::logger()->warn(
-                "[standard_srm/TX] enabled: yaw/pitch only, fire_flag is forced to 0; "
-                "lower-controller timeout is not modified, nominal_speed={}",
-                tx_use_nominal_speed);
+                "[standard_srm/TX] enabled: fire request opt-in={}, "
+                "requires converged Planner and measured bullet speed; nominal_speed={}",
+                enable_fire, tx_use_nominal_speed);
         }
 
         const auto raw_frame_dir = cli.get<std::string>("raw-frame-dir");
@@ -176,7 +181,7 @@ int run_standard_srm(int argc, char * argv[])
                 config_path,
                 real_auto_aim::TxCommandOptions{
                     enable_tx, tx_use_nominal_speed, tx_period_ms, tx_command_ttl_ms,
-                    tx_follow_temp_lost, tx_temp_lost_max_frames},
+                    tx_follow_temp_lost, tx_temp_lost_max_frames, enable_fire},
                 config.max_image_age, planner_debug_speed, !replay_frame_dir.empty()},
             serial_feedback);
         // 只读采集可等待较慢的磁盘；启用 TX 时以命令 TTL 和图像时效较小者为上限。

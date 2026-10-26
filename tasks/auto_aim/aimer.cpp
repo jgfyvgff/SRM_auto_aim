@@ -192,10 +192,8 @@ AimPoint Aimer::choose_aim_point(const Target & target, int & lock_id) const
   Eigen::VectorXd ekf_x = target.ekf_x();
   std::vector<Eigen::Vector4d> armor_xyza_list = target.armor_xyza_list();
   auto armor_num = armor_xyza_list.size();
-  // 首次捕获只有 ID0 的位置经过直接观测；标准四装甲的低速锁也从它开始。
-  // 否则下一帧短暂关联到相邻板，就可能把 Aimer 长期锁在推算板上。
+  // 同济原版在首次捕获时直接瞄准当前观测板，但不提前建立低速跨帧锁。
   if (!target.jumped) {
-    lock_id = armor_num == 4 ? 0 : -1;
     return {true, armor_xyza_list[0], 0};
   }
 
@@ -235,8 +233,8 @@ AimPoint Aimer::choose_aim_point(const Target & target, int & lock_id) const
       return {true, armor_xyza_list[lock_id], lock_id};
     }
 
-    // 唯一可选板成为锁定板；进入双板区域后继续沿用，直到它离开可选范围。
-    lock_id = id_list[0];
+    // 只有一块板可选时退出双板锁；再次出现两块候选时按角度重新选择。
+    lock_id = -1;
     return {true, armor_xyza_list[id_list[0]], id_list[0]};
   }
 

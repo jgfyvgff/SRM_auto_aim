@@ -88,6 +88,18 @@ YOLOV8::YOLOV8(const std::string & config_path, bool debug)
     model, device_, ov::hint::performance_mode(ov::hint::PerformanceMode::LATENCY));
 }
 
+void YOLOV8::set_fixed_roi(const cv::Rect & roi)
+{
+  if (roi.x < 0 || roi.y < 0 || roi.width <= 0 || roi.height <= 0) {
+    throw std::invalid_argument("YOLOv8 fixed ROI must have positive in-image coordinates");
+  }
+  roi_ = roi;
+  use_roi_ = true;
+  dynamic_roi_ = false;
+  last_target_box_.reset();
+  roi_miss_streak_ = 0;
+}
+
 std::list<Armor> YOLOV8::detect(const cv::Mat & raw_img, int frame_count)
 {
   debug_info_ = {};

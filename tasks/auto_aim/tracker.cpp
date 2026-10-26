@@ -6,6 +6,7 @@
 #include <cmath>
 #include <limits>
 #include <numeric>
+#include <utility>
 #include <optional>
 #include <stdexcept>
 #include <tuple>
@@ -174,6 +175,71 @@ Tracker::Tracker(const std::string & config_path, Solver & solver)
   }
 }
 
+void Tracker::set_distance_update_r_scale(double scale)
+{
+  if (!std::isfinite(scale) || scale < 1.0 || scale > 1e6) {
+    throw std::invalid_argument("Distance update R scale must be in [1, 1e6]");
+  }
+  distance_update_r_scale_ = scale;
+}
+
+void Tracker::set_distance_quality_experiment(bool enabled, double reference_m_per_px)
+{
+    if (!std::isfinite(reference_m_per_px) || reference_m_per_px < 0.0 ||
+        (!enabled && reference_m_per_px != 0.0)) {
+        throw std::invalid_argument("Invalid distance quality experiment configuration");
+    }
+    distance_quality_enabled_ = enabled;
+    distance_quality_reference_m_per_px_ = reference_m_per_px;
+}
+
+void Tracker::set_distance_quality_sigma_px(double sigma_px, double floor_m)
+{
+  if (!std::isfinite(sigma_px) || sigma_px < 0.0 || sigma_px > 50.0 ||
+      !std::isfinite(floor_m) || floor_m < 0.0) {
+    throw std::invalid_argument("Invalid distance quality sigma/floor");
+  }
+  distance_quality_sigma_px_ = sigma_px;
+  distance_quality_floor_m_ = floor_m;
+}
+
+void Tracker::set_yaw_update_sigma_deg(double sigma_deg)
+{
+  if (!std::isfinite(sigma_deg) || sigma_deg < 0.0 || sigma_deg > 180.0) {
+    throw std::invalid_argument("Yaw update sigma must be in [0, 180] degrees");
+  }
+  yaw_update_sigma_deg_ = sigma_deg;
+}
+
+void Tracker::set_association_image_corner_rms_max_px(double max_error_px)
+{
+  if (!std::isfinite(max_error_px) || max_error_px < 0.0 || max_error_px > 10000.0) {
+    throw std::invalid_argument(
+      "Association image corner RMS limit must be in [0, 10000] px");
+  }
+  association_image_corner_rms_max_px_ = max_error_px;
+}
+
+void Tracker::set_association_physical_feasible_gate(bool enabled)
+{
+  association_physical_feasible_gate_ = enabled;
+}
+
+void Tracker::set_association_gate_passed_filter(bool enabled)
+{
+  association_gate_passed_filter_ = enabled;
+}
+
+void Tracker::set_association_corner_rms_ranking(bool enabled)
+{
+    association_corner_rms_ranking_ = enabled;
+}
+
+void Tracker::set_association_update_trace_enabled(bool enabled)
+{
+  association_update_trace_enabled_ = enabled;
+}
+
 std::string Tracker::state() const { return state_; }
 
 const AssociationDebug & Tracker::association_debug() const { return association_debug_; }
@@ -215,7 +281,8 @@ const Target * Tracker::diagnostic_target() const
 }
 
 std::list<Target> Tracker::track(
-  std::list<Armor> & armors, std::chrono::steady_clock::time_point t, bool use_enemy_color)
+  std::list<Armor> & armors, std::chrono::steady_clock::time_point t, bool use_enemy_color,
+  EndpointRangeShadowMap * endpoint_range_shadow)
 {
   association_debug_ = AssociationDebug{};
   observation_accepted_ = false;
@@ -258,23 +325,12 @@ std::list<Target> Tracker::track(
 
   bool found;
   if (state_ == "lost") {
-    // 重新捕获时清空投票窗口，避免把上一次目标、甚至上一次丢失前的票带进来。
     recent_names_.clear();
-    found = set_target(armors, t);
-    if (found && !armors.empty()) push_recent_name(armors.front().name);
+    found = set_target(armors, t, false, endpoint_range_shadow);
   }//如果是lost状态，则寻找优先级最高的装甲板
 
   else {
-    if (!armors.empty()) push_recent_name(armors.front().name);
-    // 捕获阶段的投票只提出新观测标签；同一目标还须通过当前几何预测的关联门限。
-    // tracking 期间继续锁定标签，全向感知的 switching 路径不受此投票影响。
-    const bool capture_phase = (state_ == "detecting" || state_ == "temp_lost");
-    const auto winner = capture_phase
-                          ? majority_armor_name(recent_names_, relock_name_window_, relock_name_votes_)
-                          : std::nullopt;
-    const auto relabel_vote =
-      winner && winner->name != tracked_label_ ? winner : std::nullopt;
-    found = update_target(armors, t, relabel_vote);
+    found = update_target(armors, t, std::nullopt, endpoint_range_shadow);
   }
 
   state_machine(found);
@@ -411,10 +467,7 @@ void Tracker::state_machine(bool found)
       if (detect_count_ >= min_detect_count_) state_ = "tracking";
     } else {
       detect_count_ = 0;
-      // 初始 Target 刚建立时，单帧关联失败不应立即销毁；
-      // 先进入临时丢失，保留预测状态，给后续帧重新关联的机会。
-      temp_lost_count_ = 1;
-      state_ = "temp_lost";
+      state_ = "lost";
     }
   }
 
@@ -473,7 +526,8 @@ void Tracker::push_recent_name(std::optional<ArmorName> name)
 }
 
 bool Tracker::set_target(
-  std::list<Armor> & armors, std::chrono::steady_clock::time_point t, bool pose_solved)
+  std::list<Armor> & armors, std::chrono::steady_clock::time_point t, bool pose_solved,
+  EndpointRangeShadowMap * endpoint_range_shadow_map)
 {
   if (armors.empty()) return false;
 
@@ -482,22 +536,39 @@ bool Tracker::set_target(
   const auto is_balance = (armor.type == ArmorType::big) &&
                     (armor.name == ArmorName::three || armor.name == ArmorName::four ||
                      armor.name == ArmorName::five);
+  // 保留同济原版的默认分支：非二装甲、前哨站和基地目标按四装甲模型初始化。
   const auto is_standard_four_armor =
-    armor.type == ArmorType::small &&
-    (armor.name == ArmorName::two || armor.name == ArmorName::three ||
-     armor.name == ArmorName::four || armor.name == ArmorName::five);
-
-  // 未标定类别不能借用四装甲默认模型生成可供云台跟随的预测目标。
-  if (!is_balance && armor.name != ArmorName::outpost &&
-      armor.name != ArmorName::base && !is_standard_four_armor) {
-    rejected_unknown_geometry_ = true;
-    tools::logger()->debug(
-      "[Tracker] Reject capture: unknown geometry for {}", ARMOR_NAMES[armor.name]);
-    return false;
-  }
+    !is_balance && armor.name != ArmorName::outpost && armor.name != ArmorName::base;
 
   // 已通过关联的观测保留其 IPPE 姿态分支，重建模型时不重新求解。
   if (!pose_solved) solver_.solve(armor);
+  EndpointRangeShadowDebug * endpoint_shadow = nullptr;
+  if (endpoint_range_shadow_map != nullptr) {
+    const auto it = endpoint_range_shadow_map->find(&armor);
+    if (it != endpoint_range_shadow_map->end()) endpoint_shadow = &it->second;
+  }
+  if (endpoint_shadow != nullptr) {
+    endpoint_shadow->selected = true;
+    endpoint_shadow->selected_raw_distance_m = armor.ypd_in_world[2];
+    if (endpoint_shadow->reliable) {
+      auto fitted_armor = armor;
+      fitted_armor.points.assign(
+        endpoint_shadow->fitted_points.begin(), endpoint_shadow->fitted_points.end());
+      try {
+        solver_.solve(fitted_armor);
+        const double fitted_distance = fitted_armor.ypd_in_world[2];
+        endpoint_shadow->selected_fitted_distance_m = fitted_distance;
+        if (std::isfinite(fitted_distance) && fitted_distance > 0.0) {
+          // 初始化只替換距離，角度和板面 yaw 仍取原始 YOLO 角點的 PnP。
+          armor.ypd_in_world[2] = fitted_distance;
+          armor.xyz_in_world = tools::ypd2xyz(armor.ypd_in_world);
+          endpoint_shadow->distance_replaced = true;
+        }
+      } catch (const cv::Exception &) {
+        // 拟合 PnP 失败时继续使用原始距离，让影子试验只影响合格帧。
+      }
+    }
+  }
   geometry_constraint_active_ = false;
 
   if (is_balance) {
@@ -545,6 +616,7 @@ bool Tracker::set_target(
   }
 
   target_.set_measurement_bearing_variance(measurement_bearing_variance_);
+  if (endpoint_shadow != nullptr) endpoint_shadow->update_accepted = true;
   tracked_label_ = armor.name;
   observation_accepted_ = true;
   target_generation_++;
@@ -554,48 +626,21 @@ bool Tracker::set_target(
 
 bool Tracker::update_target(
   std::list<Armor> & armors, std::chrono::steady_clock::time_point t,
-  std::optional<NameVote> relabel_vote)
+  std::optional<NameVote>, EndpointRangeShadowMap * endpoint_range_shadow_map)
 {
-  target_.predict(t);// 预测，更新协方差矩阵和预测量
-  const ArmorName candidate_name = relabel_vote ? relabel_vote->name : tracked_label_;
-
-  struct Candidate
-  {
-    Armor * armor;
-    // 不同模型 ID 可能选择不同的 IPPE 分支，候选必须保留各自的解算结果。
-    Armor solved_armor;
-    int id;
-    double angle_error;
-    double mahalanobis_distance;
-    double position_error;
-    double distance_error;
-    double position_angle_error;
-    double distance_angle_error;
-    double association_score;
-    double orientation_error;
-    double bearing_error;
-    bool angle_gate_passed;
-    bool score_gate_passed;
-    bool position_gate_passed;
-    bool distance_gate_passed;
-    bool mahalanobis_gate_passed;
-    bool image_model_gate_enabled;
-    bool image_model_gate_passed;
-    bool gate_passed;
-    double image_reference_error_px;
-    double image_adjacent_error_px;
-    double image_observed_extent_px;
-  };
-  const auto rank_of = [this](const Candidate & candidate) {
-    return AssociationRank{
-      candidate.gate_passed,
-      association_score_for_ranking(
-        candidate.gate_passed, candidate.association_score, candidate.id,
-        target_.last_id, association_id_switch_score_margin_),
-      candidate.mahalanobis_distance};
-  };
-
+  target_.predict(t);
   const auto predicted_armors = target_.armor_xyza_list();
+  if (predicted_armors.empty()) return false;
+
+  // 保留当前同济分支的最近三板候选范围，避免把不可见背面板扩成无差别匹配。
+  std::vector<int> nearest_ids(predicted_armors.size());
+  std::iota(nearest_ids.begin(), nearest_ids.end(), 0);
+  std::stable_sort(nearest_ids.begin(), nearest_ids.end(), [&predicted_armors](int a, int b) {
+    return tools::xyz2ypd(predicted_armors[a].head(3))[2] <
+           tools::xyz2ypd(predicted_armors[b].head(3))[2];
+  });
+  nearest_ids.resize(std::min<std::size_t>(3, nearest_ids.size()));
+
   const auto quad_center = [](const std::vector<cv::Point2f> & points)
     -> std::optional<cv::Point2f> {
     if (points.size() != 4) return std::nullopt;
@@ -606,251 +651,445 @@ bool Tracker::update_target(
     }
     return center * 0.25F;
   };
+  const auto quad_geometry_error = [](
+    const std::vector<cv::Point2f> & observed,
+    const std::vector<cv::Point2f> & predicted)
+    -> std::optional<AssociationQuadGeometryError> {
+    if (observed.size() != 4 || predicted.size() != 4) return std::nullopt;
+    std::array<AssociationPoint2d, 4> observed_quad{};
+    std::array<AssociationPoint2d, 4> predicted_quad{};
+    for (std::size_t i = 0; i < 4; ++i) {
+      observed_quad[i] = {observed[i].x, observed[i].y};
+      predicted_quad[i] = {predicted[i].x, predicted[i].y};
+    }
+    auto error = association_quad_geometry_error(observed_quad, predicted_quad);
+    return error.valid ? std::optional<AssociationQuadGeometryError>{error} : std::nullopt;
+  };
+
+  // 所有预测板投影都在本帧 EKF 更新前生成，候选比较使用同一状态快照。
+  std::vector<std::vector<cv::Point2f>> predicted_quads(predicted_armors.size());
+  std::vector<std::optional<cv::Point2f>> predicted_centers(predicted_armors.size());
+  for (std::size_t id = 0; id < predicted_armors.size(); ++id) {
+    try {
+      predicted_quads[id] = solver_.reproject_armor(
+        predicted_armors[id].head(3), predicted_armors[id][3],
+        target_.armor_type, target_.name);
+      predicted_centers[id] = quad_center(predicted_quads[id]);
+    } catch (const cv::Exception &) {
+      // 单个模型投影失败只让该候选失去图像排序量，不影响其他候选。
+    }
+  }
+
   const bool check_image_model = geometry_branch_ == "standard_four";
   const bool image_model_gate_enabled = association_image_model_gate_enabled(
     check_image_model, successful_capture_updates_, standard_capture_bootstrap_updates_);
-  std::vector<cv::Point2f> predicted_centers;
-  if (check_image_model) {
-    for (const auto & predicted : predicted_armors) {
-      try {
-        const auto center = quad_center(solver_.reproject_armor(
-          predicted.head(3), predicted[3], target_.armor_type, target_.name));
-        if (!center) break;
-        predicted_centers.push_back(*center);
-      } catch (const cv::Exception &) {
-        // 投影失败时不沿用旧 ID，交给现有短时丢失流程保持瞄准角。
-        break;
-      }
-    }
-  }
   association_debug_.model_name = target_.name;
   association_debug_.model_type = target_.armor_type;
-  // 所有模型假设和最终候选共用一份诊断字段转换，保证比较的是同一预测时刻。
-  const auto make_candidate_debug = [&predicted_armors, &quad_center](const Candidate & candidate) {
-    const auto & predicted_armor = predicted_armors[candidate.id];
-    const auto predicted_ypd = tools::xyz2ypd(predicted_armor.head(3));
+
+  struct Candidate
+  {
+    std::size_t detection_index;
+    Armor * source_armor;
+    Armor solved_armor;
+    int model_id;
     AssociationCandidateDebug debug;
-    debug.model_id = candidate.id;
-    debug.gate_passed = candidate.gate_passed;
-    debug.angle_gate_passed = candidate.angle_gate_passed;
-    debug.score_gate_passed = candidate.score_gate_passed;
-    debug.position_gate_passed = candidate.position_gate_passed;
-    debug.distance_gate_passed = candidate.distance_gate_passed;
-    debug.mahalanobis_gate_passed = candidate.mahalanobis_gate_passed;
-    debug.image_model_gate_enabled = candidate.image_model_gate_enabled;
-    debug.image_model_gate_passed = candidate.image_model_gate_passed;
-    debug.image_reference_error_px = candidate.image_reference_error_px;
-    debug.image_adjacent_error_px = candidate.image_adjacent_error_px;
-    debug.image_observed_extent_px = candidate.image_observed_extent_px;
-    debug.score = candidate.association_score;
-    debug.position_error = candidate.position_error;
-    debug.distance_error = candidate.distance_error;
-    debug.mahalanobis_distance = candidate.mahalanobis_distance;
-    debug.position_angle_error = candidate.position_angle_error;
-    debug.distance_angle_error = candidate.distance_angle_error;
-    debug.observed_x = candidate.solved_armor.xyz_in_world[0];
-    debug.observed_y = candidate.solved_armor.xyz_in_world[1];
-    debug.observed_z = candidate.solved_armor.xyz_in_world[2];
-    debug.predicted_x = predicted_armor[0];
-    debug.predicted_y = predicted_armor[1];
-    debug.predicted_z = predicted_armor[2];
-    debug.predicted_yaw = predicted_armor[3];
-    debug.observed_distance = candidate.solved_armor.ypd_in_world[2];
-    debug.predicted_distance = predicted_ypd[2];
-    debug.orientation_error = candidate.orientation_error;
-    debug.bearing_error = candidate.bearing_error;
-    debug.angle_error = candidate.angle_error;
-    debug.raw_yaw_prediction_error = std::abs(
-      tools::limit_rad(candidate.solved_armor.yaw_raw - predicted_armor[3]));
-    debug.optimized_yaw_prediction_error = std::abs(
-      tools::limit_rad(candidate.solved_armor.ypr_in_world[0] - predicted_armor[3]));
-    debug.raw_yaw = candidate.solved_armor.yaw_raw;
-    debug.optimized_yaw = candidate.solved_armor.ypr_in_world[0];
-    debug.yaw_correction = tools::limit_rad(
-      candidate.solved_armor.ypr_in_world[0] - candidate.solved_armor.yaw_raw);
-    debug.image_x = candidate.solved_armor.center.x;
-    debug.image_y = candidate.solved_armor.center.y;
-    debug.observed_quad_center = quad_center(candidate.solved_armor.points);
-    return debug;
   };
   std::vector<Candidate> candidates;
-  for (auto & armor : armors) {
-    if (armor.name != candidate_name || armor.type != target_.armor_type) continue;
+
+  std::size_t detection_index = 0;
+  for (auto armor_it = armors.begin(); armor_it != armors.end();
+       ++armor_it, ++detection_index) {
+    auto & armor = *armor_it;
+    if (armor.name != target_.name || armor.type != target_.armor_type) continue;
     ++association_debug_.matching_detection_count;
 
-    const auto observed_image_center =
-      check_image_model ? quad_center(armor.points) : std::nullopt;
-
-    std::optional<Candidate> best_gated_match;
-    std::optional<Candidate> best_rejected_match;
-    // 不能仅靠位置提前锁定模型 ID；旋转时相邻装甲的位置可能很近，
-    // 每个 ID 都要先选择与自身预测 yaw 连续的 IPPE 分支，再独立计算关联残差。
-    for (std::size_t reference_id = 0; reference_id < predicted_armors.size(); ++reference_id) {
+    const auto observed_image_center = quad_center(armor.points);
+    for (const int id : nearest_ids) {
+      const auto & predicted = predicted_armors[id];
+      // 每个检测框和板号组合独立选择 IPPE 分支，避免先选错板号再固定错误姿态。
       Armor solved_armor = armor;
-      solver_.solve(solved_armor, predicted_armors[reference_id]);
+      solver_.solve(solved_armor, predicted);
+
+      const auto predicted_ypd = tools::xyz2ypd(predicted.head(3));
       const auto matches = target_.match_armors(solved_armor);
       const auto match_it = std::find_if(
-        matches.begin(), matches.end(), [reference_id](const auto & match) {
-          return match.id == static_cast<int>(reference_id);
-        });
-      if (match_it == matches.end()) continue;
-      const auto & match = *match_it;
-
-      const auto & predicted_armor = predicted_armors[match.id];
-      const auto predicted_ypd = tools::xyz2ypd(predicted_armor.head(3));
-      const auto position_error =
-        (solved_armor.xyz_in_world - predicted_armor.head(3)).norm();
-      const auto distance_error =
-        std::abs(solved_armor.ypd_in_world[2] - predicted_ypd[2]);
-      const auto orientation_error =
-        std::abs(tools::limit_rad(solved_armor.ypr_in_world[0] - predicted_armor[3]));
-      const auto bearing_error =
+        matches.begin(), matches.end(), [id](const auto & match) { return match.id == id; });
+      const double mahalanobis_distance =
+        match_it == matches.end() ? std::numeric_limits<double>::infinity()
+                                  : match_it->mahalanobis_distance;
+      const double angle_error =
+        std::abs(tools::limit_rad(solved_armor.ypr_in_world[0] - predicted[3])) +
         std::abs(tools::limit_rad(solved_armor.ypd_in_world[0] - predicted_ypd[0]));
-      // 位置误差和距离误差会随目标距离改变量纲影响，先折算为视线角度，
-      // 再与装甲板姿态/方位角误差相加，才能在近距离和远距离使用同一门限。
-      const auto reference_distance = std::max(
+      const double position_error = (solved_armor.xyz_in_world - predicted.head(3)).norm();
+      const double distance_error =
+        std::abs(solved_armor.ypd_in_world[2] - predicted_ypd[2]);
+      const double orientation_error =
+        std::abs(tools::limit_rad(solved_armor.ypr_in_world[0] - predicted[3]));
+      const double bearing_error =
+        std::abs(tools::limit_rad(solved_armor.ypd_in_world[0] - predicted_ypd[0]));
+      const double reference_distance = std::max(
         {std::abs(solved_armor.ypd_in_world[2]), std::abs(predicted_ypd[2]), 0.1});
-      const auto position_angle_error = std::atan2(position_error, reference_distance);
-      const auto distance_angle_error = std::atan2(distance_error, reference_distance);
-      const auto association_score =
-        match.angle_error + position_angle_error + distance_angle_error;
-      const auto angle_gate_passed =
-        match.angle_error <= association_max_angle_error_;
-      const auto score_gate_passed = association_score <= association_max_score_;
-      const auto position_gate_passed = position_error <= association_max_position_error_;
-      const auto distance_gate_passed = distance_error <= association_max_distance_error_;
-      const auto mahalanobis_gate_passed =
-        match.mahalanobis_distance <= association_max_mahalanobis_distance_;
-      // 相邻板的相对距离判断无法排除同号双板：所有模型预测都偏在一侧时，
-      // 远处的另一块板仍可能通过。误差超过一个检测框长边时宁可短时丢失，
-      // 不能让错误观测把 EKF 拉到另一块板。
+      const double position_angle_error = std::atan2(position_error, reference_distance);
+      const double distance_angle_error = std::atan2(distance_error, reference_distance);
+      const double association_score =
+        angle_error + position_angle_error + distance_angle_error;
+
+      // 旧门限仅用于解释候选；实际排序以四边形代价为主，NIS 与复合分数用于打破平局。
+      const bool angle_gate_passed = angle_error <= association_max_angle_error_;
+      const bool score_gate_passed = association_score <= association_max_score_;
+      const bool position_gate_passed = position_error <= association_max_position_error_;
+      const bool distance_gate_passed = distance_error <= association_max_distance_error_;
+      const bool mahalanobis_gate_passed =
+        mahalanobis_distance <= association_max_mahalanobis_distance_;
       bool image_model_gate_passed = !image_model_gate_enabled;
       double image_reference_error_px = -1.0;
       double image_adjacent_error_px = -1.0;
       double image_observed_extent_px = -1.0;
-      if (check_image_model && predicted_centers.size() == 4 && observed_image_center) {
-        const auto previous_id = (reference_id + 3) % 4;
-        const auto next_id = (reference_id + 1) % 4;
+      if (check_image_model && predicted_centers[id] && observed_image_center) {
+        const auto previous_id = (id + 3) % 4;
+        const auto next_id = (id + 1) % 4;
         image_reference_error_px =
-          cv::norm(*observed_image_center - predicted_centers[reference_id]);
-        image_adjacent_error_px = std::min(
-          cv::norm(*observed_image_center - predicted_centers[previous_id]),
-          cv::norm(*observed_image_center - predicted_centers[next_id]));
-        const int observed_extent_px = std::max(armor.box.width, armor.box.height);
-        image_observed_extent_px = static_cast<double>(observed_extent_px);
+          cv::norm(*observed_image_center - *predicted_centers[id]);
+        const auto previous_error = predicted_centers[previous_id]
+          ? cv::norm(*observed_image_center - *predicted_centers[previous_id])
+          : std::numeric_limits<double>::infinity();
+        const auto next_error = predicted_centers[next_id]
+          ? cv::norm(*observed_image_center - *predicted_centers[next_id])
+          : std::numeric_limits<double>::infinity();
+        image_adjacent_error_px = std::min(previous_error, next_error);
+        image_observed_extent_px =
+          static_cast<double>(std::max(armor.box.width, armor.box.height));
         if (image_model_gate_enabled) {
-          image_model_gate_passed =
-            observed_extent_px > 0 &&
+          image_model_gate_passed = image_observed_extent_px > 0.0 &&
             image_reference_error_px <= image_adjacent_error_px &&
             image_reference_error_px <= image_observed_extent_px;
         }
       }
-      // 关联接受由综合分数、绝对空间误差和 EKF 创新协方差共同决定。
-      // 固定 angle_gate 只用于诊断，避免在小陀螺状态下拒绝统计上合理的观测；
-      // angle_error 仍然参与 association_score，明显错误的姿态不会绕过综合门限。
-      const auto gate_passed =
-        score_gate_passed && position_gate_passed &&
-        distance_gate_passed && mahalanobis_gate_passed &&
-        image_model_gate_passed;
+      const bool legacy_gates_passed = score_gate_passed && position_gate_passed &&
+        distance_gate_passed && mahalanobis_gate_passed && image_model_gate_passed;
+      const auto corner_errors = quad_geometry_error(armor.points, predicted_quads[id]);
 
-      Candidate candidate{
-        &armor, solved_armor, match.id, match.angle_error, match.mahalanobis_distance,
-        position_error, distance_error, position_angle_error, distance_angle_error,
-        association_score, orientation_error, bearing_error, angle_gate_passed,
-        score_gate_passed, position_gate_passed, distance_gate_passed,
-        mahalanobis_gate_passed, image_model_gate_enabled, image_model_gate_passed,
-        gate_passed,
-        image_reference_error_px, image_adjacent_error_px, image_observed_extent_px};
-      if (
-        association_debug_.model_candidate_count <
-        static_cast<int>(association_debug_.model_candidates.size()))
-      {
-        association_debug_.model_candidates[association_debug_.model_candidate_count++] =
-          make_candidate_debug(candidate);
+      AssociationCandidateDebug debug;
+      debug.detection_index = static_cast<int>(detection_index);
+      debug.model_id = id;
+      debug.gate_passed = legacy_gates_passed;
+      debug.physical_feasible = score_gate_passed && position_gate_passed &&
+        distance_gate_passed && mahalanobis_gate_passed;
+      debug.angle_gate_passed = angle_gate_passed;
+      debug.score_gate_passed = score_gate_passed;
+      debug.position_gate_passed = position_gate_passed;
+      debug.distance_gate_passed = distance_gate_passed;
+      debug.mahalanobis_gate_passed = mahalanobis_gate_passed;
+      debug.image_model_gate_enabled = image_model_gate_enabled;
+      debug.image_model_gate_passed = image_model_gate_passed;
+      debug.image_reference_error_px = image_reference_error_px;
+      debug.image_adjacent_error_px = image_adjacent_error_px;
+      debug.image_observed_extent_px = image_observed_extent_px;
+      if (corner_errors) {
+        debug.image_corner_error_px = corner_errors->corner_rms_px;
+        debug.image_corner_error_norm = corner_errors->corner_rms_norm;
+        debug.image_geometry_valid = true;
+        debug.image_geometry_center_error_norm = corner_errors->center_error_norm;
+        debug.image_geometry_edge_angle_error_norm = corner_errors->edge_angle_error_norm;
+        debug.image_geometry_side_length_log_ratio = corner_errors->side_length_log_ratio;
+        debug.image_geometry_cost = corner_errors->total_cost;
+        debug.image_min_corner_rms_px = corner_errors->min_corner_rms_px;
+        debug.image_min_corner_rms_norm = corner_errors->min_corner_rms_norm;
+        debug.image_min_corner_point_permutation =
+            corner_errors->min_corner_point_permutation;
+        // 仅替换分配边的排序代价；诊断门、候选生成和匹配数量优先级保持不变。
+        debug.image_ranking_cost = association_corner_rms_ranking_
+            ? corner_errors->min_corner_rms_norm : corner_errors->total_cost;
+        debug.image_point_permutation = corner_errors->point_permutation;
       }
-      auto & best = gate_passed ? best_gated_match : best_rejected_match;
-      if (!best || association_rank_precedes(rank_of(candidate), rank_of(*best))) {
-        best = candidate;
-      }
-    }
+      debug.score = association_score;
+      debug.position_error = position_error;
+      debug.distance_error = distance_error;
+      debug.mahalanobis_distance = mahalanobis_distance;
+      debug.position_angle_error = position_angle_error;
+      debug.distance_angle_error = distance_angle_error;
+      debug.observed_x = solved_armor.xyz_in_world[0];
+      debug.observed_y = solved_armor.xyz_in_world[1];
+      debug.observed_z = solved_armor.xyz_in_world[2];
+      debug.predicted_x = predicted[0];
+      debug.predicted_y = predicted[1];
+      debug.predicted_z = predicted[2];
+      debug.predicted_yaw = predicted[3];
+      debug.observed_distance = solved_armor.ypd_in_world[2];
+      debug.predicted_distance = predicted_ypd[2];
+      debug.orientation_error = orientation_error;
+      debug.bearing_error = bearing_error;
+      debug.angle_error = angle_error;
+      debug.raw_yaw_prediction_error =
+        std::abs(tools::limit_rad(solved_armor.yaw_raw - predicted[3]));
+      debug.optimized_yaw_prediction_error =
+        std::abs(tools::limit_rad(solved_armor.ypr_in_world[0] - predicted[3]));
+      debug.raw_yaw = solved_armor.yaw_raw;
+      debug.optimized_yaw = solved_armor.ypr_in_world[0];
+      debug.yaw_correction =
+        tools::limit_rad(solved_armor.ypr_in_world[0] - solved_armor.yaw_raw);
+      debug.image_x = solved_armor.center.x;
+      debug.image_y = solved_armor.center.y;
+      debug.observed_quad_center = observed_image_center;
 
-    // 每个检测只保留一个最优的“分支 × 模型 ID”组合，避免重复框多次更新 EKF。
-    if (best_gated_match) {
-      ++association_debug_.gate_passed_count;
-      candidates.push_back(*best_gated_match);
-    } else if (best_rejected_match) {
-      candidates.push_back(*best_rejected_match);
+      if (legacy_gates_passed) ++association_debug_.gate_passed_count;
+      if (debug.physical_feasible) ++association_debug_.physical_candidate_count;
+      if (association_debug_.model_candidate_count <
+          static_cast<int>(association_debug_.model_candidates.size())) {
+        association_debug_.model_candidates[association_debug_.model_candidate_count++] = debug;
+      }
+      candidates.push_back(
+        {detection_index, &armor, std::move(solved_armor), id, std::move(debug)});
     }
   }
 
-  if (candidates.empty()) return false;
+  std::vector<std::size_t> selected_indices;
+  std::vector<AssociationAssignmentEdge> assignment_edges;
+  const bool association_experiment_filter_enabled =
+    association_image_corner_rms_max_px_ > 0.0 || association_physical_feasible_gate_ ||
+    association_gate_passed_filter_;
+  for (std::size_t index = 0; index < candidates.size(); ++index) {
+    auto & debug = candidates[index].debug;
+    debug.image_corner_rms_limit_passed = association_image_corner_rms_max_px_ <= 0.0 ||
+      (debug.image_geometry_valid && std::isfinite(debug.image_corner_error_px) &&
+       debug.image_corner_error_px >= 0.0 &&
+       debug.image_corner_error_px <= association_image_corner_rms_max_px_);
+    debug.physical_feasible_filter_passed =
+      !association_physical_feasible_gate_ || debug.physical_feasible;
+    debug.gate_passed_filter_passed =
+      !association_gate_passed_filter_ || debug.gate_passed;
+    debug.assignment_eligible = debug.image_corner_rms_limit_passed &&
+      debug.physical_feasible_filter_passed && debug.gate_passed_filter_passed;
+    const AssociationAssignmentEdge edge{
+      index, debug.detection_index, debug.model_id, debug.image_geometry_valid,
+      debug.image_ranking_cost, debug.mahalanobis_distance, debug.score,
+      debug.image_corner_error_px, debug.physical_feasible, debug.gate_passed};
+    if (!association_experiment_filter_enabled ||
+        association_assignment_edge_eligible(
+          edge, association_image_corner_rms_max_px_,
+          association_physical_feasible_gate_, association_gate_passed_filter_)) {
+      assignment_edges.push_back(edge);
+    }
+    for (int diagnostic_index = 0;
+         diagnostic_index < association_debug_.model_candidate_count; ++diagnostic_index) {
+      auto & diagnostic =
+        association_debug_.model_candidates[static_cast<std::size_t>(diagnostic_index)];
+      if (diagnostic.detection_index == debug.detection_index &&
+          diagnostic.model_id == debug.model_id) {
+        diagnostic.assignment_eligible = debug.assignment_eligible;
+        diagnostic.image_corner_rms_limit_passed = debug.image_corner_rms_limit_passed;
+        diagnostic.physical_feasible_filter_passed =
+          debug.physical_feasible_filter_passed;
+        diagnostic.gate_passed_filter_passed = debug.gate_passed_filter_passed;
+        break;
+      }
+    }
+  }
+  const std::vector<int> visible_model_ids(nearest_ids.begin(), nearest_ids.end());
+  const auto assigned_candidate_indices =
+    association_min_cost_assignment(assignment_edges, visible_model_ids);
+  if (!assigned_candidate_indices.empty()) {
+    selected_indices = assigned_candidate_indices;
+    const bool any_selected_image_geometry = std::any_of(
+      selected_indices.begin(), selected_indices.end(), [&candidates](std::size_t index) {
+        return candidates[index].debug.image_geometry_valid;
+      });
+    association_debug_.assignment_mode =
+      any_selected_image_geometry ? "global_geometry" : "tongji_score_fallback";
+  } else if (!candidates.empty() &&
+             association_score_fallback_allowed(association_experiment_filter_enabled)) {
+    // 候选缺少有限创新时仍沿用 Tongji 复合分数选一个，避免诊断量缺失直接造成整帧掉锁。
+    const auto best = std::min_element(
+      candidates.begin(), candidates.end(), [](const Candidate & a, const Candidate & b) {
+        if (a.debug.score != b.debug.score) return a.debug.score < b.debug.score;
+        if (a.debug.mahalanobis_distance != b.debug.mahalanobis_distance) {
+          return a.debug.mahalanobis_distance < b.debug.mahalanobis_distance;
+        }
+        return a.debug.angle_error < b.debug.angle_error;
+      });
+    selected_indices.push_back(static_cast<std::size_t>(best - candidates.begin()));
+    association_debug_.assignment_mode = "tongji_score_fallback";
+  } else if (!candidates.empty()) {
+    // 实验门限全拒绝时必须只保留预测，禁止分数兜底重新接纳被剔除的观测。
+    association_debug_.assignment_mode = "association_experiment_no_match";
+  }
 
-  // 所有关联都基于本帧同一个预测状态；多候选时按综合几何残差排序。
-  // 同一个模型 ID 每帧只接收一个观测，避免重复框或顺序变化把 EKF 拉向不同装甲板。
-  std::stable_sort(
-    candidates.begin(), candidates.end(),
-    [&rank_of](const Candidate & a, const Candidate & b) {
-      return association_rank_precedes(rank_of(a), rank_of(b));
+  std::stable_sort(selected_indices.begin(), selected_indices.end(),
+    [&candidates](std::size_t a, std::size_t b) {
+      return candidates[a].detection_index < candidates[b].detection_index;
+    });
+  std::vector<bool> detection_assigned(armors.size(), false);
+  for (const auto selected_index : selected_indices) {
+    auto & candidate = candidates[selected_index];
+    candidate.debug.selected = true;
+    detection_assigned[candidate.detection_index] = true;
+    for (int index = 0; index < association_debug_.model_candidate_count; ++index) {
+      auto & diagnostic = association_debug_.model_candidates[static_cast<std::size_t>(index)];
+      if (diagnostic.detection_index == candidate.debug.detection_index &&
+          diagnostic.model_id == candidate.model_id) {
+        diagnostic.selected = true;
+        break;
+      }
+    }
+  }
+  const auto selected_detection_count = static_cast<int>(std::count(
+    detection_assigned.begin(), detection_assigned.end(), true));
+  association_debug_.unmatched_detection_count = std::max(
+    0, association_debug_.matching_detection_count - selected_detection_count);
+
+  association_debug_.candidate_count = static_cast<int>(std::min(
+    selected_indices.size(), association_debug_.candidates.size()));
+  for (int index = 0; index < association_debug_.candidate_count; ++index) {
+    association_debug_.candidates[static_cast<std::size_t>(index)] =
+      candidates[selected_indices[static_cast<std::size_t>(index)]].debug;
+  }
+
+  // 匹配确定后按输入检测顺序更新，让同帧多观测的滤波更新可复现。
+  std::stable_sort(selected_indices.begin(), selected_indices.end(),
+    [&candidates](std::size_t a, std::size_t b) {
+      return candidates[a].detection_index < candidates[b].detection_index;
     });
 
-  association_debug_.candidate_count = static_cast<int>(candidates.size());
-  const auto debug_count = std::min(candidates.size(), association_debug_.candidates.size());
-  for (std::size_t index = 0; index < debug_count; ++index) {
-    association_debug_.candidates[index] = make_candidate_debug(candidates[index]);
-  }
-
-  // 同一帧的同名装甲板可能来自不同机器人，不能把它们分别写入同一个 EKF。
-  // 只吸收排序最优的候选；其余候选仍保留在 debug 中供诊断。
-  const auto & best_candidate = candidates.front();
-  // 通过关联门限后仍需检查 EKF 后验；拒绝时保持预测状态和诊断候选。
-  // 预测关联和更新后验共用距离门限，避免候选虽通过门控却被一次 EKF 更新拉出门限。
-  const auto max_abs_angular_velocity =
-    geometry_branch_ == "standard_four" ? standard_max_angular_velocity_ : std::nullopt;
-  const bool accepted = best_candidate.gate_passed && target_.update(
-    best_candidate.solved_armor, best_candidate.id, association_max_distance_error_,
-    max_abs_angular_velocity);
-  association_debug_.candidates[0].accepted = accepted;
-  if (accepted) {
-    association_debug_.accepted_count = 1;
-    observation_accepted_ = true;
-    bool capture_rebuilt = false;
-    if (relabel_vote) {
-      const ArmorName previous = tracked_label_;
-      const bool restore_standard_geometry =
-        geometry_branch_ == "outpost_three" &&
-        best_candidate.solved_armor.type == ArmorType::small &&
-        (relabel_vote->name == ArmorName::two ||
-         relabel_vote->name == ArmorName::three ||
-         relabel_vote->name == ArmorName::four ||
-         relabel_vote->name == ArmorName::five);
-      if (restore_standard_geometry) {
-        std::list<Armor> relabeled{best_candidate.solved_armor};
-        relabeled.front().name = relabel_vote->name;
-        set_target(relabeled, t, true);
-        capture_rebuilt = true;
-        // 几何模型已更换，重新累计捕获帧，不能沿用旧模型的 tracking 状态。
-        state_ = "detecting";
-        detect_count_ = 0;
-        temp_lost_count_ = 0;
-      } else {
-        // 同一几何分支内只改观测标签，保留已有 EKF 连续性。
-        tracked_label_ = relabel_vote->name;
+  bool found = false;
+  for (const auto selected_index : selected_indices) {
+    auto & candidate = candidates[selected_index];
+    EndpointRangeShadowDebug * endpoint_shadow = nullptr;
+    if (endpoint_range_shadow_map != nullptr) {
+      const auto it = endpoint_range_shadow_map->find(candidate.source_armor);
+      if (it != endpoint_range_shadow_map->end()) endpoint_shadow = &it->second;
+    }
+    std::optional<Armor> shadow_measurement;
+    const Armor * measurement = &candidate.solved_armor;
+    if (endpoint_shadow != nullptr) {
+      endpoint_shadow->selected = true;
+      endpoint_shadow->selected_raw_distance_m = candidate.solved_armor.ypd_in_world[2];
+      if (endpoint_shadow->reliable) {
+        auto fitted_armor = candidate.solved_armor;
+        fitted_armor.points.assign(
+          endpoint_shadow->fitted_points.begin(), endpoint_shadow->fitted_points.end());
+        try {
+          solver_.solve(fitted_armor, predicted_armors[candidate.model_id]);
+          const double fitted_distance = fitted_armor.ypd_in_world[2];
+          endpoint_shadow->selected_fitted_distance_m = fitted_distance;
+          if (std::isfinite(fitted_distance) && fitted_distance > 0.0) {
+            // 关联始终用原始 PnP；这里只替换选中观测的径向分量，不动方位和板面 yaw。
+            shadow_measurement.emplace(candidate.solved_armor);
+            shadow_measurement->ypd_in_world[2] = fitted_distance;
+            shadow_measurement->xyz_in_world = tools::ypd2xyz(shadow_measurement->ypd_in_world);
+            measurement = &shadow_measurement.value();
+            endpoint_shadow->distance_replaced = true;
+          }
+        } catch (const cv::Exception &) {
+          // 同一预测姿态下重求拟合角点失败时，保留原始距离完成本次关联更新。
+        }
       }
-      tools::logger()->info(
-        "[Tracker] Relabel {} -> {} on continuous observation "
-        "(votes {}/{}, geometry={})",
-        ARMOR_NAMES[previous], ARMOR_NAMES[tracked_label_], relabel_vote->votes,
-        static_cast<int>(recent_names_.size()), geometry_branch_);
     }
-    // 探针会从原始检测列表读取已接收的位姿，因此把选中的分支回填给原对象。
-    *best_candidate.armor = best_candidate.solved_armor;
-    if (!capture_rebuilt && geometry_branch_ == "standard_four") {
-      ++successful_capture_updates_;
+    // 标准四装甲目标使用已配置的物理转速上限；超限时 Target 会回滚本次 EKF 更新。
+    const auto max_abs_angular_velocity =
+      geometry_branch_ == "standard_four"
+        ? standard_max_angular_velocity_
+        : std::optional<double>{};
+    const Armor * measurement_noise_reference = endpoint_shadow != nullptr &&
+        endpoint_shadow->distance_replaced
+      ? &candidate.solved_armor : nullptr;
+    // 先完成关联，再评估原角点；探针不改变初始化和本帧候选选择。
+    DistanceObservationQuality distance_quality;
+    double quality_scale = 1.0;
+    double quality_ms = 0.0;
+    std::optional<double> distance_variance_override;
+    if (distance_quality_enabled_) {
+        const auto start = std::chrono::steady_clock::now();
+        distance_quality = estimate_distance_quality(
+            candidate.solved_armor, predicted_armors[candidate.model_id][3],
+            [this](const Armor & armor) { return solver_.pnp_candidates(armor); });
+        if (distance_quality.valid && distance_quality_sigma_px_ > 0.0) {
+            // 几何尺度模式：用本次观测的敏感度 s_d 直接给出距离方差，
+            // 覆盖倍率规则；敏感度无效时回退到下面的倍率路径。
+            const double s = distance_quality.sensitivity_m_per_px;
+            distance_variance_override =
+                distance_quality_sigma_px_ * distance_quality_sigma_px_ * s * s +
+                distance_quality_floor_m_ * distance_quality_floor_m_;
+        } else {
+            quality_scale = distance_quality.update_scale(distance_quality_reference_m_per_px_);
+        }
+        quality_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - start).count();
+    }
+    TargetUpdateTrace target_update_trace;
+    const bool accepted = target_.update(
+      *measurement, candidate.model_id, std::nullopt,
+      max_abs_angular_velocity, measurement_noise_reference,
+      distance_update_r_scale_ * quality_scale,
+      association_update_trace_enabled_ ? &target_update_trace : nullptr,
+      yaw_update_sigma_deg_, distance_variance_override);
+    candidate.debug.accepted = accepted;
+    if (association_update_trace_enabled_) {
+      AssociationUpdateDebug update_debug;
+      update_debug.detection_index = static_cast<int>(candidate.detection_index);
+      update_debug.model_id = candidate.model_id;
+      update_debug.target_update = target_update_trace;
+        update_debug.distance_quality = distance_quality;
+        update_debug.distance_quality_scale = quality_scale;
+        update_debug.distance_quality_ms = quality_ms;
+      try {
+        const auto branches = solver_.pnp_candidates(candidate.solved_armor);
+        update_debug.ippe_branch_count =
+          std::min(branches.size(), update_debug.ippe_branch_yaw_world_rad.size());
+        for (std::size_t i = 0; i < update_debug.ippe_branch_count; ++i) {
+          update_debug.ippe_branch_yaw_world_rad[i] = branches[i].yaw_in_world;
+          update_debug.ippe_branch_reprojection_error_px[i] =
+            branches[i].reprojection_error;
+        }
+        if (update_debug.ippe_branch_count == 2) {
+          update_debug.ippe_branch_pair_valid = true;
+          update_debug.ippe_branch_yaw_gap_rad = std::abs(tools::limit_rad(
+            branches[0].yaw_in_world - branches[1].yaw_in_world));
+          update_debug.ippe_branch_reprojection_gap_px = std::abs(
+            branches[0].reprojection_error - branches[1].reprojection_error);
+          const double predicted_yaw = predicted_armors[candidate.model_id][3];
+          const double error0 = std::abs(tools::limit_rad(
+            branches[0].yaw_in_world - predicted_yaw));
+          const double error1 = std::abs(tools::limit_rad(
+            branches[1].yaw_in_world - predicted_yaw));
+          update_debug.selected_ippe_branch_index = error0 <= error1 ? 0 : 1;
+        }
+      } catch (const cv::Exception &) {
+        // 诊断 PnP 失败只留下空分支记录，不影响已经完成的 Tracker 更新。
+      }
+      association_debug_.update_trace.push_back(std::move(update_debug));
+    }
+    if (endpoint_shadow != nullptr) endpoint_shadow->update_accepted = accepted;
+    for (int index = 0; index < association_debug_.candidate_count; ++index) {
+      auto & selected = association_debug_.candidates[static_cast<std::size_t>(index)];
+      if (selected.detection_index == static_cast<int>(candidate.detection_index) &&
+          selected.model_id == candidate.model_id) {
+        selected.accepted = accepted;
+      }
+    }
+    for (int index = 0; index < association_debug_.model_candidate_count; ++index) {
+      auto & diagnostic = association_debug_.model_candidates[static_cast<std::size_t>(index)];
+      if (diagnostic.detection_index == static_cast<int>(candidate.detection_index) &&
+          diagnostic.model_id == candidate.model_id) {
+        diagnostic.accepted = accepted;
+        break;
+      }
+    }
+    if (!accepted) continue;
+
+    found = true;
+    observation_accepted_ = true;
+    ++association_debug_.accepted_count;
+    *candidate.source_armor = candidate.solved_armor;
+    if (geometry_branch_ == "standard_four") ++successful_capture_updates_;
+  }
+
+  if (association_update_trace_enabled_) {
+    association_debug_.experiment_candidates.reserve(candidates.size());
+    for (const auto & candidate : candidates) {
+      association_debug_.experiment_candidates.push_back(candidate.debug);
     }
   }
 
-  // 门限或后验拒绝时进入 temp_lost；持续拒绝由原状态机触发重捕获。
-  return accepted;
+  return found;
 }
-
 }  // namespace auto_aim

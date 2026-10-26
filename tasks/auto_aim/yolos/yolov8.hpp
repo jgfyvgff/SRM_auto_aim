@@ -24,6 +24,9 @@ public:
   std::list<Armor> detect(const cv::Mat & bgr_img, int frame_count) override;
   DetectorDebugInfo debug_info() const override { return debug_info_; }
 
+  // 为独立的离线诊断实例指定原图坐标系中的固定 ROI；越界由 detect 按图像尺寸检查。
+  void set_fixed_roi(const cv::Rect & roi);
+
   std::list<Armor> postprocess(
     double scale, cv::Mat & output, const cv::Mat & bgr_img, int frame_count) override;
 

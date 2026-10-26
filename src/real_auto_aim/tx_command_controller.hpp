@@ -17,6 +17,7 @@ struct TxCommandOptions
     int ttl_ms = 100;  // 正值，普通目标命令有效期。
     bool follow_lost = true;  // 短暂 temp_lost 默认继续跟随 Tracker 预测目标。
     int lost_frames = 5;  // 外推允许的最大连续丢帧数，非负。
+    bool allow_fire = false;  // 必须显式启用；实际开火还要满足 Planner 和弹速条件。
 };
 
 // 主线程拥有命令状态；串口读写仍由 SerialFeedbackReader 的唯一工作线程负责。
@@ -30,7 +31,7 @@ public:
     void clear();
     // 无可用预测目标时保持上一条有效命令；首次跟踪前使用当前反馈角，禁止开火。
     void hold(const MatchedFeedback & feedback);
-    // 将当前 Planner/Aimer 参考角写入无开火 TX 命令；feedback 用于失效时保持。
+    // 写入 Planner 参考角；开火请求仍受 allow_fire、收敛、弹速和外推状态约束。
     void apply(
         const auto_aim::Plan & plan, const MatchedFeedback & feedback,
         bool measured_speed, bool extrapolating);
@@ -45,6 +46,9 @@ public:
     const std::string & source() const { return source_; }
     double yaw() const { return yaw_; }
     double pitch() const { return pitch_; }
+    int fire_flag() const {
+        return sent_ && last_command_ ? last_command_->fire_flag : 0;
+    }
 
 private:
     SerialFeedbackReader & serial_feedback_;

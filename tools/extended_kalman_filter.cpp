@@ -63,26 +63,40 @@ Eigen::VectorXd ExtendedKalmanFilter::predict(
 
 Eigen::VectorXd ExtendedKalmanFilter::update(
   const Eigen::VectorXd & z, const Eigen::MatrixXd & H, const Eigen::MatrixXd & R,
-  std::function<Eigen::VectorXd(const Eigen::VectorXd &, const Eigen::VectorXd &)> z_subtract)
+  std::function<Eigen::VectorXd(const Eigen::VectorXd &, const Eigen::VectorXd &)> z_subtract,
+  const Eigen::MatrixXd * nis_measurement_noise)
 {
-  return update(z, H, R, [&](const Eigen::VectorXd & x) { return H * x; }, z_subtract);
+  return update(
+    z, H, R, [&](const Eigen::VectorXd & x) { return H * x; }, z_subtract,
+    nis_measurement_noise);
 }
 
 Eigen::VectorXd ExtendedKalmanFilter::update(
   const Eigen::VectorXd & z, const Eigen::MatrixXd & H, const Eigen::MatrixXd & R,
   std::function<Eigen::VectorXd(const Eigen::VectorXd &)> h,
-  std::function<Eigen::VectorXd(const Eigen::VectorXd &, const Eigen::VectorXd &)> z_subtract)
+  std::function<Eigen::VectorXd(const Eigen::VectorXd &, const Eigen::VectorXd &)> z_subtract,
+  const Eigen::MatrixXd * nis_measurement_noise)
 {
   const Eigen::VectorXd x_prior = x;
   const Eigen::MatrixXd P_prior = P;
 
+  // 调整状态增益时仍用基准观测噪声评估 NIS，避免权重倍率顺带放宽丢失判据。
+  const Eigen::MatrixXd & R_nis = nis_measurement_noise != nullptr
+    ? *nis_measurement_noise : R;
+  if (R_nis.rows() != R.rows() || R_nis.cols() != R.cols()) {
+    throw std::invalid_argument("NIS measurement noise dimension does not match update R");
+  }
+
   // NIS 必须基于更新前的创新计算；使用后验残差会低估观测与预测的不一致程度。
   const Eigen::VectorXd residual = z_subtract(z, h(x_prior));
   const Eigen::MatrixXd S = H * P_prior * H.transpose() + R;
+  const Eigen::MatrixXd S_nis = H * P_prior * H.transpose() + R_nis;
+  last_nis_innovation_covariance = S_nis;
   const Eigen::MatrixXd K = P_prior * H.transpose() * S.inverse();
 
   last_innovation = residual;
   last_measurement_noise = R;
+  last_nis_measurement_noise = R_nis;
   last_innovation_covariance = S;
   last_kalman_gain = K;
 
@@ -95,7 +109,7 @@ Eigen::VectorXd ExtendedKalmanFilter::update(
   x = x_add(x_prior, K * residual);
 
   /// 卡方检验
-  double nis = residual.transpose() * S.inverse() * residual;
+  double nis = residual.transpose() * S_nis.inverse() * residual;
   double nees = (x - x_prior).transpose() * P.inverse() * (x - x_prior);
 
   // 95% 上分位点用于拒绝过大的创新；四维自瞄观测对应 9.488。

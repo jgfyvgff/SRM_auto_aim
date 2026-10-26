@@ -133,6 +133,9 @@ add_executable(tracker_capture_test tests/tracker_capture_test.cpp)
 target_link_libraries(tracker_capture_test ${OpenCV_LIBS} fmt::fmt yaml-cpp tools io auto_aim)
 add_executable(tracker_association_policy_test tests/tracker_association_policy_test.cpp)
 add_test(NAME tracker_association_policy_test COMMAND tracker_association_policy_test)
+add_executable(distance_observation_quality_test tests/distance_observation_quality_test.cpp)
+target_link_libraries(distance_observation_quality_test ${OpenCV_LIBS} fmt::fmt yaml-cpp tools io auto_aim)
+add_test(NAME distance_observation_quality_test COMMAND distance_observation_quality_test)
 add_test(
     NAME tracker_capture_test
     COMMAND tracker_capture_test ${PROJECT_SOURCE_DIR}/configs/real_auto_aim.yaml)

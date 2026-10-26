@@ -1,6 +1,8 @@
 #include <Eigen/Dense>
 #include <opencv2/opencv.hpp>
 
+#include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <iostream>
@@ -90,8 +92,22 @@ int main()
   // 模拟消息内三维位置与距离不一致：门控之前的候选可由 Tracker 校验，
   // Target 自身必须防止这类观测把已知装甲位置向远处拉走。
   inconsistent_armor.ypd_in_world = tools::xyz2ypd(Eigen::Vector3d(5.0, 0.0, 0.5));
-  if (rollback_target.update(inconsistent_armor, 0)) {
+  auto_aim::TargetUpdateTrace rejected_trace;
+  if (rollback_target.update(
+        inconsistent_armor, 0, std::nullopt, std::nullopt, nullptr, 1.0,
+        &rejected_trace)) {
     std::cerr << "后验位置残差劣化的观测未被拒绝\n";
+    return 1;
+  }
+  if (!rejected_trace.attempted || rejected_trace.accepted ||
+      !std::all_of(rejected_trace.innovation.begin(), rejected_trace.innovation.end(),
+                   [](double value) { return std::isfinite(value); }) ||
+      !std::all_of(rejected_trace.center_gain.begin(), rejected_trace.center_gain.end(),
+                   [](const auto & row) {
+                     return std::all_of(row.begin(), row.end(),
+                                        [](double value) { return std::isfinite(value); });
+                   })) {
+    std::cerr << "拒绝更新的创新或中心增益诊断缺失\n";
     return 1;
   }
   if (
@@ -105,9 +121,30 @@ int main()
     std::cerr << "拒绝观测后 EKF 或装甲关联状态未完全恢复\n";
     return 1;
   }
-  if (!rollback_target.update(armor, 0)) {
+  constexpr std::array<Eigen::Index, 3> center_state_rows{0, 2, 4};
+  for (std::size_t i = 0; i < center_state_rows.size(); ++i) {
+    if (!nearly_equal(rejected_trace.center_after_commit[i], prior_ekf.x[center_state_rows[i]])) {
+      std::cerr << "拒绝更新的提交中心没有恢复到更新前状态\n";
+      return 1;
+    }
+  }
+  auto_aim::TargetUpdateTrace accepted_trace;
+  if (!rollback_target.update(
+        armor, 0, std::nullopt, std::nullopt, nullptr, 1.0, &accepted_trace)) {
     std::cerr << "正常观测被后验检查拒绝\n";
     return 1;
+  }
+  if (!accepted_trace.attempted || !accepted_trace.accepted) {
+    std::cerr << "接受更新的逐次诊断状态错误\n";
+    return 1;
+  }
+  for (std::size_t i = 0; i < center_state_rows.size(); ++i) {
+    if (!nearly_equal(
+          accepted_trace.center_after_commit[i],
+          rollback_target.ekf_x()[center_state_rows[i]])) {
+      std::cerr << "接受更新的提交中心与 EKF 状态不一致\n";
+      return 1;
+    }
   }
   auto_aim::Target small_error_target(
     armor, std::chrono::steady_clock::now(), 0.1, 4, initial_variance);
@@ -190,6 +227,24 @@ int main()
   }
   if (!diameter_guard_target.update(armor, 0)) {
     std::cerr << "旋转直径门限误拒正常观测\n";
+    return 1;
+  }
+
+  // 配置角速度上限后，超限状态必须拒绝观测并完整恢复 EKF 历史。
+  auto_aim::Target over_limit_target(0.2, 9.0, 0.1, 0.0);
+  auto consistent_armor = armor;
+  consistent_armor.xyz_in_world = Eigen::Vector3d(0.1, 0.0, 0.0);
+  consistent_armor.ypr_in_world = Eigen::Vector3d::Zero();
+  consistent_armor.ypd_in_world = tools::xyz2ypd(consistent_armor.xyz_in_world);
+  const auto over_limit_prior = over_limit_target.ekf();
+  if (
+    over_limit_target.update(consistent_armor, 0, std::nullopt, 8.0) ||
+    !over_limit_target.ekf_x().isApprox(over_limit_prior.x) ||
+    !over_limit_target.ekf().P.isApprox(over_limit_prior.P) ||
+    over_limit_target.ekf().data != over_limit_prior.data ||
+    over_limit_target.ekf().recent_nis_failures != over_limit_prior.recent_nis_failures)
+  {
+    std::cerr << "角速度超限观测未被拒绝或 EKF 未完整回滚\n";
     return 1;
   }
 

@@ -103,7 +103,7 @@ FrameProcessResult FrameProcessor::process(
         append_target_json(sample, targets);
         append_reprojection_json(
             sample, solver_, detected_armors_for_diagnostic, targets);
-        append_association_json(sample, tracker_.association_debug(), solver_);
+        append_association_json(sample, tracker_.association_debug(), solver_, armors);
         append_tracker_filter_json(sample, tracker_, targets);
         tx_controller.clear();
         result.invalid_bullet_speed = true;
@@ -131,6 +131,7 @@ FrameProcessResult FrameProcessor::process(
 
     sample["planner_status"] = "no_tracking_target";
     sample["planner_control"] = 0;
+    sample["planner_fire"] = 0;
     sample["planner_speed_source"] = nullptr;
     sample["planner_yaw_deg"] = nullptr;
     sample["planner_pitch_deg"] = nullptr;
@@ -154,7 +155,7 @@ FrameProcessResult FrameProcessor::process(
         sample["replay_planner_enabled"] = false;
     }
     // temp_lost 短暂丢帧时继续使用 Tracker 预测目标规划；超过上限后保持上一条命令。
-    // temp_lost 外推直接使用 Tracker 预测角；fire_flag 始终为 0。
+    // temp_lost 可继续外推云台角，但不能据此申请开火。
     const int temp_lost_frames = tracker_.temp_lost_count();
     const bool tx_extrapolating =
         tx_controller.follow_lost() && tracker_.state() == "temp_lost" &&
@@ -235,6 +236,7 @@ FrameProcessResult FrameProcessor::process(
             plan.solver_converged ? "ok" : "unconverged_diagnostic";
         sample["planner_control"] =
             plan.control && planner_armor_id.has_value() ? 1 : 0;
+        sample["planner_fire"] = plan.fire ? 1 : 0;
         sample["planner_solver_converged"] = plan.solver_converged;
         sample["planner_yaw_solver_status"] = plan.yaw_solver_status;
         sample["planner_pitch_solver_status"] = plan.pitch_solver_status;
@@ -296,6 +298,7 @@ FrameProcessResult FrameProcessor::process(
         tx_controller.hold(feedback);
     }
     sample["tx_command_sent"] = tx_controller.sent();
+    sample["tx_command_fire_flag"] = tx_controller.fire_flag();
     sample["tx_command_mode"] = tx_controller.mode();
     sample["tx_command_source"] = tx_controller.source();
     sample["tx_extrapolating"] = tx_controller.extrapolating();
@@ -322,7 +325,7 @@ FrameProcessResult FrameProcessor::process(
     append_target_json(sample, targets);
     append_reprojection_json(
         sample, solver_, detected_armors_for_diagnostic, targets);
-    append_association_json(sample, tracker_.association_debug(), solver_);
+    append_association_json(sample, tracker_.association_debug(), solver_, armors);
     append_tracker_filter_json(sample, tracker_, targets);
     append_aim_json(sample, aimer_, diagnostic);
     result.targets = std::move(targets);

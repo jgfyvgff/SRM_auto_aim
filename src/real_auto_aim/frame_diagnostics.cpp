@@ -289,9 +289,23 @@ void append_association_candidate_json(
     const auto_aim::Solver & solver)
 {
     if (candidate.model_id < 0) return;
+    sample[prefix + "_detection_index"] = candidate.detection_index;
     sample[prefix + "_id"] = candidate.model_id;
+    sample[prefix + "_image_corner_error_px"] = candidate.image_corner_error_px;
+    sample[prefix + "_image_corner_error_norm"] = candidate.image_corner_error_norm;
+    sample[prefix + "_image_geometry_valid"] = candidate.image_geometry_valid ? 1 : 0;
+    sample[prefix + "_image_geometry_center_error_norm"] =
+        candidate.image_geometry_center_error_norm;
+    sample[prefix + "_image_geometry_edge_angle_error_norm"] =
+        candidate.image_geometry_edge_angle_error_norm;
+    sample[prefix + "_image_geometry_side_length_log_ratio"] =
+        candidate.image_geometry_side_length_log_ratio;
+    sample[prefix + "_image_geometry_cost"] = candidate.image_geometry_cost;
+    sample[prefix + "_image_point_permutation"] = candidate.image_point_permutation;
     sample[prefix + "_gate_passed"] = candidate.gate_passed ? 1 : 0;
     sample[prefix + "_accepted"] = candidate.accepted ? 1 : 0;
+    sample[prefix + "_physical_feasible"] = candidate.physical_feasible ? 1 : 0;
+    sample[prefix + "_selected"] = candidate.selected ? 1 : 0;
     sample[prefix + "_angle_gate_passed"] = candidate.angle_gate_passed ? 1 : 0;
     sample[prefix + "_score_gate_passed"] = candidate.score_gate_passed ? 1 : 0;
     sample[prefix + "_position_gate_passed"] = candidate.position_gate_passed ? 1 : 0;
@@ -339,7 +353,8 @@ void append_association_candidate_json(
 
 void append_association_json(
     Json & sample, const auto_aim::AssociationDebug & association,
-    const auto_aim::Solver & solver)
+    const auto_aim::Solver & solver,
+    const std::list<auto_aim::Armor> & association_detections)
 {
     // 这些字段只记录关联决策的输入、门控和最终候选，不参与任何算法决策。
     // 真机日志需要据此区分 PnP 误差、模型 ID 切换和 EKF 中心漂移。
@@ -348,18 +363,79 @@ void append_association_json(
     sample["association_gate_passed_count"] = association.gate_passed_count;
     sample["association_candidate_count"] = association.candidate_count;
     sample["association_accepted_count"] = association.accepted_count;
+    sample["association_assignment_mode"] = association.assignment_mode;
+    sample["association_physical_candidate_count"] = association.physical_candidate_count;
+    sample["association_unmatched_detection_count"] = association.unmatched_detection_count;
+    sample["association_detections"] = Json::array();
+    std::size_t detection_index = 0;
+    for (const auto & armor : association_detections) {
+        Json detection = Json::object();
+        detection["detection_index"] = detection_index++;
+        detection["name"] = auto_aim::ARMOR_NAMES[static_cast<std::size_t>(armor.name)];
+        detection["type"] = static_cast<int>(armor.type);
+        detection["confidence"] = armor.confidence;
+        detection["box"] = Json::array(
+            {armor.box.x, armor.box.y, armor.box.width, armor.box.height});
+        detection["corners_px"] = Json::array();
+        for (const auto & point : armor.points) {
+            if (std::isfinite(point.x) && std::isfinite(point.y)) {
+                detection["corners_px"].push_back(Json::array({point.x, point.y}));
+            } else {
+                detection["corners_px"].push_back(nullptr);
+            }
+        }
+        sample["association_detections"].push_back(std::move(detection));
+    }
     append_association_candidate_json(
         sample, "association_primary", association.candidates[0], association, solver);
     append_association_candidate_json(
         sample, "association_secondary", association.candidates[1], association, solver);
-    // 同一检测还会按多个装甲板 ID 计算模型假设，保留完整列表便于复盘 ID 切换。
+    sample["association_selected_candidates"] = Json::array();
+    for (int i = 0; i < association.candidate_count; ++i) {
+        const auto & candidate = association.candidates[static_cast<std::size_t>(i)];
+        if (candidate.model_id < 0) continue;
+        Json item = Json::object();
+        item["detection_index"] = candidate.detection_index;
+        item["model_id"] = candidate.model_id;
+        item["accepted"] = candidate.accepted ? 1 : 0;
+        item["image_corner_error_px"] = candidate.image_corner_error_px;
+        item["image_corner_error_norm"] = candidate.image_corner_error_norm;
+        item["image_geometry_valid"] = candidate.image_geometry_valid ? 1 : 0;
+        item["image_geometry_center_error_norm"] =
+            candidate.image_geometry_center_error_norm;
+        item["image_geometry_edge_angle_error_norm"] =
+            candidate.image_geometry_edge_angle_error_norm;
+        item["image_geometry_side_length_log_ratio"] =
+            candidate.image_geometry_side_length_log_ratio;
+        item["image_geometry_cost"] = candidate.image_geometry_cost;
+        item["image_point_permutation"] = candidate.image_point_permutation;
+        item["physical_feasible"] = candidate.physical_feasible ? 1 : 0;
+        item["selected"] = candidate.selected ? 1 : 0;
+        sample["association_selected_candidates"].push_back(std::move(item));
+    }
+    // 同一检测还会按多个装甲板 ID 计算模型假设，保留组合列表便于复盘匹配。
     sample["association_model_candidates"] = Json::array();
     for (int i = 0; i < association.model_candidate_count; ++i) {
         const auto & candidate = association.model_candidates[static_cast<std::size_t>(i)];
         if (candidate.model_id < 0) continue;
         Json item = Json::object();
         item["index"] = i;
+        item["detection_index"] = candidate.detection_index;
         item["model_id"] = candidate.model_id;
+        item["accepted"] = candidate.accepted ? 1 : 0;
+        item["image_corner_error_px"] = candidate.image_corner_error_px;
+        item["image_corner_error_norm"] = candidate.image_corner_error_norm;
+        item["image_geometry_valid"] = candidate.image_geometry_valid ? 1 : 0;
+        item["image_geometry_center_error_norm"] =
+            candidate.image_geometry_center_error_norm;
+        item["image_geometry_edge_angle_error_norm"] =
+            candidate.image_geometry_edge_angle_error_norm;
+        item["image_geometry_side_length_log_ratio"] =
+            candidate.image_geometry_side_length_log_ratio;
+        item["image_geometry_cost"] = candidate.image_geometry_cost;
+        item["image_point_permutation"] = candidate.image_point_permutation;
+        item["physical_feasible"] = candidate.physical_feasible ? 1 : 0;
+        item["selected"] = candidate.selected ? 1 : 0;
         item["gate_passed"] = candidate.gate_passed ? 1 : 0;
         item["angle_gate_passed"] = candidate.angle_gate_passed ? 1 : 0;
         item["score_gate_passed"] = candidate.score_gate_passed ? 1 : 0;

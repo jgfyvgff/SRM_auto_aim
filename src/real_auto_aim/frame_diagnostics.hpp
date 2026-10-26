@@ -34,8 +34,10 @@ void append_reprojection_json(Json & sample, const auto_aim::Solver & solver,
     const std::list<auto_aim::Armor> & detected_armors,
     const std::list<auto_aim::Target> & targets);
 void append_target_json(Json & sample, const std::list<auto_aim::Target> & targets);
+// association_detections 必须是 Tracker 原地过滤、排序后的列表，索引才能对应候选。
 void append_association_json(Json & sample, const auto_aim::AssociationDebug & association,
-    const auto_aim::Solver & solver);
+    const auto_aim::Solver & solver,
+    const std::list<auto_aim::Armor> & association_detections);
 void append_tracker_filter_json(Json & sample, const auto_aim::Tracker & tracker,
     const std::list<auto_aim::Target> & targets);
 void append_aim_json(Json & sample, const auto_aim::Aimer & aimer, const io::Command & command);

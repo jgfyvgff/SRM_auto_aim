@@ -157,6 +157,7 @@ std::vector<PnpCandidateDebug> Solver::pnp_candidates(const Armor & armor) const
     PnpCandidateDebug candidate;
     candidate.yaw_in_world = tools::eulers(R_armor2world, 2, 1, 0)[0];
     candidate.reprojection_error = reprojection_error;
+    candidate.xyz_in_camera = xyz_in_camera;
     candidate.xyz_in_world = xyz_in_world;
     candidate.R_armor2world = R_armor2world;
     candidates.push_back(candidate);

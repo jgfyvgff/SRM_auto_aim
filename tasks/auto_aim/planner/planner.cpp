@@ -343,6 +343,15 @@ Plan Planner::plan(
     plan.solver_converged = yaw_status == 0 && pitch_status == 0;
     // 未收敛的 TinyMPC 工作区仍可能有有限数值，只允许只读诊断使用。
     plan.control = plan.diagnostic_valid && plan.solver_converged;
+    // 开火判据沿用 Planner 的 fire_thresh：比较预测参考与 MPC 未来角度误差。
+    // 只允许收敛且可控的轨迹申请开火，阈值单位为 rad。
+    constexpr int fire_check_offset = 2;
+    constexpr int fire_check_step = HALF_HORIZON + fire_check_offset;
+    const double fire_error = std::hypot(
+      traj(0, fire_check_step) - yaw_solver_->work->x(0, fire_check_step),
+      traj(2, fire_check_step) - pitch_solver_->work->x(0, fire_check_step));
+    plan.fire = plan.control && std::isfinite(fire_error) &&
+                fire_error < fire_thresh_;
     return plan;
   } catch (const std::exception & e) {
     tools::logger()->warn("Planner current-state solve failed: {}", e.what());

@@ -2,6 +2,7 @@
 #define AUTO_AIM__TARGET_HPP
 
 #include <Eigen/Dense>
+#include <array>
 #include <chrono>
 #include <optional>
 #include <queue>
@@ -22,6 +23,28 @@ struct ArmorMatch
   double angle_error = 0.0;
   double mahalanobis_distance = 0.0;
   bool valid = false;
+};
+
+// 单次 EKF 观测更新的离线诊断；提交中心与尝试中心分开，能识别后验回滚。
+struct TargetUpdateTrace
+{
+  bool attempted = false;
+  bool accepted = false;
+  std::array<double, 4> innovation{};
+  std::array<std::array<double, 4>, 3> center_gain{};
+    // 每次更新记录实际 R，避免多板帧只保留最后一个观测的噪声。
+    double distance_r_base_m2 = 0.0;
+    double distance_r_used_m2 = 0.0;
+  // yaw 创新按本档 S 和固定基准 S 分别标准化，均为无量纲边际量。
+  bool yaw_update_scale_valid = false;
+  double yaw_update_variance_rad2 = 0.0;
+  double yaw_update_standardized_innovation = 0.0;
+  bool yaw_base_scale_valid = false;
+  double yaw_base_variance_rad2 = 0.0;
+  double yaw_base_standardized_innovation = 0.0;
+  std::array<double, 3> center_before{};
+  std::array<double, 3> center_after_attempt{};
+  std::array<double, 3> center_after_commit{};
 };
 
 class Target
@@ -52,11 +75,20 @@ public:
   // 已知几何目标按最大旋转直径检查后验；其他目标保持距离噪声检查。
   bool update(const Armor & armor);
   // 使用已经完成关联的 ID 更新 EKF。可选后验距离门限单位为 m，角速度上限单位为 rad/s；
+  // noise_reference 仅在本次调用中读取，可用于替换观测时仍沿用原观测的完整 R 矩阵。
+  // distance_update_r_scale 只缩放更新阶段的距离方差；初始化、关联、NIS 和后验容限使用基准值。
+  // yaw_update_sigma_deg=0 保持当前 yaw 方差；大于 0 时只替换本次 EKF 更新的 yaw 方差。
   // 任一门限超限时恢复更新前的完整滤波状态，避免异常观测污染后续预测。
   bool update(
     const Armor & armor, int id,
     std::optional<double> max_posterior_distance_error = std::nullopt,
-    std::optional<double> max_abs_angular_velocity = std::nullopt);
+    std::optional<double> max_abs_angular_velocity = std::nullopt,
+    const Armor * measurement_noise_reference = nullptr,
+    double distance_update_r_scale = 1.0,
+    TargetUpdateTrace * update_trace = nullptr,
+    double yaw_update_sigma_deg = 0.0,
+    // 有值时直接替换更新阶段 R(2,2)，由几何敏感度 s_d 与 σ_px 合成；仅离线实验使用。
+    std::optional<double> distance_variance_override_m2 = std::nullopt);
 
   // 对机械尺寸已知的车辆持续约束两组装甲半径。variance 的单位为 m²；
   // 该约束会清除几何量与运动状态的错误互协方差，避免不可观测半径退化。
@@ -107,7 +139,12 @@ private:
   bool update_ypda(
     const Armor & armor, int id,
     std::optional<double> max_posterior_distance_error,
-    std::optional<double> max_abs_angular_velocity);  // yaw pitch distance angle
+    std::optional<double> max_abs_angular_velocity,
+    const Armor * measurement_noise_reference,
+    double distance_update_r_scale,
+    TargetUpdateTrace * update_trace,
+    double yaw_update_sigma_deg,
+    std::optional<double> distance_variance_override_m2);  // yaw pitch distance angle
   void apply_geometry_constraint();
   Eigen::Matrix4d measurement_noise(const Armor & armor) const;
 

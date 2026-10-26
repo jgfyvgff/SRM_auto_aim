@@ -33,14 +33,17 @@ void TxCommandController::hold(const MatchedFeedback & feedback)
     const auto command = last_command_.value_or(
         io::srm_auto_aim::CommandFrame{
             feedback.feedback.yaw_deg, feedback.feedback.pitch_deg, 0});
-    if (std::isfinite(command.yaw_deg) && std::isfinite(command.pitch_deg)) {
-        serial_feedback_.set_hold_command(command);
-        last_command_ = command;
+    // 保持角不是新的瞄准判定，不能延续上一帧的开火请求。
+    auto hold_command = command;
+    hold_command.fire_flag = 0;
+    if (std::isfinite(hold_command.yaw_deg) && std::isfinite(hold_command.pitch_deg)) {
+        serial_feedback_.set_hold_command(hold_command);
+        last_command_ = hold_command;
         sent_ = true;
         mode_ = "hold_last_aim";
         source_ = "hold";
-        yaw_ = command.yaw_deg;
-        pitch_ = command.pitch_deg;
+        yaw_ = hold_command.yaw_deg;
+        pitch_ = hold_command.pitch_deg;
     } else {
         clear();
     }
@@ -83,7 +86,11 @@ void TxCommandController::apply(
         const io::srm_auto_aim::CommandFrame command{
             static_cast<float>(target_yaw_deg),
             static_cast<float>(target_pitch_deg),
-            0};
+            // 名义弹速模式下也可依据 Planner 判据申请开火；丢帧外推仍禁止。
+            options_.allow_fire && !extrapolating &&
+                    plan.control && plan.fire
+                ? 1
+                : 0};
         serial_feedback_.set_command(command);
         last_command_ = command;
         sent_ = true;

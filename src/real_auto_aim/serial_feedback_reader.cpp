@@ -165,8 +165,8 @@ std::optional<LatestGimbalMotion> SerialFeedbackReader::latest_motion()
 void SerialFeedbackReader::set_command(const io::srm_auto_aim::CommandFrame & command)
 {
     if (!std::isfinite(command.yaw_deg) || !std::isfinite(command.pitch_deg) ||
-        command.fire_flag != 0) {
-        throw std::invalid_argument("Only finite no-fire commands may be sent");
+        command.fire_flag < 0 || command.fire_flag > 1) {
+        throw std::invalid_argument("Commands require finite angles and binary fire_flag");
     }
     std::lock_guard<std::mutex> lock(mutex_);
     if (failure_) std::rethrow_exception(failure_);
@@ -185,8 +185,8 @@ void SerialFeedbackReader::set_hold_command(
     const io::srm_auto_aim::CommandFrame & command)
 {
     if (!std::isfinite(command.yaw_deg) || !std::isfinite(command.pitch_deg) ||
-        command.fire_flag != 0) {
-        throw std::invalid_argument("Only finite no-fire hold commands may be sent");
+        command.fire_flag < 0 || command.fire_flag > 1) {
+        throw std::invalid_argument("Hold commands require finite angles and binary fire_flag");
     }
     std::lock_guard<std::mutex> lock(mutex_);
     if (failure_) std::rethrow_exception(failure_);

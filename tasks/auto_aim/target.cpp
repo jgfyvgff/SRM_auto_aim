@@ -217,8 +217,12 @@ bool Target::update(const Armor & armor)
 
 bool Target::update(
   const Armor & armor, int id, std::optional<double> max_posterior_distance_error,
-  std::optional<double> max_abs_angular_velocity)
+  std::optional<double> max_abs_angular_velocity,
+  const Armor * measurement_noise_reference, double distance_update_r_scale,
+  TargetUpdateTrace * update_trace, double yaw_update_sigma_deg,
+  std::optional<double> distance_variance_override_m2)
 {
+  if (update_trace != nullptr) *update_trace = TargetUpdateTrace{};
   if (
     max_posterior_distance_error &&
     (!std::isfinite(*max_posterior_distance_error) || *max_posterior_distance_error <= 0.0))
@@ -231,10 +235,25 @@ bool Target::update(
   {
     throw std::invalid_argument("Invalid angular velocity limit");
   }
+  if (!std::isfinite(distance_update_r_scale) || distance_update_r_scale < 1.0) {
+    throw std::invalid_argument("Distance update R scale must be finite and at least 1");
+  }
+  if (!std::isfinite(yaw_update_sigma_deg) ||
+      yaw_update_sigma_deg < 0.0 || yaw_update_sigma_deg > 180.0) {
+    throw std::invalid_argument("Yaw update sigma must be finite and in [0, 180] degrees");
+  }
+  // 几何尺度模式只在离线实验使用；方差必须有限且非负，避免静默放宽到非法值。
+  if (distance_variance_override_m2.has_value() &&
+      (!std::isfinite(*distance_variance_override_m2) || *distance_variance_override_m2 < 0.0)) {
+    throw std::invalid_argument("Distance variance override must be finite and non-negative");
+  }
   if (id < 0 || id >= armor_num_) return false;
 
   // 状态机计数只在 EKF 更新成功后提交；失败帧不应伪装成一次装甲切换。
-  if (!update_ypda(armor, id, max_posterior_distance_error, max_abs_angular_velocity)) {
+  if (!update_ypda(
+        armor, id, max_posterior_distance_error, max_abs_angular_velocity,
+        measurement_noise_reference, distance_update_r_scale, update_trace,
+        yaw_update_sigma_deg, distance_variance_override_m2)) {
     return false;
   }
 
@@ -316,8 +335,20 @@ void Target::apply_geometry_constraint()
 
 bool Target::update_ypda(
   const Armor & armor, int id, std::optional<double> max_posterior_distance_error,
-  std::optional<double> max_abs_angular_velocity)
+  std::optional<double> max_abs_angular_velocity,
+  const Armor * measurement_noise_reference, double distance_update_r_scale,
+  TargetUpdateTrace * update_trace, double yaw_update_sigma_deg,
+  std::optional<double> distance_variance_override_m2)
 {
+  const auto center_from_state = [](const Eigen::VectorXd & state) {
+    return std::array<double, 3>{state[0], state[2], state[4]};
+  };
+  if (update_trace != nullptr) {
+    *update_trace = TargetUpdateTrace{};
+    update_trace->center_before = center_from_state(ekf_.x);
+    update_trace->center_after_attempt = update_trace->center_before;
+    update_trace->center_after_commit = update_trace->center_before;
+  }
   const double prior_error =
     (armor.xyz_in_world - h_armor_xyz(ekf_.x, id)).norm();
   if (!std::isfinite(prior_error)) return false;
@@ -326,8 +357,25 @@ bool Target::update_ypda(
   const auto prior_ekf = ekf_;
   //观测jacobi
   Eigen::MatrixXd H = h_jacobian(ekf_.x, id);
-  // 关联和 EKF 更新必须使用同一套观测噪声，否则马氏距离会与实际更新不一致。
-  const Eigen::Matrix4d R = measurement_noise(armor);
+    // 关联和 NIS 使用基准噪声；离线降权只改变更新 R，避免同时放宽检验标尺。
+  // 影子试验替换观测值时可沿用原始观测完整 R，保持方位、俯仰和 yaw 权重不变。
+  const Eigen::MatrixXd R_base = measurement_noise_reference != nullptr
+    ? measurement_noise(*measurement_noise_reference) : measurement_noise(armor);
+  Eigen::MatrixXd R_update = R_base;
+  R_update(2, 2) *= distance_update_r_scale;
+  // 几何尺度模式：距离方差由本次观测的 s_d 与 σ_px 直接合成，覆盖倍率结果。
+  if (distance_variance_override_m2.has_value()) {
+    R_update(2, 2) = *distance_variance_override_m2;
+  }
+  if (yaw_update_sigma_deg > 0.0) {
+    const double sigma_rad = yaw_update_sigma_deg * CV_PI / 180.0;
+    R_update(3, 3) = sigma_rad * sigma_rad;
+  }
+  // R_base 仍用于关联、NIS 标尺和后验距离容限；实验只改更新权重。
+    if (update_trace != nullptr) {
+        update_trace->distance_r_base_m2 = R_base(2, 2);
+        update_trace->distance_r_used_m2 = R_update(2, 2);
+    }
 
   // 定义非线性转换函数h: x -> z
   auto h = [&](const Eigen::VectorXd & x) -> Eigen::Vector4d {
@@ -350,9 +398,47 @@ bool Target::update_ypda(
   const Eigen::VectorXd & ypr = armor.ypr_in_world;
   Eigen::VectorXd z{{ypd[0], ypd[1], ypd[2], ypr[0]}};  //获得观测量
 
-  ekf_.update(z, H, R, h, z_subtract);
+  ekf_.update(z, H, R_update, h, z_subtract, &R_base);
+  if (update_trace != nullptr) {
+    update_trace->attempted = true;
+    if (ekf_.last_innovation.size() == 4 &&
+        ekf_.last_kalman_gain.rows() > 4 && ekf_.last_kalman_gain.cols() == 4) {
+      for (Eigen::Index column = 0; column < 4; ++column) {
+        update_trace->innovation[static_cast<std::size_t>(column)] =
+          ekf_.last_innovation[column];
+      }
+      const auto record_yaw_scale = [&](const Eigen::MatrixXd & covariance,
+                                        bool & valid, double & variance,
+                                        double & normalized) {
+        if (covariance.rows() <= 3 || covariance.cols() <= 3) return;
+        const double value = covariance(3, 3);
+        if (!std::isfinite(value) || value <= 0.0) return;
+        valid = true;
+        variance = value;
+        normalized = ekf_.last_innovation[3] / std::sqrt(value);
+      };
+      record_yaw_scale(ekf_.last_innovation_covariance,
+                       update_trace->yaw_update_scale_valid,
+                       update_trace->yaw_update_variance_rad2,
+                       update_trace->yaw_update_standardized_innovation);
+      record_yaw_scale(ekf_.last_nis_innovation_covariance,
+                       update_trace->yaw_base_scale_valid,
+                       update_trace->yaw_base_variance_rad2,
+                       update_trace->yaw_base_standardized_innovation);
+      constexpr std::array<Eigen::Index, 3> center_rows{0, 2, 4};
+      for (std::size_t row = 0; row < center_rows.size(); ++row) {
+        for (Eigen::Index column = 0; column < 4; ++column) {
+          update_trace->center_gain[row][static_cast<std::size_t>(column)] =
+            ekf_.last_kalman_gain(center_rows[row], column);
+        }
+      }
+    }
+  }
   // 观测更新可能再次把不可观测半径拉向发散下限，更新后恢复已知机械尺寸。
   apply_geometry_constraint();
+  if (update_trace != nullptr) {
+    update_trace->center_after_attempt = center_from_state(ekf_.x);
+  }
   const double posterior_error =
     (armor.xyz_in_world - h_armor_xyz(ekf_.x, id)).norm();
   // 关联前后的距离必须服从同一门限；仅靠三维残差增长检查会放过
@@ -376,14 +462,22 @@ bool Target::update_ypda(
                                       std::abs(
                                         geometry_constraint_->radius +
                                         geometry_constraint_->radius_delta))
-                                  : std::sqrt(R(2, 2));
+                                  : std::sqrt(R_base(2, 2));
   if (
     !ekf_.x.allFinite() || !ekf_.P.allFinite() || !std::isfinite(posterior_error) ||
     posterior_distance_limit_exceeded || angular_velocity_limit_exceeded ||
     posterior_error > prior_error + allowed_growth)
   {
     ekf_ = prior_ekf;
+    if (update_trace != nullptr) {
+      update_trace->accepted = false;
+      update_trace->center_after_commit = center_from_state(ekf_.x);
+    }
     return false;
+  }
+  if (update_trace != nullptr) {
+    update_trace->accepted = true;
+    update_trace->center_after_commit = center_from_state(ekf_.x);
   }
   return true;
 }

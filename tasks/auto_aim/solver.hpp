@@ -16,6 +16,7 @@ struct PnpCandidateDebug
 {
   double yaw_in_world = 0.0;
   double reprojection_error = 0.0;  // 四个角点平均像素误差
+  Eigen::Vector3d xyz_in_camera = Eigen::Vector3d::Zero();  // solvePnP 的相机系 tvec，单位 m
   Eigen::Vector3d xyz_in_world = Eigen::Vector3d::Zero();
   // 保留完整姿态，供同帧多装甲板联合拟合时重建各板的真实倾斜。
   Eigen::Matrix3d R_armor2world = Eigen::Matrix3d::Identity();

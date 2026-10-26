@@ -72,6 +72,7 @@ CaptureResult FrameCaptureStage::next()
     input.sample["tx_enabled"] = options_.tx_enabled;
     input.sample["tx_speed_source"] = "unavailable";
     input.sample["tx_command_sent"] = false;
+    input.sample["tx_command_fire_flag"] = 0;
     input.sample["tx_command_mode"] = "none";
     input.sample["tx_command_source"] = "none";
     input.sample["tx_command_yaw_deg"] = nullptr;
