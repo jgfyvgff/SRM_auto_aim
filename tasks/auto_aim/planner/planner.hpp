@@ -25,6 +25,11 @@ struct Plan
   bool fire;
   float target_yaw;
   float target_pitch;
+  // 与 MPC 下发角对齐的 20 ms 目标参考；供 MPC 未收敛时回退使用。
+  float command_target_yaw = 0.0F;
+  float command_target_pitch = 0.0F;
+  double gimbal_response_delay_ms = 0.0;
+  double target_lead_compensation_ms = 0.0;
   float yaw;
   float yaw_vel;
   float yaw_acc;
@@ -47,6 +52,13 @@ struct Plan
   // 新真机只读入口可记录未收敛但有限的轨迹；只有收敛结果允许 control=true。
   bool diagnostic_valid = false;
   bool solver_converged = false;
+  // 当前参考角减云台反馈角，单位 rad；同时用于反馈对准诊断与开火判据。
+  double feedback_yaw_error_rad = 0.0;
+  double feedback_pitch_error_rad = 0.0;
+  // 两轴反馈误差合成值，单位 rad；与 fire_thresh 直接比较。
+  double fire_alignment_error_rad = 0.0;
+  // 规划轨迹与近未来参考轨迹的角度误差，单位 rad；仅真机入口使用。
+  double fire_reference_error_rad = 0.0;
   // 从当前时刻算起，预测参考轨迹首次换板的 10 ms 步数；-1 表示窗口内未换板。
   int preview_switch_step = -1;
 };
@@ -77,6 +89,8 @@ class Planner
 public:
   Eigen::Vector4d debug_xyza;
   Planner(const std::string & config_path);
+  // 设置 TX 到云台响应的有效滞后估计，范围 [0, 100] ms。
+  void set_gimbal_response_delay_ms(double delay_ms);
 
   Plan plan(Target target, double bullet_speed);
   Plan plan(std::optional<Target> target, double bullet_speed);
@@ -96,6 +110,7 @@ private:
   double yaw_offset_;
   double pitch_offset_;
   double fire_thresh_;
+  double gimbal_response_delay_ms_ = 0.0;
   // TinyMPC 迭代上限。真机日志显示 yaw 的迭代次数中位正好等于 10（撞上限），
   // 是未收敛帧的主要来源，因此做成可配参数以便不重编就能比较收敛率。
   int max_iter_;

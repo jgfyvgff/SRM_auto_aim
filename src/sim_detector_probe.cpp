@@ -513,20 +513,40 @@ private:
     const auto aimer_start = std::chrono::steady_clock::now();
     auto command = aimer_.aim(targets, timestamp, sim_bullet_speed_mps);
     // Shooter 根据上一帧命令、当前云台 TF 和瞄准点稳定性决定是否开火。
-    // 这里不强制 fire_advice，保持与真实自瞄链路相同的开火判定。
+    // Shooter 结果仅保留为 Aimer 基线诊断；实际仿真开火建议由 Planner 判据决定。
     command.shoot = shooter_.shoot(command, aimer_, targets, gimbal_ypr);
     const auto aimer_end = std::chrono::steady_clock::now();
 
-    // MPC 使用 Tracker 的目标副本生成未来参考轨迹，不修改 Tracker 当前状态。
-    // Aimer 的结果保留用于弹道和 Shooter 诊断；MPC 结果作为实际云台执行命令。
-    std::optional<auto_aim::Target> mpc_target;
-    if (!targets.empty()) {
-      mpc_target = targets.front();
-    }
+    // Planner 使用图像时刻的 TF 反馈外推到规划时刻，并在目标副本上预测，
+    // 使仿真开火对准判据与真机的当前状态入口保持一致。
     const auto mpc_start = std::chrono::steady_clock::now();
-    const auto mpc_plan = planner_.plan(mpc_target, sim_bullet_speed_mps);
+    auto_aim::Plan mpc_plan{};
+    std::optional<int> mpc_armor_id;
+    auto_aim::PlannerState planner_state{};
+    double planner_feedback_age_ms = -1.0;
+    if (!targets.empty()) {
+      auto planner_target = targets.front();
+      planner_target.predict(mpc_start);
+
+      if (command.control && aimer_.debug_aim_point.valid &&
+          aimer_.debug_aim_point.armor_id >= 0) {
+        mpc_armor_id = aimer_.debug_aim_point.armor_id;
+      }
+
+      planner_feedback_age_ms = duration_ms(frame_timestamp, mpc_start);
+      const double feedback_age_s =
+        std::chrono::duration<double>(mpc_start - frame_timestamp).count();
+      planner_state = {
+        tools::limit_rad(gimbal_ypr[0] + feedback_age_s * gimbal_yaw_vel_rad_s),
+        gimbal_yaw_vel_rad_s,
+        gimbal_ypr[1] + feedback_age_s * gimbal_pitch_vel_rad_s,
+        gimbal_pitch_vel_rad_s};
+      mpc_plan = planner_.plan(
+        planner_target, sim_bullet_speed_mps, planner_state, mpc_armor_id,
+        mpc_armor_id ? &aimer_ : nullptr);
+    }
     const auto mpc_end = std::chrono::steady_clock::now();
-    const bool mpc_control = mpc_plan.control && !targets.empty();
+    const bool mpc_control = mpc_plan.control && mpc_armor_id.has_value();
     const double published_yaw = mpc_control ? mpc_plan.yaw : 0.0;
     const double published_pitch = mpc_control ? mpc_plan.pitch : 0.0;
 
@@ -650,7 +670,7 @@ private:
     // 模拟器不接收 command.control，只用 distance=-1.0 表示当前没有有效解。
     const bool has_valid_aim = mpc_control && target_distance >= 0.0;
     gimbal_command.distance = has_valid_aim ? target_distance : -1.0;
-    gimbal_command.fire_advice = mpc_control && command.shoot;
+    gimbal_command.fire_advice = mpc_control && mpc_plan.fire;
     gimbal_command_publisher_->publish(gimbal_command);
 
     RCLCPP_INFO_THROTTLE(
@@ -762,6 +782,25 @@ private:
         // command_* 保留 Aimer 基线；published_* 才是送给模拟器的实际命令。
         plot_data["mpc_control"] = mpc_control ? 1 : 0;
         plot_data["mpc_fire"] = mpc_control && mpc_plan.fire ? 1 : 0;
+        plot_data["planner_feedback_age_ms"] = planner_feedback_age_ms;
+        plot_data["planner_state_yaw_deg"] = planner_state.yaw * 180.0 / CV_PI;
+        plot_data["planner_state_pitch_deg"] = planner_state.pitch * 180.0 / CV_PI;
+        plot_data["planner_feedback_yaw_error_deg"] =
+          mpc_plan.diagnostic_valid
+            ? nlohmann::json(mpc_plan.feedback_yaw_error_rad * 180.0 / CV_PI)
+            : nlohmann::json(nullptr);
+        plot_data["planner_feedback_pitch_error_deg"] =
+          mpc_plan.diagnostic_valid
+            ? nlohmann::json(mpc_plan.feedback_pitch_error_rad * 180.0 / CV_PI)
+            : nlohmann::json(nullptr);
+        plot_data["planner_fire_alignment_error_deg"] =
+          mpc_plan.diagnostic_valid
+            ? nlohmann::json(mpc_plan.fire_alignment_error_rad * 180.0 / CV_PI)
+            : nlohmann::json(nullptr);
+        plot_data["planner_fire_reference_error_deg"] =
+          mpc_plan.diagnostic_valid
+            ? nlohmann::json(mpc_plan.fire_reference_error_rad * 180.0 / CV_PI)
+            : nlohmann::json(nullptr);
         plot_data["mpc_target_yaw"] = mpc_control ? mpc_plan.target_yaw : 0.0;
         plot_data["mpc_target_pitch"] = mpc_control ? mpc_plan.target_pitch : 0.0;
         plot_data["mpc_yaw"] = mpc_control ? mpc_plan.yaw : 0.0;

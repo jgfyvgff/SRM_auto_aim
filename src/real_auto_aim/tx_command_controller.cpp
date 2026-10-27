@@ -54,7 +54,9 @@ void TxCommandController::apply(
     bool measured_speed, bool extrapolating)
 {
     const bool finite_target =
-        std::isfinite(plan.target_yaw) && std::isfinite(plan.target_pitch);
+        std::isfinite(plan.target_yaw) && std::isfinite(plan.target_pitch) &&
+        std::isfinite(plan.command_target_yaw) &&
+        std::isfinite(plan.command_target_pitch);
     if (!plan.diagnostic_valid || !finite_target ||
         (!measured_speed && !options_.nominal)) {
         if (extrapolating) {
@@ -75,10 +77,10 @@ void TxCommandController::apply(
         const double target_yaw_deg = use_mpc
             ? tools::limit_rad(plan.yaw + auto_aim::DT * plan.yaw_vel) *
                 180.0 / CV_PI
-            : plan.target_yaw * 180.0 / CV_PI;
+            : plan.command_target_yaw * 180.0 / CV_PI;
         const double target_pitch_deg = use_mpc
             ? (plan.pitch + auto_aim::DT * plan.pitch_vel) * 180.0 / CV_PI
-            : plan.target_pitch * 180.0 / CV_PI;
+            : plan.command_target_pitch * 180.0 / CV_PI;
         if (!std::isfinite(target_yaw_deg) || !std::isfinite(target_pitch_deg)) {
             clear();
             return;

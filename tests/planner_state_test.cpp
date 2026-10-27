@@ -1,4 +1,5 @@
 #include "tasks/auto_aim/planner/planner.hpp"
+#include "tasks/auto_aim/aimer.hpp"
 
 #include <cmath>
 #include <iostream>
@@ -43,5 +44,29 @@ int main(int argc, char * argv[])
             "Pitch plan did not start from measured state");
     require(!planner.plan(target, 0.0, measured).control,
             "Planner accepted zero bullet speed in current-state mode");
+    auto_aim::Aimer aimer(argv[1]);
+    // 正常选板入口按参考轨迹生成角度；反馈未对准时不能申请开火。
+    auto tracking_plan = planner.plan(target, 23.0, measured, 0, &aimer);
+    for (int attempt = 0; attempt < 20 && !tracking_plan.solver_converged; ++attempt) {
+        tracking_plan = planner.plan(target, 23.0, measured, 0, &aimer);
+    }
+    require(tracking_plan.diagnostic_valid && tracking_plan.solver_converged,
+            "Planner failed to solve reference-mode test case");
+    require(std::hypot(tracking_plan.feedback_yaw_error_rad,
+                       tracking_plan.feedback_pitch_error_rad) > 0.003 &&
+                !tracking_plan.fire,
+            "Planner requested fire while feedback was off target");
+    const auto_aim::PlannerState aligned{
+        tracking_plan.target_yaw, 0.0, tracking_plan.target_pitch, 0.0};
+    auto aligned_plan = planner.plan(target, 23.0, aligned, 0, &aimer);
+    for (int attempt = 0; attempt < 20 && !aligned_plan.solver_converged; ++attempt) {
+        aligned_plan = planner.plan(target, 23.0, aligned, 0, &aimer);
+    }
+    require(aligned_plan.diagnostic_valid && aligned_plan.solver_converged,
+            "Planner failed to solve aligned reference-mode case");
+    require(std::hypot(aligned_plan.feedback_yaw_error_rad,
+                       aligned_plan.feedback_pitch_error_rad) < 0.003,
+            "Aligned feedback was not recognized");
+    require(aligned_plan.fire, "Planner did not request fire when feedback was aligned");
     std::cout << "planner_state_test passed\n";
 }

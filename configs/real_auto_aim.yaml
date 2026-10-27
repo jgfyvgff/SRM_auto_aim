@@ -107,6 +107,9 @@ fire_thresh: 0.003
 # 即撞在上限上），是 17% 未收敛帧的主要来源；单次求解仅约 0.3ms，放宽上限的代价可忽略。
 # 改这个值不需要重编，配 PlotJuggler 看 planner_{yaw,pitch}_solver_status 的 1 占比即可。
 planner_max_iter: 10
+# TX 到云台反馈的有效滞后估计，单位 ms；Planner 已有约 20 ms 前视，
+# 因此 35 ms 会额外前推约 15 ms。该值是待离线复核的补偿起点。
+planner_gimbal_response_delay_ms: 35.0
 max_yaw_acc: 50
 Q_yaw: [9e6, 0]
 R_yaw: [1]

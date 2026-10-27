@@ -132,6 +132,14 @@ FrameProcessResult FrameProcessor::process(
     sample["planner_status"] = "no_tracking_target";
     sample["planner_control"] = 0;
     sample["planner_fire"] = 0;
+    sample["planner_feedback_yaw_error_deg"] = nullptr;
+    sample["planner_feedback_pitch_error_deg"] = nullptr;
+    sample["planner_fire_alignment_error_deg"] = nullptr;
+    sample["planner_fire_reference_error_deg"] = nullptr;
+    sample["planner_gimbal_response_delay_ms"] = nullptr;
+    sample["planner_target_lead_compensation_ms"] = nullptr;
+    sample["planner_command_target_yaw_deg"] = nullptr;
+    sample["planner_command_target_pitch_deg"] = nullptr;
     sample["planner_speed_source"] = nullptr;
     sample["planner_yaw_deg"] = nullptr;
     sample["planner_pitch_deg"] = nullptr;
@@ -238,13 +246,29 @@ FrameProcessResult FrameProcessor::process(
             plan.control && planner_armor_id.has_value() ? 1 : 0;
         sample["planner_fire"] = plan.fire ? 1 : 0;
         sample["planner_solver_converged"] = plan.solver_converged;
+        sample["planner_gimbal_response_delay_ms"] =
+            plan.gimbal_response_delay_ms;
+        sample["planner_target_lead_compensation_ms"] =
+            plan.target_lead_compensation_ms;
         sample["planner_yaw_solver_status"] = plan.yaw_solver_status;
         sample["planner_pitch_solver_status"] = plan.pitch_solver_status;
         sample["planner_yaw_solver_iterations"] = plan.yaw_solver_iterations;
         sample["planner_pitch_solver_iterations"] = plan.pitch_solver_iterations;
         if (plan.diagnostic_valid) {
+            sample["planner_feedback_yaw_error_deg"] =
+                plan.feedback_yaw_error_rad * 180.0 / CV_PI;
+            sample["planner_feedback_pitch_error_deg"] =
+                plan.feedback_pitch_error_rad * 180.0 / CV_PI;
+            sample["planner_fire_alignment_error_deg"] =
+                plan.fire_alignment_error_rad * 180.0 / CV_PI;
+            sample["planner_fire_reference_error_deg"] =
+                plan.fire_reference_error_rad * 180.0 / CV_PI;
             sample["planner_target_yaw_deg"] = plan.target_yaw * 180.0 / CV_PI;
             sample["planner_target_pitch_deg"] = plan.target_pitch * 180.0 / CV_PI;
+            sample["planner_command_target_yaw_deg"] =
+                plan.command_target_yaw * 180.0 / CV_PI;
+            sample["planner_command_target_pitch_deg"] =
+                plan.command_target_pitch * 180.0 / CV_PI;
             sample["planner_yaw_deg"] = plan.yaw * 180.0 / CV_PI;
             sample["planner_pitch_deg"] = plan.pitch * 180.0 / CV_PI;
             sample["planner_yaw_20ms_deg"] =

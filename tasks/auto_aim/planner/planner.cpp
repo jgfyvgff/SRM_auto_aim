@@ -21,6 +21,10 @@ Planner::Planner(const std::string & config_path)
   yaw_offset_ = tools::read<double>(yaml, "yaw_offset") / 57.3;
   pitch_offset_ = tools::read<double>(yaml, "pitch_offset") / 57.3;
   fire_thresh_ = tools::read<double>(yaml, "fire_thresh");
+  if (yaml["planner_gimbal_response_delay_ms"].IsDefined()) {
+    set_gimbal_response_delay_ms(
+      yaml["planner_gimbal_response_delay_ms"].as<double>());
+  }
   // 老配置没有这个键时保持原来的 10 次，避免其他入口因缺键起不来；上限小于 1 时
   // TinyMPC 会直接返回"达上限"，等于永不解算，所以这里兜到 1。
   max_iter_ = yaml["planner_max_iter"].IsDefined() ? yaml["planner_max_iter"].as<int>() : 10;
@@ -28,6 +32,15 @@ Planner::Planner(const std::string & config_path)
 
   setup_yaw_solver(config_path);
   setup_pitch_solver(config_path);
+}
+
+void Planner::set_gimbal_response_delay_ms(double delay_ms)
+{
+  if (!std::isfinite(delay_ms) || delay_ms < 0.0 || delay_ms > 100.0) {
+    throw std::invalid_argument(
+      "planner_gimbal_response_delay_ms must be finite and in [0, 100]");
+  }
+  gimbal_response_delay_ms_ = delay_ms;
 }
 
 Plan Planner::plan(Target target, double bullet_speed)
@@ -239,6 +252,12 @@ Plan Planner::plan(
     return {false};
   }
 
+  // TX 的命令参考时刻为规划时刻后 20 ms；只补偿实测滞后超出这段前视的部分。
+  constexpr double kTxReferenceHorizonMs = 2.0 * DT * 1000.0;
+  const double extra_lead_ms =
+    std::max(0.0, gimbal_response_delay_ms_ - kTxReferenceHorizonMs);
+  target.predict(extra_lead_ms / 1000.0);
+
   const auto armors = target.armor_xyza_list();
   if (armors.empty()) return {false};
   if (armor_id &&
@@ -306,6 +325,13 @@ Plan Planner::plan(
     constexpr int next_step = 1;
     constexpr int diagnostic_step = 10;
     Plan plan{};
+    plan.gimbal_response_delay_ms = gimbal_response_delay_ms_;
+    plan.target_lead_compensation_ms = extra_lead_ms;
+    // 参考轨迹的第 0 列对应规划时刻；反馈状态由调用方估计。
+    // 此误差约束开火请求，但不改变发给下位机的绝对角度指令。
+    plan.feedback_yaw_error_rad =
+      tools::limit_rad(traj(0, 0) + yaw0 - state.yaw);
+    plan.feedback_pitch_error_rad = traj(2, 0) - state.pitch;
     plan.preview_switch_step = preview_switch_step;
     plan.yaw_solver_status = yaw_status;
     plan.pitch_solver_status = pitch_status;
@@ -326,6 +352,8 @@ Plan Planner::plan(
         pitch_solver_->work->dual_residual_input);
     plan.target_yaw = tools::limit_rad(traj(0, next_step) + yaw0);
     plan.target_pitch = traj(2, next_step);
+    plan.command_target_yaw = tools::limit_rad(traj(0, 2) + yaw0);
+    plan.command_target_pitch = traj(2, 2);
     plan.target_yaw_100ms = tools::limit_rad(traj(0, diagnostic_step) + yaw0);
     plan.target_pitch_100ms = traj(2, diagnostic_step);
     plan.yaw = tools::limit_rad(yaw_solver_->work->x(0, next_step) + yaw0);
@@ -343,15 +371,21 @@ Plan Planner::plan(
     plan.solver_converged = yaw_status == 0 && pitch_status == 0;
     // 未收敛的 TinyMPC 工作区仍可能有有限数值，只允许只读诊断使用。
     plan.control = plan.diagnostic_valid && plan.solver_converged;
-    // 开火判据沿用 Planner 的 fire_thresh：比较预测参考与 MPC 未来角度误差。
-    // 只允许收敛且可控的轨迹申请开火，阈值单位为 rad。
+    // 当前参考与反馈都要对准；参考轨迹从当前时刻起算，规划误差也应检查
+    // 近未来而非旧居中轨迹的第 52 步。阈值沿用 fire_thresh，单位 rad。
     constexpr int fire_check_offset = 2;
-    constexpr int fire_check_step = HALF_HORIZON + fire_check_offset;
-    const double fire_error = std::hypot(
-      traj(0, fire_check_step) - yaw_solver_->work->x(0, fire_check_step),
+    constexpr int fire_check_step = next_step + fire_check_offset;
+    plan.fire_reference_error_rad = std::hypot(
+      tools::limit_rad(traj(0, fire_check_step) -
+                       yaw_solver_->work->x(0, fire_check_step)),
       traj(2, fire_check_step) - pitch_solver_->work->x(0, fire_check_step));
-    plan.fire = plan.control && std::isfinite(fire_error) &&
-                fire_error < fire_thresh_;
+    plan.fire_alignment_error_rad = std::hypot(
+      plan.feedback_yaw_error_rad, plan.feedback_pitch_error_rad);
+    plan.fire = plan.control &&
+                std::isfinite(plan.fire_alignment_error_rad) &&
+                std::isfinite(plan.fire_reference_error_rad) &&
+                plan.fire_alignment_error_rad < fire_thresh_ &&
+                plan.fire_reference_error_rad < fire_thresh_;
     return plan;
   } catch (const std::exception & e) {
     tools::logger()->warn("Planner current-state solve failed: {}", e.what());

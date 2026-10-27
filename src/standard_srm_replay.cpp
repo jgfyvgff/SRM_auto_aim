@@ -550,6 +550,7 @@ const std::string kKeys =
     "{association-physical-feasible-gate|false|仅离线：将 physical_feasible 作为关联资格条件}"
     "{association-require-gate-passed|false|仅离线：要求评分、位置、距离、马氏距离及启用时的图像门全部通过}"
     "{compare-centered-mpc|false|额外计算居中窗口 MPC 诊断，不参与模拟 TX}"
+    "{planner-gimbal-response-delay-ms|-1|离线覆盖 Planner 滞后配置，单位 ms；-1 使用 YAML，范围 [0, 100]}"
     "{compare-quintic|false|额外计算因果五次多项式选板过渡，仅用于回放诊断}"
     "{quintic-frame-ms|65|五次曲线校验单条 TX 步长时假定的帧周期，单位 ms}"
     "{debug-udp|false|按回放时间实时发送逐帧诊断 JSON 到 127.0.0.1:9871}"
@@ -616,6 +617,14 @@ void append_plan(
         plan.solver_converged ? "ok" : "unconverged_diagnostic";
     output["planner_control"] =
         plan.control && has_aimer_armor ? 1 : 0;
+    output["planner_fire"] = plan.fire ? 1 : 0;
+    output["planner_feedback_yaw_error_deg"] = nullptr;
+    output["planner_feedback_pitch_error_deg"] = nullptr;
+    output["planner_fire_alignment_error_deg"] = nullptr;
+    output["planner_fire_reference_error_deg"] = nullptr;
+    output["planner_gimbal_response_delay_ms"] = plan.gimbal_response_delay_ms;
+    output["planner_target_lead_compensation_ms"] =
+        plan.target_lead_compensation_ms;
     output["planner_preview_switch_ms"] =
         plan.preview_switch_step >= 0
             ? Json(plan.preview_switch_step * auto_aim::DT * 1000.0)
@@ -628,6 +637,7 @@ void append_plan(
 
     for (const char * key : {
              "planner_target_yaw_deg", "planner_target_pitch_deg",
+             "planner_command_target_yaw_deg", "planner_command_target_pitch_deg",
              "planner_yaw_deg", "planner_pitch_deg",
              "planner_yaw_20ms_deg", "planner_pitch_20ms_deg",
              "planner_target_yaw_100ms_deg", "planner_target_pitch_100ms_deg",
@@ -641,8 +651,20 @@ void append_plan(
     if (!plan.diagnostic_valid) return;
 
     constexpr double kRadToDeg = 180.0 / CV_PI;
+    output["planner_feedback_yaw_error_deg"] =
+        plan.feedback_yaw_error_rad * kRadToDeg;
+    output["planner_feedback_pitch_error_deg"] =
+        plan.feedback_pitch_error_rad * kRadToDeg;
+    output["planner_fire_alignment_error_deg"] =
+        plan.fire_alignment_error_rad * kRadToDeg;
+    output["planner_fire_reference_error_deg"] =
+        plan.fire_reference_error_rad * kRadToDeg;
     output["planner_target_yaw_deg"] = plan.target_yaw * kRadToDeg;
     output["planner_target_pitch_deg"] = plan.target_pitch * kRadToDeg;
+    output["planner_command_target_yaw_deg"] =
+        plan.command_target_yaw * kRadToDeg;
+    output["planner_command_target_pitch_deg"] =
+        plan.command_target_pitch * kRadToDeg;
     output["planner_yaw_deg"] = plan.yaw * kRadToDeg;
     output["planner_pitch_deg"] = plan.pitch * kRadToDeg;
     output["planner_yaw_20ms_deg"] =
@@ -1010,6 +1032,13 @@ int main(int argc, char * argv[])
         }
         const bool simulate_tx = cli.get<bool>("simulate-tx");
         const bool compare_centered = cli.get<bool>("compare-centered-mpc");
+        const double planner_delay_override_ms =
+            cli.get<double>("planner-gimbal-response-delay-ms");
+        if (!std::isfinite(planner_delay_override_ms) ||
+            planner_delay_override_ms < -1.0 || planner_delay_override_ms > 100.0) {
+            throw std::invalid_argument(
+                "--planner-gimbal-response-delay-ms must be -1 or in [0, 100]");
+        }
         const bool compare_quintic = cli.get<bool>("compare-quintic");
         const double quintic_frame_ms = cli.get<double>("quintic-frame-ms");
         const bool tx_use_nominal_speed = cli.get<bool>("tx-use-nominal-speed");
@@ -1097,6 +1126,9 @@ int main(int argc, char * argv[])
         tracker.set_association_update_trace_enabled(true);
         auto_aim::Aimer aimer(config_path);
         auto_aim::Planner planner(config_path);
+        if (planner_delay_override_ms >= 0.0) {
+            planner.set_gimbal_response_delay_ms(planner_delay_override_ms);
+        }
         std::optional<auto_aim::Planner> centered_planner;
         if (compare_centered) centered_planner.emplace(config_path);
         std::optional<real_auto_aim::QuinticSwitchDiagnostic> quintic;
@@ -1695,8 +1727,8 @@ int main(int argc, char * argv[])
                                     (plan.pitch + auto_aim::DT * plan.pitch_vel) *
                                         180.0 / CV_PI}
                                 : real_auto_aim::TxAnglesDeg{
-                                    plan.target_yaw * 180.0 / CV_PI,
-                                    plan.target_pitch * 180.0 / CV_PI};
+                                    plan.command_target_yaw * 180.0 / CV_PI,
+                                    plan.command_target_pitch * 180.0 / CV_PI};
                         if (!std::isfinite(target_command.yaw) ||
                             !std::isfinite(target_command.pitch)) {
                             if (extrapolating) hold_tx();

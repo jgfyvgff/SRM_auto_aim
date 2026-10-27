@@ -258,11 +258,17 @@ Tracker 使用。该映射仍带有未知的
 `fire_thresh` 判据通过且未处于 temp_lost 外推时发送 `fire_flag=1`。反馈弹速无效时，
 仅启用 `--tx-use-nominal-speed=1` 才允许命令发送；此时开火判据使用配置中的名义弹速。
 保持角和异常回退不会请求开火。本次只修改上位机仓库，不修改下位机固件。
-Planner 从串口缓存有效窗口内相距较远的两帧主机接收时间估计当前角速度，按当前云台姿态建立
-MPC 初始状态，并从当前时刻生成参考轨迹。协议没有真实采样时刻或速度，所以该估计
-不能视作硬件同步测量。弹速反馈为 0 时，Planner 使用配置中的
-`planner_debug_bullet_speed_mps`，日志明确标记 `diagnostic_nominal`；这种结果仅供
-只读对比。先运行无硬件配置检查：
+Planner 从串口缓存有效窗口内相距较远的两帧主机接收时间估计当前角速度。
+正常跟踪时 MPC 仍以参考轨迹建立初态并生成绝对角度指令；反馈角目前用于
+跟随误差诊断和开火对准检查。协议没有真实采样时刻或速度，所以差分估计不能视作硬件同步测量。
+真机配置 `planner_gimbal_response_delay_ms` 表示 TX 到反馈响应的有效滞后估计，当前设为
+35 ms；Planner/TX 已有约 20 ms 目标前视，因此额外前推约 15 ms。这个时延来自主机日志的
+有效滞后估计，不是下位机硬件时间戳或纯机械死区测量，需用后续运动日志复核。
+未收敛时的目标参考也使用同一 20 ms 输出时刻，避免和收敛 MPC 命令差一个规划步。
+弹速反馈为 0 时，Planner 使用配置中的
+`planner_debug_bullet_speed_mps`，日志明确标记 `diagnostic_nominal`；默认仅供
+只读对比，显式启用 `--tx-use-nominal-speed=1` 后可用于 TX 与开火判据。
+先运行无硬件配置检查：
 当前真机配置关闭固定俯仰角的 yaw 重投影优化，Tracker 使用 PnP 原始 yaw；
 仿真配置仍保留原有优化。倒装相机的模型角点可观察几何位置，但逐点同序
 重投影误差不能直接当作框体对齐误差。
@@ -389,7 +395,7 @@ python3 -m unittest tests/test_real_tracker_analyzer.py
 `planner_status=ok` 表示求解器收敛；`unconverged_diagnostic` 表示求解器未收敛，
 但仍记录有限的诊断轨迹。`planner_control` 只表示 MPC 控制判据，不是命令发送标志；
 当前 Aimer 选板有效且求解收敛时，Planner 以参考轨迹为初态，预览未来换板，
-发送 20 ms 规划角；未收敛时继续跟随有限的 `planner_target_yaw/pitch`。
+发送 20 ms 规划角；未收敛时跟随 `planner_command_target_yaw/pitch_deg`，它使用同一输出时刻。
 差分估计的云台速度只作诊断，不再是发送条件。选中的 MPC 规划角或目标参考角直接进入 TX，
 发送链路不再叠加速率或单步限幅。
 可比较 `planner_measured_*`、
@@ -401,16 +407,26 @@ python3 -m unittest tests/test_real_tracker_analyzer.py
 `planner_{yaw,pitch}_{primal,dual}_residual_max`；状态 0 表示该轴收敛，残差为
 TinyMPC 原始数值，不是角度误差。100 ms 角度只用于查看轨迹趋势，不是下发命令；新增
 planner_yaw_20ms_deg/pitch_20ms_deg 用于核对 MPC 规划角与 TX 指令。
+`planner_gimbal_response_delay_ms` 和 `planner_target_lead_compensation_ms` 分别记录配置的总滞后
+与扣除现有 20 ms 前视后的额外目标前推；`planner_command_target_yaw/pitch_deg` 是未收敛时
+实际使用的目标参考角。
 `planner_preview_switch_ms` 记录预测窗口内首次换板距当前的时间；无换板时为 null。
 `tx_command_source` 标记 `mpc_reference_20ms`、`target_reference` 或 `hold`；
 `planner_control=0` 不代表没有发送角度命令，实际发送状态由 `tx_command_sent` 标记，
 普通跟踪命令使用 `tx_command_mode=tracking`。
+`planner_feedback_yaw_error_deg` 和 `planner_feedback_pitch_error_deg` 是规划时刻的
+参考角减调用方估计的反馈角，正值表示参考角领先；yaw 误差已按 ±180° 折返。
+`planner_fire_alignment_error_deg` 是两轴误差的合成值；它小于 `fire_thresh`
+才允许 Planner 申请开火，且不改变下发角。
+`planner_fire_reference_error_deg` 记录约 30 ms 处规划角与参考角的差，也使用
+`fire_thresh`。需结合 `planner_state_source` 判读：
+`matched_pose_zero_velocity` 没有同步到规划时刻的实测速率。
 云台静止且无法形成可靠差分速度时，Planner 使用图像时刻已匹配的串口 yaw/pitch，
-将角速度置零，并标记 `planner_state_source=matched_pose_zero_velocity`；该状态只能
-用于静止场景诊断，`planner_control` 保持为 0。存在有效差分速度时，状态来源标记为
+将角速度置零，并标记 `planner_state_source=matched_pose_zero_velocity`；规划是否
+可控仍由求解结果决定。存在有效差分速度时，状态来源标记为
 `latest_pose_extrapolated`。
-`planner_yaw_deg/pitch_deg` 是下一 10 ms 规划步的状态角；当前模型的首步角度
-由反馈角和角速度确定。检查 MPC 波形时应对比同为 100 ms 的
+`planner_yaw_deg/pitch_deg` 是下一 10 ms 规划步的状态角；正常跟踪模式的首步角度
+由参考轨迹决定。检查 MPC 波形时应对比同为 100 ms 的
 `planner_*_100ms_deg` 与 `planner_target_*_100ms_deg`，并同时查看求解状态。
 实际下发角看 `tx_command_yaw_deg/pitch_deg`；串口协议没有速度、加速度字段。
 启用 `--debug-jsonl` 后，每帧另附 `wire_trace_events`：`tx_target/tx_zero`
@@ -655,6 +671,13 @@ UDP 使用 PlotJuggler 的接收时间作为横轴；`replay_time_s` 也作为�
   --frames-dir=/tmp/real6_replay/frames \
   --output-jsonl=/tmp/real6_replay/replayed.jsonl
 
+# 对照关闭额外补偿；默认 -1 使用 YAML 中的 35 ms。
+./build/standard_srm_replay configs/real_auto_aim.yaml \
+  --input-jsonl=/tmp/real6_replay/input.jsonl \
+  --frames-dir=/tmp/real6_replay/frames \
+  --output-jsonl=/tmp/real6_replay/replayed_delay0.jsonl \
+  --planner-gimbal-response-delay-ms=0
+
 python3 tools/jsonl_to_plotjuggler_csv.py \
   --input=/tmp/real6_replay/replayed.jsonl \
   --output=/tmp/real6_replay/replayed.csv \
@@ -759,7 +782,10 @@ MPC 使用 `configs/demo.yaml` 中的 `max_yaw_acc`、`max_pitch_acc`、`Q_yaw`�
 `R_yaw`、`Q_pitch` 和 `R_pitch`。`mpc_yaw_vel`、`mpc_pitch_vel` 的单位为
 rad/s，`mpc_yaw_acc`、`mpc_pitch_acc` 的单位为 rad/s²，`mpc_ms` 为单帧
 规划耗时。`mpc_fire` 是规划器自身的误差判定；最终 `published_fire_advice`
-仍需同时通过现有 Shooter 判定。
+由 Planner 的云台反馈对准误差和近未来参考误差共同决定；`command.shoot` 仍保留
+为 Shooter 基线诊断，不参与仿真开火请求。Planner 使用图像时刻查询到的 TF 姿态和
+相邻帧估计角速度，并外推到规划时刻；这能验证仿真闭环中的反馈门控，但不能单独证明
+模拟器复现了真机的 33–38 ms 延迟。
 
 `association_primary_*_error` 是 EKF 更新前的关联残差；`post_update_*_error`
 使用同一帧实际接受的装甲板计算 EKF 更新后的残差。未接受或无法配对时值为 `-1`。
