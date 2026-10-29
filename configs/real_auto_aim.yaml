@@ -139,6 +139,9 @@ planner_max_iter: 30
 # TX 到云台反馈的有效滞后估计，单位 ms；Planner 已有约 20 ms 前视，
 # 因此 55 ms 会额外前推约 35 ms。该值仍需闭环复核。
 planner_gimbal_response_delay_ms: 55
+# 连续两帧确认未来板后，额外提前的最大角度与变化速率；0 可关闭提前过渡。
+planner_preview_max_advance_deg: 0.8
+planner_preview_advance_rate_deg_s: 20
 max_yaw_acc: 50
 Q_yaw: [9e6, 0]
 R_yaw: [1]

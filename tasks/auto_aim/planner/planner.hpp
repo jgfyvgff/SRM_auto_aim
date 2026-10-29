@@ -37,6 +37,8 @@ struct Plan
   float tx_yaw = 0.0F;
   bool tx_yaw_valid = false;
   bool tx_yaw_spike_suppressed = false;
+  // 切板预览额外施加的平滑提前量，单位 rad；不写入同板基准直线。
+  float tx_preview_advance_yaw = 0.0F;
   double gimbal_response_delay_ms = 0.0;
   double target_lead_compensation_ms = 0.0;
   float yaw;
@@ -70,6 +72,7 @@ struct Plan
   double fire_reference_error_rad = 0.0;
   // 从当前时刻算起，预测参考轨迹首次换板的 10 ms 步数；-1 表示窗口内未换板。
   int preview_switch_step = -1;
+  int preview_switch_id = -1;
 };
 
 // 云台当前状态属于 world 绝对角，单位 rad、rad/s；与轨迹参考共用坐标和符号约定。
@@ -100,7 +103,7 @@ public:
   Planner(const std::string & config_path);
   // 设置 TX 到云台响应的有效滞后估计，范围 [0, 100] ms。
   void set_gimbal_response_delay_ms(double delay_ms);
-  // 仅在实际准备发送时调用；同一目标和装甲板沿已接受的斜率抑制单帧突刺。
+  // 仅在实际准备发送时调用；同板抑制突刺，确认切板预览后限速提前过渡。
   void prepare_tx_yaw(
     Plan & plan, std::uint64_t target_generation, int armor_id,
     std::chrono::steady_clock::time_point now);
@@ -131,6 +134,8 @@ private:
     double velocity = 0.0;  // 单位 rad/s。
     double last_rejected_yaw = 0.0;
     int rejected_count = 0;
+    int preview_switch_id = -1;
+    double preview_advance = 0.0;  // 与同板基准直线分离，单位 rad。
   };
 
   TxYawLine tx_yaw_line_;
@@ -138,6 +143,8 @@ private:
   double pitch_offset_;
   double fire_thresh_;
   double gimbal_response_delay_ms_ = 0.0;
+  double preview_max_advance_rad_ = 0.0;
+  double preview_advance_rate_rad_s_ = 0.0;
   // TinyMPC 迭代上限。真机日志显示 yaw 的迭代次数中位正好等于 10（撞上限），
   // 是未收敛帧的主要来源，因此做成可配参数以便不重编就能比较收敛率。
   int max_iter_;

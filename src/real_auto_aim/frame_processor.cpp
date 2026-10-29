@@ -244,6 +244,9 @@ FrameProcessResult FrameProcessor::process(
         sample["planner_preview_switch_ms"] = plan.preview_switch_step >= 0
             ? Json(plan.preview_switch_step * auto_aim::DT * 1000.0)
             : Json(nullptr);
+        sample["planner_preview_switch_id"] =
+            plan.preview_switch_id >= 0
+                ? Json(plan.preview_switch_id) : Json(nullptr);
         sample["planner_status"] =
             !plan.diagnostic_valid ? "invalid" :
             plan.solver_converged ? "ok" : "unconverged_diagnostic";
@@ -328,6 +331,8 @@ FrameProcessResult FrameProcessor::process(
                             plan.tx_raw_yaw * 180.0 / CV_PI;
                         sample["planner_tx_yaw_deg"] =
                             plan.tx_yaw * 180.0 / CV_PI;
+                        sample["planner_tx_preview_advance_deg"] =
+                            plan.tx_preview_advance_yaw * 180.0 / CV_PI;
                         sample["planner_tx_spike_suppressed"] =
                             plan.tx_yaw_spike_suppressed;
                         sample["planner_fire"] = plan.fire ? 1 : 0;

@@ -399,9 +399,13 @@ python3 -m unittest tests/test_real_tracker_analyzer.py
 差分估计的云台速度只作诊断，不再是发送条件。Planner 将 MPC 规划角或
 未收敛回退参考角统一为 20 ms 候选 yaw；同一目标、同一装甲板的发送角
 沿已接受的斜率抑制单帧突刺，实际换板允许跳变。连续的新趋势逐步追上；
+若未收敛参考连续两帧预览到同一新板，发送角额外以配置速率向新板提前
+最多 `planner_preview_max_advance_deg`；预览撤销时同速退回，过渡期间不开火。
 处理后的角度若偏离原规划角，本帧禁止开火。TX 不再另加角度限幅。
 `planner_tx_raw_yaw_deg`、`planner_tx_yaw_deg` 和
 `planner_tx_spike_suppressed` 分别记录候选角、处理后角及是否拒绝异常点。
+`planner_preview_switch_id` 和 `planner_tx_preview_advance_deg` 用于核对
+切板预览是否稳定，以及实际叠加了多少提前量。
 可比较 `planner_measured_*`、
 `planner_state_*`、`planner_target_*` 与 `planner_yaw_deg/pitch_deg`，并查看
 `planner_feedback_age_ms`、`planner_feedback_interval_ms`、`planner_ms`。

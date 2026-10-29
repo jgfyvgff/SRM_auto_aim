@@ -629,6 +629,9 @@ void append_plan(
         plan.preview_switch_step >= 0
             ? Json(plan.preview_switch_step * auto_aim::DT * 1000.0)
             : Json(nullptr);
+    output["planner_preview_switch_id"] =
+        plan.preview_switch_id >= 0
+            ? Json(plan.preview_switch_id) : Json(nullptr);
     output["planner_solver_converged"] = plan.solver_converged;
     output["planner_yaw_solver_status"] = plan.yaw_solver_status;
     output["planner_pitch_solver_status"] = plan.pitch_solver_status;

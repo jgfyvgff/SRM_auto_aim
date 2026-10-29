@@ -72,7 +72,8 @@ int main(int argc, char * argv[])
     // 同板突刺沿已接受的斜边外推；实际换板保留角度跳变。
     constexpr double degree = 3.14159265358979323846 / 180.0;
     const auto start = std::chrono::steady_clock::time_point{};
-    const auto filter = [&](double yaw_deg, int armor_id, int frame, bool mpc) {
+    const auto filter = [&](double yaw_deg, int armor_id, int frame, bool mpc,
+                            int preview_step = -1, int preview_id = -1) {
         auto_aim::Plan candidate{};
         candidate.control = mpc;
         candidate.diagnostic_valid = true;
@@ -81,6 +82,8 @@ int main(int argc, char * argv[])
         candidate.yaw = yaw_deg * degree;
         candidate.yaw_vel = 0.0F;
         candidate.fire = true;
+        candidate.preview_switch_step = preview_step;
+        candidate.preview_switch_id = preview_id;
         planner.prepare_tx_yaw(
             candidate, 1, armor_id,
             start + std::chrono::milliseconds(frame * 20));
@@ -100,6 +103,32 @@ int main(int argc, char * argv[])
     require(!switched.tx_yaw_spike_suppressed &&
                 std::abs(switched.tx_yaw / degree - 105.43) < 0.01,
             "Actual armor switch was suppressed");
+
+    // 单帧预览不动；同一未来板连续出现后限速提前，实际换板清除提前量。
+    planner.reset_tx_yaw();
+    filter(103.43, 1, 0, false);
+    filter(103.31, 1, 1, false);
+    const auto first_preview = filter(106.34, 1, 2, false, 2, 0);
+    const auto second_preview = filter(106.22, 1, 3, false, 1, 0);
+    const auto third_preview = filter(106.10, 1, 4, false, 1, 0);
+    require(std::abs(first_preview.tx_preview_advance_yaw) < 1e-6 &&
+                second_preview.tx_preview_advance_yaw > 0.0F &&
+                third_preview.tx_preview_advance_yaw / degree <= 0.81 &&
+                !second_preview.fire,
+            "Preview transition was not bounded or gated");
+    const auto preview_switched = filter(105.43, 0, 5, false);
+    require(std::abs(preview_switched.tx_preview_advance_yaw) < 1e-6 &&
+                std::abs(preview_switched.tx_yaw / degree - 105.43) < 0.01,
+            "Actual switch retained preview advance");
+
+    planner.reset_tx_yaw();
+    filter(103.43, 1, 0, false);
+    filter(103.31, 1, 1, false);
+    filter(106.34, 1, 2, false, 2, 0);
+    filter(106.22, 1, 3, false, 1, 0);
+    const auto cancelled_preview = filter(102.95, 1, 4, false);
+    require(std::abs(cancelled_preview.tx_preview_advance_yaw) < 1e-6,
+            "Cancelled preview did not return to the old line");
 
     planner.reset_tx_yaw();
     filter(103.43, 1, 0, true);

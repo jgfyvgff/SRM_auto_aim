@@ -25,6 +25,21 @@ Planner::Planner(const std::string & config_path)
     set_gimbal_response_delay_ms(
       yaml["planner_gimbal_response_delay_ms"].as<double>());
   }
+  const double preview_max_deg =
+    yaml["planner_preview_max_advance_deg"].IsDefined()
+      ? yaml["planner_preview_max_advance_deg"].as<double>() : 0.0;
+  const double preview_rate_deg_s =
+    yaml["planner_preview_advance_rate_deg_s"].IsDefined()
+      ? yaml["planner_preview_advance_rate_deg_s"].as<double>() : 0.0;
+  if (!std::isfinite(preview_max_deg) || preview_max_deg < 0.0 ||
+      preview_max_deg > 1.0 || !std::isfinite(preview_rate_deg_s) ||
+      preview_rate_deg_s < 0.0 || preview_rate_deg_s > 30.0 ||
+      (preview_max_deg > 0.0 && preview_rate_deg_s == 0.0)) {
+    throw std::invalid_argument("invalid Planner preview transition limits");
+  }
+  constexpr double kRadPerDegree = 3.14159265358979323846 / 180.0;
+  preview_max_advance_rad_ = preview_max_deg * kRadPerDegree;
+  preview_advance_rate_rad_s_ = preview_rate_deg_s * kRadPerDegree;
   // 老配置没有这个键时保持原来的 10 次，避免其他入口因缺键起不来；上限小于 1 时
   // TinyMPC 会直接返回"达上限"，等于永不解算，所以这里兜到 1。
   max_iter_ = yaml["planner_max_iter"].IsDefined() ? yaml["planner_max_iter"].as<int>() : 10;
@@ -95,6 +110,13 @@ void Planner::prepare_tx_yaw(
     const double expected = line.yaw + line.velocity * dt;
     const double residual = candidate - expected;
     double output = expected;
+    const bool preview_candidate =
+        preview_max_advance_rad_ > 0.0 && !plan.control &&
+        plan.preview_switch_step >= 1 && plan.preview_switch_step <= 2 &&
+        plan.preview_switch_id >= 0 &&
+        plan.preview_switch_id != armor_id &&
+        std::abs(residual) > kSpikeGate;
+    bool stable_preview = false;
 
     if (std::abs(residual) > kSpikeGate) {
         // 单帧异常不进入直线状态。连续三帧的新趋势才逐步追上，避免永久锁死。
@@ -104,6 +126,10 @@ void Planner::prepare_tx_yaw(
                 kSpikeGate;
         line.rejected_count = consistent ? line.rejected_count + 1 : 1;
         line.last_rejected_yaw = candidate;
+        stable_preview =
+            preview_candidate &&
+            line.preview_switch_id == plan.preview_switch_id &&
+            line.rejected_count >= 2;
         if (line.rejected_count >= 3) {
             output += std::clamp(residual, -kRecoveryStep, kRecoveryStep);
         }
@@ -115,13 +141,26 @@ void Planner::prepare_tx_yaw(
         line.velocity += kVelocityGain * residual / dt;
     }
 
+    // 原突刺保护继续维护旧板直线；确认未来板后，只给发送角叠加有界提前量。
+    // 预览撤销时同速退回，避免把错误预览永久写进直线斜率。
+    line.preview_switch_id =
+        preview_candidate ? plan.preview_switch_id : -1;
+    const double advance_target = stable_preview
+        ? std::copysign(preview_max_advance_rad_, residual) : 0.0;
+    const double advance_step = preview_advance_rate_rad_s_ * dt;
+    line.preview_advance += std::clamp(
+        advance_target - line.preview_advance, -advance_step, advance_step);
     line.yaw = output;
     line.time = now;
-    plan.tx_yaw = static_cast<float>(tools::limit_rad(output));
+    const double tx_output = output + line.preview_advance;
+    plan.tx_preview_advance_yaw =
+        static_cast<float>(line.preview_advance);
+    plan.tx_yaw = static_cast<float>(tools::limit_rad(tx_output));
     plan.tx_yaw_valid = true;
     // 最终发送角偏离原规划角时，不沿用原角度计算的开火结论。
     if (plan.tx_yaw_spike_suppressed ||
-        std::abs(tools::limit_rad(output - raw_yaw)) >= fire_thresh_) {
+        std::abs(line.preview_advance) > 1e-6 ||
+        std::abs(tools::limit_rad(tx_output - raw_yaw)) >= fire_thresh_) {
         plan.fire = false;
     }
 }
@@ -427,6 +466,7 @@ Plan Planner::plan(
       tools::limit_rad(fire_yaw - state.yaw);
     plan.feedback_pitch_error_rad = fire_pitch - state.pitch;
     plan.preview_switch_step = preview_switch_step;
+    plan.preview_switch_id = preview_switch_id;
     plan.yaw_solver_status = yaw_status;
     plan.pitch_solver_status = pitch_status;
     plan.yaw_solver_iterations = yaw_solver_->solution->iter;
