@@ -3,6 +3,8 @@
 
 #include <Eigen/Dense>
 #include <array>
+#include <chrono>
+#include <cstdint>
 #include <list>
 #include <optional>
 
@@ -28,6 +30,13 @@ struct Plan
   // 与 MPC 下发角对齐的 20 ms 目标参考；供 MPC 未收敛时回退使用。
   float command_target_yaw = 0.0F;
   float command_target_pitch = 0.0F;
+  // 当前物理板的局部 yaw 斜率，单位 rad/s；换板后用于建立新直线。
+  float command_target_yaw_vel = 0.0F;
+  // 统一选择 MPC 或回退角后，供 TX 发送的最终 yaw。
+  float tx_raw_yaw = 0.0F;
+  float tx_yaw = 0.0F;
+  bool tx_yaw_valid = false;
+  bool tx_yaw_spike_suppressed = false;
   double gimbal_response_delay_ms = 0.0;
   double target_lead_compensation_ms = 0.0;
   float yaw;
@@ -91,6 +100,11 @@ public:
   Planner(const std::string & config_path);
   // 设置 TX 到云台响应的有效滞后估计，范围 [0, 100] ms。
   void set_gimbal_response_delay_ms(double delay_ms);
+  // 仅在实际准备发送时调用；同一目标和装甲板沿已接受的斜率抑制单帧突刺。
+  void prepare_tx_yaw(
+    Plan & plan, std::uint64_t target_generation, int armor_id,
+    std::chrono::steady_clock::time_point now);
+  void reset_tx_yaw();
 
   Plan plan(Target target, double bullet_speed);
   Plan plan(std::optional<Target> target, double bullet_speed);
@@ -107,6 +121,19 @@ public:
     Target target, double bullet_speed, int armor_id, const Aimer & preview_aimer);
 
 private:
+  struct TxYawLine
+  {
+    bool valid = false;
+    std::uint64_t target_generation = 0;
+    int armor_id = -1;
+    std::chrono::steady_clock::time_point time{};
+    double yaw = 0.0;  // 不折返的连续角，单位 rad。
+    double velocity = 0.0;  // 单位 rad/s。
+    double last_rejected_yaw = 0.0;
+    int rejected_count = 0;
+  };
+
+  TxYawLine tx_yaw_line_;
   double yaw_offset_;
   double pitch_offset_;
   double fire_thresh_;

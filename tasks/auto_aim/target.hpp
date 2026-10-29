@@ -99,8 +99,14 @@ public:
   void set_radius_delta_constraint(double radius_delta, double variance);
   // 方位观测噪声方差，单位 rad²；关联和 EKF 更新共用此值。
   void set_measurement_bearing_variance(double variance);
-  // 设置平移加速度方差，单位 m²/s⁴；用于控制中心速度预测协方差增长。
+  // 兼容旧调用者的平移过程噪声设置；新配置应同时设置平移与角加速度方差。
   void set_translation_acceleration_variance(double variance);
+  // 设置平移与角加速度方差，分别使用 m²/s⁴ 与 rad²/s⁴，控制预测协方差增长。
+  void set_process_noise_variances(double translation_variance, double angular_variance);
+  // 配置俯仰、距离和装甲 yaw 的观测方差模型；对数项系数和偏置均为方差参数。
+  void set_measurement_noise_model(
+    double elevation_variance, double distance_log_scale, double distance_offset,
+    double armor_yaw_log_scale, double armor_yaw_offset);
 
   Eigen::VectorXd ekf_x() const;
   const tools::ExtendedKalmanFilter & ekf() const;
@@ -134,7 +140,13 @@ private:
   std::optional<GeometryConstraint> geometry_constraint_;
   std::optional<std::pair<double, double>> radius_delta_constraint_;
   double measurement_bearing_variance_ = 4e-3;
+  double measurement_elevation_variance_ = 4e-3;
+  double measurement_distance_variance_log_scale_ = 1.0;
+  double measurement_distance_variance_offset_ = 1.0;
+  double measurement_armor_yaw_variance_log_scale_ = 0.005;
+  double measurement_armor_yaw_variance_offset_ = 9e-2;
   double translation_acceleration_variance_ = 100.0;
+  double angular_acceleration_variance_ = 100.0;
 
   bool update_ypda(
     const Armor & armor, int id,

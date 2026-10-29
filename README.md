@@ -262,7 +262,7 @@ Planner 从串口缓存有效窗口内相距较远的两帧主机接收时间估
 正常跟踪时 MPC 仍以参考轨迹建立初态并生成绝对角度指令；反馈角目前用于
 跟随误差诊断和开火对准检查。协议没有真实采样时刻或速度，所以差分估计不能视作硬件同步测量。
 真机配置 `planner_gimbal_response_delay_ms` 表示 TX 到反馈响应的有效滞后估计，当前设为
-35 ms；Planner/TX 已有约 20 ms 目标前视，因此额外前推约 15 ms。这个时延来自主机日志的
+55 ms；Planner/TX 已有约 20 ms 目标前视，因此额外前推约 35 ms。这个时延来自主机日志的
 有效滞后估计，不是下位机硬件时间戳或纯机械死区测量，需用后续运动日志复核。
 未收敛时的目标参考也使用同一 20 ms 输出时刻，避免和收敛 MPC 命令差一个规划步。
 弹速反馈为 0 时，Planner 使用配置中的
@@ -396,8 +396,12 @@ python3 -m unittest tests/test_real_tracker_analyzer.py
 但仍记录有限的诊断轨迹。`planner_control` 只表示 MPC 控制判据，不是命令发送标志；
 当前 Aimer 选板有效且求解收敛时，Planner 以参考轨迹为初态，预览未来换板，
 发送 20 ms 规划角；未收敛时跟随 `planner_command_target_yaw/pitch_deg`，它使用同一输出时刻。
-差分估计的云台速度只作诊断，不再是发送条件。选中的 MPC 规划角或目标参考角直接进入 TX，
-发送链路不再叠加速率或单步限幅。
+差分估计的云台速度只作诊断，不再是发送条件。Planner 将 MPC 规划角或
+未收敛回退参考角统一为 20 ms 候选 yaw；同一目标、同一装甲板的发送角
+沿已接受的斜率抑制单帧突刺，实际换板允许跳变。连续的新趋势逐步追上；
+处理后的角度若偏离原规划角，本帧禁止开火。TX 不再另加角度限幅。
+`planner_tx_raw_yaw_deg`、`planner_tx_yaw_deg` 和
+`planner_tx_spike_suppressed` 分别记录候选角、处理后角及是否拒绝异常点。
 可比较 `planner_measured_*`、
 `planner_state_*`、`planner_target_*` 与 `planner_yaw_deg/pitch_deg`，并查看
 `planner_feedback_age_ms`、`planner_feedback_interval_ms`、`planner_ms`。
@@ -414,8 +418,9 @@ planner_yaw_20ms_deg/pitch_20ms_deg 用于核对 MPC 规划角与 TX 指令。
 `tx_command_source` 标记 `mpc_reference_20ms`、`target_reference` 或 `hold`；
 `planner_control=0` 不代表没有发送角度命令，实际发送状态由 `tx_command_sent` 标记，
 普通跟踪命令使用 `tx_command_mode=tracking`。
-`planner_feedback_yaw_error_deg` 和 `planner_feedback_pitch_error_deg` 是规划时刻的
-参考角减调用方估计的反馈角，正值表示参考角领先；yaw 误差已按 ±180° 折返。
+真机固定选板入口的 `planner_feedback_yaw_error_deg` 和
+`planner_feedback_pitch_error_deg` 是当前发射弹道目标角减反馈角，
+不含云台响应前推；正值表示目标角领先，yaw 误差按 ±180° 折返。
 `planner_fire_alignment_error_deg` 是两轴误差的合成值；它小于 `fire_thresh`
 才允许 Planner 申请开火，且不改变下发角。
 `planner_fire_reference_error_deg` 记录约 30 ms 处规划角与参考角的差，也使用
@@ -671,7 +676,7 @@ UDP 使用 PlotJuggler 的接收时间作为横轴；`replay_time_s` 也作为�
   --frames-dir=/tmp/real6_replay/frames \
   --output-jsonl=/tmp/real6_replay/replayed.jsonl
 
-# 对照关闭额外补偿；默认 -1 使用 YAML 中的 35 ms。
+# 对照关闭额外补偿；默认 -1 使用 YAML 中的 55 ms。
 ./build/standard_srm_replay configs/real_auto_aim.yaml \
   --input-jsonl=/tmp/real6_replay/input.jsonl \
   --frames-dir=/tmp/real6_replay/frames \
@@ -854,6 +859,19 @@ python3 tools/sim_pnp_geometry_audit.py \
 `standard_translation_acceleration_variance` 控制标准四装甲目标预测时的平移
 加速度方差（m²/s⁴）。未配置时保持原值 `100`；固定位置旋转仿真暂设为 `1.0`，
 用于检查过大的过程噪声是否导致中心速度漂移。
+
+Tracker 的 Kalman 初始协方差、过程噪声和观测噪声均从 YAML 读取。标准四装甲的
+位置与中心 yaw 初始方差分别由 `standard_initial_position_variance`（m²）和
+`standard_initial_center_yaw_variance`（rad²）控制；balance、outpost、base 的完整
+P0 对角线使用对应的 `*_initial_covariance_diagonal`，顺序为
+`[x, vx, y, vy, z, vz, center_yaw, omega, r, l, h]`。过程噪声还包括各模型的平移
+加速度方差（m²/s⁴）和角加速度方差（rad²/s⁴）。
+
+R 中的方位与俯仰方差单位为 rad²；距离和装甲 yaw 的对数项系数、偏置分别由
+`measurement_distance_variance_{slope,offset}` 与
+`measurement_armor_yaw_variance_{slope,offset}` 控制。`distance_update_r_scale` 和
+`yaw_update_sigma_deg` 可进一步调整更新阶段的距离、yaw 权重；默认值保持当前行为。
+修改 YAML 后需重启程序使参数生效，之后改数值不需要重新编译。
 
 `standard_max_angular_velocity` 是标准四装甲 EKF 更新后的角速度物理上限（rad/s）。
 仿真 `demo.yaml` 按 Daedalus 底盘 `7.42 rad/s` 的设定留余量设为 `8.0`；超限时回滚

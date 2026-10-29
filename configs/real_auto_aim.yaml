@@ -72,7 +72,25 @@ max_temp_lost_count: 15
 outpost_max_temp_lost_count: 75
 tracker_max_prediction_gap: 0.3
 # EKF 观测方位角噪声方差，单位 rad²。
+#\(R=diag(
+# 0.004,
+# 0.004,
+# 1+\ln(1+|Delta\theta|),
+# 0.09+0.005\ln(1+d))
 measurement_bearing_variance: 4e-3
+# EKF 完整 R 模型；距离项使用 log(abs(delta_angle)+1)，yaw 项使用 log(abs(distance)+1)。
+measurement_elevation_variance: 4e-3
+measurement_distance_variance_slope: 1.0
+measurement_distance_variance_offset: 1.0
+measurement_armor_yaw_variance_slope: 0.005
+measurement_armor_yaw_variance_offset: 0.09
+# EKF 更新阶段额外的 R 调整；默认倍率 1、yaw 标准差 0° 均保持原行为。
+distance_update_r_scale: 1.0
+yaw_update_sigma_deg: 0.0
+# 非标准目标 P0 对角线顺序：[x, vx, y, vy, z, vz, center_yaw, omega, r, l, h]。
+balance_initial_covariance_diagonal: [1, 64, 1, 64, 1, 64, 0.4, 100, 1, 1, 1]
+outpost_initial_covariance_diagonal: [1, 64, 1, 64, 1, 81, 0.4, 100, 1e-4, 0, 0]
+base_initial_covariance_diagonal: [1, 64, 1, 64, 1, 64, 0.4, 100, 1e-4, 0, 0]
 # 旧 ID 仍通过门限时，新 ID 排序分数增加此值；单位等效 rad，不改变门限。
 association_id_switch_score_margin: 0.05
 # 实测标准四装甲旋转半径约 0.22 m，作为 EKF 初始软先验。
@@ -84,32 +102,43 @@ standard_geometry_constraint: false
 standard_radius_delta_constraint: true
 standard_radius_delta_variance: 1e-6
 # EKF 初始状态协方差与平移过程噪声；数值沿用当前代码默认值。
-# 中心速度方差单位 m²/s²，角速度方差单位 (rad/s)²。
+# 位置方差单位 m²，中心 yaw 方差单位 rad²，中心速度方差单位 m²/s²，角速度方差单位 (rad/s)²。
+standard_initial_position_variance: 1.0
+standard_initial_center_yaw_variance: 0.4
 standard_initial_velocity_variance: 64.0
 standard_initial_angular_velocity_variance: 0.1
-# 平移加速度过程噪声方差单位 m²/s⁴，高度差初始方差单位 m²。
+# 平移和角加速度过程噪声方差单位分别为 m²/s⁴ 与 rad²/s⁴。
 standard_translation_acceleration_variance: 100.0
+standard_angular_acceleration_variance: 1
+# 两装甲/三装甲分支的平移与角加速度过程噪声方差。
+balance_translation_acceleration_variance: 100.0
+balance_angular_acceleration_variance: 100.0
+outpost_translation_acceleration_variance: 10.0
+outpost_angular_acceleration_variance: 0.1
+base_translation_acceleration_variance: 100.0
+base_angular_acceleration_variance: 100.0
+# 高度差初始方差单位 m²。
 standard_height_delta_variance: 1.0
 # 倒装相机不使用固定俯仰、零滚转的逐点 yaw 重投影优化。
 yaw_optimization_enabled: false
 
 # 零偏置仅用于读数诊断，未经实车射击校准。
-yaw_offset: 0
-pitch_offset: 0
+yaw_offset: -1
+pitch_offset: -1.3
 comming_angle: 55
 leaving_angle: 20
 decision_speed: 7
 
 # 真机 Planner 先只读对比；弹速反馈为 0 时使用诊断参考值，不能用于开火或控制。
-planner_debug_bullet_speed_mps: 23.0
+planner_debug_bullet_speed_mps: 22.0
 fire_thresh: 0.003
 # TinyMPC 迭代上限。真机 10526 帧日志实测：yaw 的迭代次数中位正好等于 10（p95 也是 10，
 # 即撞在上限上），是 17% 未收敛帧的主要来源；单次求解仅约 0.3ms，放宽上限的代价可忽略。
 # 改这个值不需要重编，配 PlotJuggler 看 planner_{yaw,pitch}_solver_status 的 1 占比即可。
-planner_max_iter: 10
+planner_max_iter: 30
 # TX 到云台反馈的有效滞后估计，单位 ms；Planner 已有约 20 ms 前视，
-# 因此 35 ms 会额外前推约 15 ms。该值是待离线复核的补偿起点。
-planner_gimbal_response_delay_ms: 35.0
+# 因此 55 ms 会额外前推约 35 ms。该值仍需闭环复核。
+planner_gimbal_response_delay_ms: 55
 max_yaw_acc: 50
 Q_yaw: [9e6, 0]
 R_yaw: [1]
@@ -118,7 +147,7 @@ Q_pitch: [9e6, 0]
 R_pitch: [1]
 
 camera_name: hikrobot
-exposure_ms: 2.2
+exposure_ms: 2.0
 gain: 16.9
 vid_pid: "2bdf:0001"
 

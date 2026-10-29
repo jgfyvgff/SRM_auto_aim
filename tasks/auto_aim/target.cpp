@@ -25,6 +25,11 @@ Target::Target(
   is_converged_(false),
   switch_count_(0)
 {
+  // 保留 Tracker 配置化前独立构造前哨站目标时的过程噪声默认值。
+  if (name == ArmorName::outpost) {
+    translation_acceleration_variance_ = 10.0;
+    angular_acceleration_variance_ = 0.1;
+  }
   auto r = radius;
   priority = armor.priority;
   const Eigen::VectorXd & xyz = armor.xyz_in_world;
@@ -122,14 +127,8 @@ void Target::predict(double dt)
 
 
 
-  double v1, v2;
-  if (name == ArmorName::outpost) {
-    v1 = 10;   // 前哨站加速度方差
-    v2 = 0.1;  // 前哨站角加速度方差
-  } else {
-    v1 = translation_acceleration_variance_;
-    v2 = 100;  // 角加速度方差
-  }
+  const double v1 = translation_acceleration_variance_;
+  const double v2 = angular_acceleration_variance_;
   auto a = dt * dt * dt * dt / 4;
   auto b = dt * dt * dt / 2;
   auto c = dt * dt;
@@ -305,10 +304,35 @@ void Target::set_measurement_bearing_variance(double variance)
 
 void Target::set_translation_acceleration_variance(double variance)
 {
-  if (!std::isfinite(variance) || variance <= 0.0) {
-    throw std::invalid_argument("Invalid translation acceleration variance");
+  set_process_noise_variances(variance, angular_acceleration_variance_);
+}
+
+void Target::set_process_noise_variances(double translation_variance, double angular_variance)
+{
+  if (!std::isfinite(translation_variance) || translation_variance <= 0.0 ||
+      !std::isfinite(angular_variance) || angular_variance <= 0.0) {
+    throw std::invalid_argument("Invalid process noise variance");
   }
-  translation_acceleration_variance_ = variance;
+  translation_acceleration_variance_ = translation_variance;
+  angular_acceleration_variance_ = angular_variance;
+}
+
+void Target::set_measurement_noise_model(
+  double elevation_variance, double distance_log_scale, double distance_offset,
+  double armor_yaw_log_scale, double armor_yaw_offset)
+{
+  if (!std::isfinite(elevation_variance) || elevation_variance <= 0.0 ||
+      !std::isfinite(distance_log_scale) || distance_log_scale < 0.0 ||
+      !std::isfinite(distance_offset) || distance_offset <= 0.0 ||
+      !std::isfinite(armor_yaw_log_scale) || armor_yaw_log_scale < 0.0 ||
+      !std::isfinite(armor_yaw_offset) || armor_yaw_offset <= 0.0) {
+    throw std::invalid_argument("Invalid measurement noise model");
+  }
+  measurement_elevation_variance_ = elevation_variance;
+  measurement_distance_variance_log_scale_ = distance_log_scale;
+  measurement_distance_variance_offset_ = distance_offset;
+  measurement_armor_yaw_variance_log_scale_ = armor_yaw_log_scale;
+  measurement_armor_yaw_variance_offset_ = armor_yaw_offset;
 }
 
 void Target::apply_geometry_constraint()
@@ -487,9 +511,12 @@ Eigen::Matrix4d Target::measurement_noise(const Armor & armor) const
   const auto center_yaw = std::atan2(armor.xyz_in_world[1], armor.xyz_in_world[0]);
   const auto delta_angle = tools::limit_rad(armor.ypr_in_world[0] - center_yaw);
   Eigen::Matrix4d R = Eigen::Matrix4d::Zero();
-  R.diagonal() << measurement_bearing_variance_, 4e-3,
-    std::log(std::abs(delta_angle) + 1) + 1,
-    std::log(std::abs(armor.ypd_in_world[2]) + 1) / 200 + 9e-2;
+  R.diagonal() << measurement_bearing_variance_, measurement_elevation_variance_,
+    measurement_distance_variance_log_scale_ * std::log(std::abs(delta_angle) + 1) +
+      measurement_distance_variance_offset_,
+    measurement_armor_yaw_variance_log_scale_ *
+      std::log(std::abs(armor.ypd_in_world[2]) + 1) +
+      measurement_armor_yaw_variance_offset_;
   return R;
 }
 

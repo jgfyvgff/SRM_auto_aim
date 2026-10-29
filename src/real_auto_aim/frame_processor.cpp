@@ -106,6 +106,7 @@ FrameProcessResult FrameProcessor::process(
         append_association_json(sample, tracker_.association_debug(), solver_, armors);
         append_tracker_filter_json(sample, tracker_, targets);
         tx_controller.clear();
+        planner_.reset_tx_yaw();
         result.invalid_bullet_speed = true;
         result.targets = targets;
         result.bullet_speed = bullet_speed;
@@ -140,6 +141,9 @@ FrameProcessResult FrameProcessor::process(
     sample["planner_target_lead_compensation_ms"] = nullptr;
     sample["planner_command_target_yaw_deg"] = nullptr;
     sample["planner_command_target_pitch_deg"] = nullptr;
+    sample["planner_tx_raw_yaw_deg"] = nullptr;
+    sample["planner_tx_yaw_deg"] = nullptr;
+    sample["planner_tx_spike_suppressed"] = false;
     sample["planner_speed_source"] = nullptr;
     sample["planner_yaw_deg"] = nullptr;
     sample["planner_pitch_deg"] = nullptr;
@@ -150,6 +154,7 @@ FrameProcessResult FrameProcessor::process(
         if (stop_requested.load() || now < image_timestamp ||
             now - image_timestamp > max_image_age) {
             tx_controller.clear();
+            planner_.reset_tx_yaw();
             sample["tx_skip_reason"] = stop_requested.load() ?
                 "pipeline_stopping" : "image_stale_before_tx";
             return false;
@@ -233,7 +238,7 @@ FrameProcessResult FrameProcessor::process(
                     aimer_.debug_aim_point.armor_id >= 0
                 ? std::optional<int>{aimer_.debug_aim_point.armor_id}
                 : std::nullopt;
-        const auto plan = planner_.plan(
+        auto plan = planner_.plan(
             target, planning_speed, planner_state, planner_armor_id,
             planner_armor_id ? &aimer_ : nullptr);
         sample["planner_preview_switch_ms"] = plan.preview_switch_step >= 0
@@ -312,14 +317,36 @@ FrameProcessResult FrameProcessor::process(
 
         if (command_allowed()) {
             if (planner_armor_id) {
+                if (tx_controller.enabled() &&
+                    (measured_speed || tx_controller.nominal()) &&
+                    plan.diagnostic_valid) {
+                    planner_.prepare_tx_yaw(
+                        plan, tracker_.target_generation(), *planner_armor_id,
+                        Clock::now());
+                    if (plan.tx_yaw_valid) {
+                        sample["planner_tx_raw_yaw_deg"] =
+                            plan.tx_raw_yaw * 180.0 / CV_PI;
+                        sample["planner_tx_yaw_deg"] =
+                            plan.tx_yaw * 180.0 / CV_PI;
+                        sample["planner_tx_spike_suppressed"] =
+                            plan.tx_yaw_spike_suppressed;
+                        sample["planner_fire"] = plan.fire ? 1 : 0;
+                    }
+                } else {
+                    planner_.reset_tx_yaw();
+                }
                 tx_controller.apply(
                     plan, feedback, measured_speed, tx_extrapolating);
             } else {
+                planner_.reset_tx_yaw();
                 tx_controller.hold(feedback);
             }
         }
-    } else if (tx_controller.enabled() && command_allowed()) {
-        tx_controller.hold(feedback);
+    } else {
+        planner_.reset_tx_yaw();
+        if (tx_controller.enabled() && command_allowed()) {
+            tx_controller.hold(feedback);
+        }
     }
     sample["tx_command_sent"] = tx_controller.sent();
     sample["tx_command_fire_flag"] = tx_controller.fire_flag();

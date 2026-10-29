@@ -197,6 +197,10 @@ private:
   int temp_lost_count_;
   int outpost_max_temp_lost_count_;
   int normal_temp_lost_count_;
+  // 非标准模型完整 P0 对角线，顺序为 [x,vx,y,vy,z,vz,center_yaw,omega,r,l,h]。
+  std::array<double, 11> balance_initial_covariance_diagonal_;
+  std::array<double, 11> outpost_initial_covariance_diagonal_;
+  std::array<double, 11> base_initial_covariance_diagonal_;
   // 标准四装甲机器人的已知几何先验；方差单位为 m²。
   bool standard_geometry_constraint_;
   bool standard_radius_delta_constraint_;
@@ -204,6 +208,8 @@ private:
   double standard_radius_variance_;
   double standard_radius_delta_variance_;
   double standard_height_delta_variance_;
+  double standard_initial_position_variance_;
+  double standard_initial_center_yaw_variance_;
   // 标准四装甲捕获时的平移速度初始方差，单位 m²/s²。
   double standard_initial_velocity_variance_;
   // 标准四装甲捕获时的角速度初始方差，单位 (rad/s)²。
@@ -212,6 +218,13 @@ private:
   int standard_capture_bootstrap_updates_;
   // 标准四装甲目标的平移加速度方差，单位 m²/s⁴。
   double standard_translation_acceleration_variance_;
+  double standard_angular_acceleration_variance_;
+  double balance_translation_acceleration_variance_;
+  double balance_angular_acceleration_variance_;
+  double outpost_translation_acceleration_variance_;
+  double outpost_angular_acceleration_variance_;
+  double base_translation_acceleration_variance_;
+  double base_angular_acceleration_variance_;
   // 可选标准四装甲角速度上限，单位 rad/s；只由仿真配置启用。
   std::optional<double> standard_max_angular_velocity_;
   // 固定角度诊断阈值，单位为 rad；实际接受由综合分数和 EKF 协方差门控决定。
@@ -238,6 +251,11 @@ private:
   bool association_update_trace_enabled_ = false;
   // 配置值仅改变方位观测噪声；未配置时保持原实现。
   double measurement_bearing_variance_;
+  double measurement_elevation_variance_;
+  double measurement_distance_variance_log_scale_;
+  double measurement_distance_variance_offset_;
+  double measurement_armor_yaw_variance_log_scale_;
+  double measurement_armor_yaw_variance_offset_;
   // 最大可信预测间隔，单位为 s；短时抖动由 EKF 使用真实 dt 吸收。
   double max_prediction_gap_;
   std::string state_, pre_state_;

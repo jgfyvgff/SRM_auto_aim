@@ -56,7 +56,8 @@ void TxCommandController::apply(
     const bool finite_target =
         std::isfinite(plan.target_yaw) && std::isfinite(plan.target_pitch) &&
         std::isfinite(plan.command_target_yaw) &&
-        std::isfinite(plan.command_target_pitch);
+        std::isfinite(plan.command_target_pitch) &&
+        plan.tx_yaw_valid && std::isfinite(plan.tx_yaw);
     if (!plan.diagnostic_valid || !finite_target ||
         (!measured_speed && !options_.nominal)) {
         if (extrapolating) {
@@ -67,17 +68,12 @@ void TxCommandController::apply(
         return;
     }
 
-    // 参考轨迹初态使平稳段贴近目标；未来换板进入窗口时使用受加速度约束的规划角。
-    // 第 2 步是当前离散模型中可体现本次加速度选择的最早角度。
+    // Planner 已统一选择并处理最终 yaw；TX 只负责换算和发送。
     const bool ready = options_.enabled && (measured_speed || options_.nominal) &&
                        plan.diagnostic_valid && finite_target;
     if (ready) {
-        // Planner 已生成本帧参考角；这里不再叠加发送端速率或单步限幅。
         const bool use_mpc = plan.control;
-        const double target_yaw_deg = use_mpc
-            ? tools::limit_rad(plan.yaw + auto_aim::DT * plan.yaw_vel) *
-                180.0 / CV_PI
-            : plan.command_target_yaw * 180.0 / CV_PI;
+        const double target_yaw_deg = plan.tx_yaw * 180.0 / CV_PI;
         const double target_pitch_deg = use_mpc
             ? (plan.pitch + auto_aim::DT * plan.pitch_vel) * 180.0 / CV_PI
             : plan.command_target_pitch * 180.0 / CV_PI;

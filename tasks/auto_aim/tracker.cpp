@@ -3,6 +3,7 @@
 #include <yaml-cpp/yaml.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <limits>
 #include <numeric>
@@ -16,6 +17,39 @@
 #include "tools/math_tools.hpp"
 #include "tasks/auto_aim/tracker_association_policy.hpp"
 #include "tracker_time_policy.hpp"
+
+namespace
+{
+using P0Diagonal = std::array<double, 11>;
+
+P0Diagonal read_p0_diagonal(
+  const YAML::Node & yaml, const char * key, const P0Diagonal & fallback)
+{
+  const auto node = yaml[key];
+  if (!node.IsDefined()) return fallback;
+  if (!node.IsSequence() || node.size() != fallback.size()) {
+    throw std::runtime_error(std::string("Invalid ") + key + ": expected 11 diagonal values");
+  }
+
+  P0Diagonal values{};
+  for (std::size_t index = 0; index < values.size(); ++index) {
+    values[index] = node[index].as<double>();
+    if (!std::isfinite(values[index]) || values[index] < 0.0) {
+      throw std::runtime_error(std::string("Invalid ") + key + ": values must be finite and non-negative");
+    }
+  }
+  return values;
+}
+
+Eigen::VectorXd to_eigen_vector(const P0Diagonal & values)
+{
+  Eigen::VectorXd result(static_cast<Eigen::Index>(values.size()));
+  for (Eigen::Index index = 0; index < result.size(); ++index) {
+    result[index] = values[static_cast<std::size_t>(index)];
+  }
+  return result;
+}
+}  // namespace
 
 namespace auto_aim
 {
@@ -34,6 +68,12 @@ Tracker::Tracker(const std::string & config_path, Solver & solver)
   max_temp_lost_count_ = yaml["max_temp_lost_count"].as<int>();//连续丢失目标的最大次数
   outpost_max_temp_lost_count_ = yaml["outpost_max_temp_lost_count"].as<int>();//前哨站连续丢失目标的最大次数
   normal_temp_lost_count_ = max_temp_lost_count_;//普通模式连续丢失目标的最大次数
+  balance_initial_covariance_diagonal_ = read_p0_diagonal(
+    yaml, "balance_initial_covariance_diagonal", P0Diagonal{1, 64, 1, 64, 1, 64, 0.4, 100, 1, 1, 1});
+  outpost_initial_covariance_diagonal_ = read_p0_diagonal(
+    yaml, "outpost_initial_covariance_diagonal", P0Diagonal{1, 64, 1, 64, 1, 81, 0.4, 100, 1e-4, 0, 0});
+  base_initial_covariance_diagonal_ = read_p0_diagonal(
+    yaml, "base_initial_covariance_diagonal", P0Diagonal{1, 64, 1, 64, 1, 64, 0.4, 100, 1e-4, 0, 0});
 
   standard_geometry_constraint_ = yaml["standard_geometry_constraint"].IsDefined()
                                     ? yaml["standard_geometry_constraint"].as<bool>()
@@ -53,6 +93,12 @@ Tracker::Tracker(const std::string & config_path, Solver & solver)
   standard_height_delta_variance_ = yaml["standard_height_delta_variance"].IsDefined()
                                       ? yaml["standard_height_delta_variance"].as<double>()
                                       : 1.0;
+  standard_initial_position_variance_ = yaml["standard_initial_position_variance"].IsDefined()
+                                         ? yaml["standard_initial_position_variance"].as<double>()
+                                         : 1.0;
+  standard_initial_center_yaw_variance_ = yaml["standard_initial_center_yaw_variance"].IsDefined()
+                                            ? yaml["standard_initial_center_yaw_variance"].as<double>()
+                                            : 0.4;
   standard_initial_velocity_variance_ =
     yaml["standard_initial_velocity_variance"].IsDefined()
       ? yaml["standard_initial_velocity_variance"].as<double>()
@@ -69,6 +115,28 @@ Tracker::Tracker(const std::string & config_path, Solver & solver)
     yaml["standard_translation_acceleration_variance"].IsDefined()
       ? yaml["standard_translation_acceleration_variance"].as<double>()
       : 100.0;
+  standard_angular_acceleration_variance_ =
+    yaml["standard_angular_acceleration_variance"].IsDefined()
+      ? yaml["standard_angular_acceleration_variance"].as<double>()
+      : 100.0;
+  balance_translation_acceleration_variance_ = yaml["balance_translation_acceleration_variance"].IsDefined()
+                                                  ? yaml["balance_translation_acceleration_variance"].as<double>()
+                                                  : 100.0;
+  balance_angular_acceleration_variance_ = yaml["balance_angular_acceleration_variance"].IsDefined()
+                                              ? yaml["balance_angular_acceleration_variance"].as<double>()
+                                              : 100.0;
+  outpost_translation_acceleration_variance_ = yaml["outpost_translation_acceleration_variance"].IsDefined()
+                                                  ? yaml["outpost_translation_acceleration_variance"].as<double>()
+                                                  : 10.0;
+  outpost_angular_acceleration_variance_ = yaml["outpost_angular_acceleration_variance"].IsDefined()
+                                              ? yaml["outpost_angular_acceleration_variance"].as<double>()
+                                              : 0.1;
+  base_translation_acceleration_variance_ = yaml["base_translation_acceleration_variance"].IsDefined()
+                                               ? yaml["base_translation_acceleration_variance"].as<double>()
+                                               : 100.0;
+  base_angular_acceleration_variance_ = yaml["base_angular_acceleration_variance"].IsDefined()
+                                           ? yaml["base_angular_acceleration_variance"].as<double>()
+                                           : 100.0;
   if (yaml["standard_max_angular_velocity"].IsDefined()) {
     standard_max_angular_velocity_ = yaml["standard_max_angular_velocity"].as<double>();
   }
@@ -106,6 +174,27 @@ Tracker::Tracker(const std::string & config_path, Solver & solver)
     yaml["measurement_bearing_variance"].IsDefined()
       ? yaml["measurement_bearing_variance"].as<double>()
       : 4e-3;
+  measurement_elevation_variance_ = yaml["measurement_elevation_variance"].IsDefined()
+                                      ? yaml["measurement_elevation_variance"].as<double>()
+                                      : 4e-3;
+  measurement_distance_variance_log_scale_ = yaml["measurement_distance_variance_slope"].IsDefined()
+                                               ? yaml["measurement_distance_variance_slope"].as<double>()
+                                               : 1.0;
+  measurement_distance_variance_offset_ = yaml["measurement_distance_variance_offset"].IsDefined()
+                                           ? yaml["measurement_distance_variance_offset"].as<double>()
+                                           : 1.0;
+  measurement_armor_yaw_variance_log_scale_ = yaml["measurement_armor_yaw_variance_slope"].IsDefined()
+                                                ? yaml["measurement_armor_yaw_variance_slope"].as<double>()
+                                                : 0.005;
+  measurement_armor_yaw_variance_offset_ = yaml["measurement_armor_yaw_variance_offset"].IsDefined()
+                                             ? yaml["measurement_armor_yaw_variance_offset"].as<double>()
+                                             : 9e-2;
+  distance_update_r_scale_ = yaml["distance_update_r_scale"].IsDefined()
+                               ? yaml["distance_update_r_scale"].as<double>()
+                               : 1.0;
+  yaw_update_sigma_deg_ = yaml["yaw_update_sigma_deg"].IsDefined()
+                            ? yaml["yaw_update_sigma_deg"].as<double>()
+                            : 0.0;
   max_prediction_gap_ = yaml["tracker_max_prediction_gap"].IsDefined()
                           ? yaml["tracker_max_prediction_gap"].as<double>()
                           : 0.3;
@@ -114,6 +203,9 @@ Tracker::Tracker(const std::string & config_path, Solver & solver)
     standard_radius_ <= 0.05 || standard_radius_ >= 0.5 ||
     standard_radius_variance_ <= 0 || standard_radius_delta_variance_ <= 0 ||
     standard_height_delta_variance_ <= 0 ||
+    !std::isfinite(standard_initial_position_variance_) || standard_initial_position_variance_ <= 0.0 ||
+    !std::isfinite(standard_initial_center_yaw_variance_) ||
+    standard_initial_center_yaw_variance_ <= 0.0 ||
     !std::isfinite(standard_initial_velocity_variance_) ||
     standard_initial_velocity_variance_ <= 0 ||
     !std::isfinite(standard_initial_angular_velocity_variance_) ||
@@ -129,6 +221,15 @@ Tracker::Tracker(const std::string & config_path, Solver & solver)
     standard_translation_acceleration_variance_ <= 0.0)
   {
     throw std::runtime_error("Invalid standard_translation_acceleration_variance");
+  }
+  const std::array<double, 7> process_noise_variances{
+    standard_angular_acceleration_variance_, balance_translation_acceleration_variance_,
+    balance_angular_acceleration_variance_, outpost_translation_acceleration_variance_,
+    outpost_angular_acceleration_variance_, base_translation_acceleration_variance_,
+    base_angular_acceleration_variance_};
+  if (std::any_of(process_noise_variances.begin(), process_noise_variances.end(),
+      [](double value) { return !std::isfinite(value) || value <= 0.0; })) {
+    throw std::runtime_error("Invalid target process noise variance configuration");
   }
   if (
     standard_max_angular_velocity_ &&
@@ -168,6 +269,22 @@ Tracker::Tracker(const std::string & config_path, Solver & solver)
   if (!std::isfinite(measurement_bearing_variance_) ||
       measurement_bearing_variance_ <= 0.0) {
     throw std::runtime_error("Invalid measurement_bearing_variance configuration");
+  }
+  const std::array<double, 6> measurement_noise_parameters{
+    measurement_elevation_variance_, measurement_distance_variance_log_scale_,
+    measurement_distance_variance_offset_, measurement_armor_yaw_variance_log_scale_,
+    measurement_armor_yaw_variance_offset_, distance_update_r_scale_};
+  if (std::any_of(measurement_noise_parameters.begin(), measurement_noise_parameters.end(),
+      [](double value) { return !std::isfinite(value); }) ||
+      measurement_elevation_variance_ <= 0.0 ||
+      measurement_distance_variance_log_scale_ < 0.0 ||
+      measurement_distance_variance_offset_ <= 0.0 ||
+      measurement_armor_yaw_variance_log_scale_ < 0.0 ||
+      measurement_armor_yaw_variance_offset_ <= 0.0 ||
+      distance_update_r_scale_ < 1.0 || distance_update_r_scale_ > 1e6 ||
+      !std::isfinite(yaw_update_sigma_deg_) || yaw_update_sigma_deg_ < 0.0 ||
+      yaw_update_sigma_deg_ > 180.0) {
+    throw std::runtime_error("Invalid measurement noise configuration");
   }
   if (!std::isfinite(max_prediction_gap_) ||
       max_prediction_gap_ <= tracker_time_policy::large_dt_warning_seconds) {
@@ -573,20 +690,26 @@ bool Tracker::set_target(
 
   if (is_balance) {
     geometry_branch_ = "balance_two";
-    Eigen::VectorXd P0_dig{{1, 64, 1, 64, 1, 64, 0.4, 100, 1, 1, 1}};
+    Eigen::VectorXd P0_dig = to_eigen_vector(balance_initial_covariance_diagonal_);
     target_ = Target(armor, t, 0.18, 2, P0_dig);//参数分别为装甲板、时间戳、旋转半径、装甲板数量、初始协方差矩阵
+    target_.set_process_noise_variances(
+      balance_translation_acceleration_variance_, balance_angular_acceleration_variance_);
   }
 
   else if (armor.name == ArmorName::outpost) {
     geometry_branch_ = "outpost_three";
-    Eigen::VectorXd P0_dig{{1, 64, 1, 64, 1, 81, 0.4, 100, 1e-4, 0, 0}};
+    Eigen::VectorXd P0_dig = to_eigen_vector(outpost_initial_covariance_diagonal_);
     target_ = Target(armor, t, 0.2765, 3, P0_dig);
+    target_.set_process_noise_variances(
+      outpost_translation_acceleration_variance_, outpost_angular_acceleration_variance_);
   }
 
   else if (armor.name == ArmorName::base) {
     geometry_branch_ = "base_three";
-    Eigen::VectorXd P0_dig{{1, 64, 1, 64, 1, 64, 0.4, 100, 1e-4, 0, 0}};
+    Eigen::VectorXd P0_dig = to_eigen_vector(base_initial_covariance_diagonal_);
     target_ = Target(armor, t, 0.3205, 3, P0_dig);
+    target_.set_process_noise_variances(
+      base_translation_acceleration_variance_, base_angular_acceleration_variance_);
   }
 
   else if (is_standard_four_armor) {
@@ -594,14 +717,15 @@ bool Tracker::set_target(
     // 单块装甲无法同时确定车辆中心和半径，因此 r 保持软先验；
     // 半径差 l 可按实测尺寸单独约束，不必连带固定 r。
     Eigen::VectorXd P0_dig{
-      {1, standard_initial_velocity_variance_,
-       1, standard_initial_velocity_variance_,
-       1, standard_initial_velocity_variance_, 0.4,
+      {standard_initial_position_variance_, standard_initial_velocity_variance_,
+       standard_initial_position_variance_, standard_initial_velocity_variance_,
+       standard_initial_position_variance_, standard_initial_velocity_variance_,
+       standard_initial_center_yaw_variance_,
        standard_initial_angular_velocity_variance_, standard_radius_variance_,
        standard_radius_delta_variance_, standard_height_delta_variance_}};
     target_ = Target(armor, t, standard_radius_, 4, P0_dig);
-    target_.set_translation_acceleration_variance(
-      standard_translation_acceleration_variance_);
+    target_.set_process_noise_variances(
+      standard_translation_acceleration_variance_, standard_angular_acceleration_variance_);
     if (standard_geometry_constraint_) {
       // 整体几何约束会同时固定 r 和 l。
       target_.set_geometry_constraint(
@@ -616,6 +740,10 @@ bool Tracker::set_target(
   }
 
   target_.set_measurement_bearing_variance(measurement_bearing_variance_);
+  target_.set_measurement_noise_model(
+    measurement_elevation_variance_, measurement_distance_variance_log_scale_,
+    measurement_distance_variance_offset_, measurement_armor_yaw_variance_log_scale_,
+    measurement_armor_yaw_variance_offset_);
   if (endpoint_shadow != nullptr) endpoint_shadow->update_accepted = true;
   tracked_label_ = armor.name;
   observation_accepted_ = true;

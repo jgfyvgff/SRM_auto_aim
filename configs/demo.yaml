@@ -55,6 +55,18 @@ association_max_distance_error: 0.45
 association_max_mahalanobis_distance: 3.2
 # 仿真方位观测噪声实验值：约 8px / fx=1304px，单位 rad²。
 measurement_bearing_variance: 4e-5
+# EKF 完整 R 模型；默认值与原公式一致，噪声仍可逐项离线调整。
+measurement_elevation_variance: 4e-3
+measurement_distance_variance_slope: 1.0
+measurement_distance_variance_offset: 1.0
+measurement_armor_yaw_variance_slope: 0.005
+measurement_armor_yaw_variance_offset: 0.09
+distance_update_r_scale: 1.0
+yaw_update_sigma_deg: 0.0
+# 非标准目标 P0 对角线顺序：[x, vx, y, vy, z, vz, center_yaw, omega, r, l, h]。
+balance_initial_covariance_diagonal: [1, 64, 1, 64, 1, 64, 0.4, 100, 1, 1, 1]
+outpost_initial_covariance_diagonal: [1, 64, 1, 64, 1, 81, 0.4, 100, 1e-4, 0, 0]
+base_initial_covariance_diagonal: [1, 64, 1, 64, 1, 64, 0.4, 100, 1e-4, 0, 0]
 
 # Daedalus vehicle.glb 的四装甲几何先验，单位为 m / m²。
 # 实际前后半径约 0.21177m，左右半径约 0.21117m。
@@ -62,6 +74,8 @@ standard_geometry_constraint: true
 standard_radius: 0.21147
 # 标准四装甲目标初次捕获时的中心速度先验方差，单位 m²/s²。
 # 0.04 对应 0.2 m/s 标准差，适配固定位置旋转场景；仅仿真配置覆盖，其他配置保留代码默认值 64。
+standard_initial_position_variance: 1.0
+standard_initial_center_yaw_variance: 0.4
 standard_initial_velocity_variance: 0.04
 # 捕获时角速度先验方差，单位 (rad/s)²；64 对应 8 rad/s 标准差，覆盖高速转动初值。
 standard_initial_angular_velocity_variance: 64.0
@@ -69,6 +83,14 @@ standard_initial_angular_velocity_variance: 64.0
 standard_capture_bootstrap_updates: 4
 # 平移加速度方差，单位 m²/s⁴；当前固定位置旋转仿真先设为 1.0。
 standard_translation_acceleration_variance: 1.0
+standard_angular_acceleration_variance: 100.0
+# 其他目标分支保持当前源码默认过程噪声。
+balance_translation_acceleration_variance: 100.0
+balance_angular_acceleration_variance: 100.0
+outpost_translation_acceleration_variance: 10.0
+outpost_angular_acceleration_variance: 0.1
+base_translation_acceleration_variance: 100.0
+base_angular_acceleration_variance: 100.0
 # Daedalus 模拟器底盘转速为 7.42 rad/s；略留余量，拒绝不符合物理范围的滤波后验。
 standard_max_angular_velocity: 8.0
 standard_radius_variance: 1e-4

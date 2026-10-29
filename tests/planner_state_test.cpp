@@ -2,6 +2,7 @@
 #include "tasks/auto_aim/aimer.hpp"
 
 #include <cmath>
+#include <chrono>
 #include <iostream>
 #include <stdexcept>
 
@@ -68,5 +69,50 @@ int main(int argc, char * argv[])
                        aligned_plan.feedback_pitch_error_rad) < 0.003,
             "Aligned feedback was not recognized");
     require(aligned_plan.fire, "Planner did not request fire when feedback was aligned");
+    // 同板突刺沿已接受的斜边外推；实际换板保留角度跳变。
+    constexpr double degree = 3.14159265358979323846 / 180.0;
+    const auto start = std::chrono::steady_clock::time_point{};
+    const auto filter = [&](double yaw_deg, int armor_id, int frame, bool mpc) {
+        auto_aim::Plan candidate{};
+        candidate.control = mpc;
+        candidate.diagnostic_valid = true;
+        candidate.command_target_yaw = yaw_deg * degree;
+        candidate.command_target_yaw_vel = -6.0 * degree;
+        candidate.yaw = yaw_deg * degree;
+        candidate.yaw_vel = 0.0F;
+        candidate.fire = true;
+        planner.prepare_tx_yaw(
+            candidate, 1, armor_id,
+            start + std::chrono::milliseconds(frame * 20));
+        return candidate;
+    };
+    filter(103.43, 1, 0, false);
+    filter(103.31, 1, 1, false);
+    const auto spike = filter(106.34, 1, 2, false);
+    require(spike.tx_yaw_spike_suppressed && !spike.fire &&
+                std::abs(spike.tx_yaw / degree - 103.19) < 0.05,
+            "Same-armor fallback spike reached TX yaw");
+    const auto resumed = filter(103.14, 1, 3, false);
+    require(!resumed.tx_yaw_spike_suppressed &&
+                resumed.tx_yaw / degree < 103.25,
+            "Fallback did not resume the descending line");
+    const auto switched = filter(105.43, 0, 4, false);
+    require(!switched.tx_yaw_spike_suppressed &&
+                std::abs(switched.tx_yaw / degree - 105.43) < 0.01,
+            "Actual armor switch was suppressed");
+
+    planner.reset_tx_yaw();
+    filter(103.43, 1, 0, true);
+    filter(103.31, 1, 1, true);
+    const auto mpc_spike = filter(106.34, 1, 2, true);
+    require(mpc_spike.tx_yaw_spike_suppressed &&
+                std::abs(mpc_spike.tx_yaw / degree - 103.19) < 0.05,
+            "Same-armor MPC spike reached TX yaw");
+
+    planner.reset_tx_yaw();
+    filter(179.9, 1, 0, false);
+    const auto wrapped = filter(-179.9, 1, 1, false);
+    require(!wrapped.tx_yaw_spike_suppressed,
+            "Yaw wrap was mistaken for a spike");
     std::cout << "planner_state_test passed\n";
 }

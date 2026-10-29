@@ -43,6 +43,89 @@ void Planner::set_gimbal_response_delay_ms(double delay_ms)
   gimbal_response_delay_ms_ = delay_ms;
 }
 
+void Planner::reset_tx_yaw()
+{
+    tx_yaw_line_ = {};
+}
+
+void Planner::prepare_tx_yaw(
+    Plan & plan, std::uint64_t target_generation, int armor_id,
+    std::chrono::steady_clock::time_point now)
+{
+    constexpr double kRadPerDegree = 3.14159265358979323846 / 180.0;
+    constexpr double kSpikeGate = 0.5 * kRadPerDegree;
+    constexpr double kRecoveryStep = 0.15 * kRadPerDegree;
+    constexpr double kMaxGapSeconds = 0.15;
+    constexpr double kPositionGain = 0.25;
+    constexpr double kVelocityGain = 0.10;
+
+    // 两种求解状态先统一到同一 20 ms 发送时刻，再检查波形连续性。
+    const double raw_yaw = plan.control
+        ? tools::limit_rad(plan.yaw + DT * plan.yaw_vel)
+        : plan.command_target_yaw;
+    if (!plan.diagnostic_valid || armor_id < 0 || !std::isfinite(raw_yaw)) {
+        reset_tx_yaw();
+        return;
+    }
+    plan.tx_raw_yaw = static_cast<float>(raw_yaw);
+
+    auto & line = tx_yaw_line_;
+    const double dt = line.valid
+        ? std::chrono::duration<double>(now - line.time).count()
+        : 0.0;
+    if (!line.valid || line.target_generation != target_generation ||
+        line.armor_id != armor_id || dt <= 0.0 || dt > kMaxGapSeconds) {
+        // 实际换板允许跳变；新板斜率只取该物理板的局部参考，不跨板差分。
+        line = {};
+        line.valid = true;
+        line.target_generation = target_generation;
+        line.armor_id = armor_id;
+        line.time = now;
+        line.yaw = raw_yaw;
+        line.velocity = std::isfinite(plan.command_target_yaw_vel)
+            ? plan.command_target_yaw_vel
+            : 0.0;
+        plan.tx_yaw = static_cast<float>(raw_yaw);
+        plan.tx_yaw_valid = true;
+        return;
+    }
+
+    const double candidate =
+        line.yaw + tools::limit_rad(raw_yaw - tools::limit_rad(line.yaw));
+    const double expected = line.yaw + line.velocity * dt;
+    const double residual = candidate - expected;
+    double output = expected;
+
+    if (std::abs(residual) > kSpikeGate) {
+        // 单帧异常不进入直线状态。连续三帧的新趋势才逐步追上，避免永久锁死。
+        const bool consistent =
+            line.rejected_count > 0 &&
+            std::abs(candidate - line.last_rejected_yaw - line.velocity * dt) <
+                kSpikeGate;
+        line.rejected_count = consistent ? line.rejected_count + 1 : 1;
+        line.last_rejected_yaw = candidate;
+        if (line.rejected_count >= 3) {
+            output += std::clamp(residual, -kRecoveryStep, kRecoveryStep);
+        }
+        plan.tx_yaw_spike_suppressed = true;
+    } else {
+        line.rejected_count = 0;
+        // 小偏差缓慢修正位置和斜率，使斜边接近直线而仍能跟随速度变化。
+        output += kPositionGain * residual;
+        line.velocity += kVelocityGain * residual / dt;
+    }
+
+    line.yaw = output;
+    line.time = now;
+    plan.tx_yaw = static_cast<float>(tools::limit_rad(output));
+    plan.tx_yaw_valid = true;
+    // 最终发送角偏离原规划角时，不沿用原角度计算的开火结论。
+    if (plan.tx_yaw_spike_suppressed ||
+        std::abs(tools::limit_rad(output - raw_yaw)) >= fire_thresh_) {
+        plan.fire = false;
+    }
+}
+
 Plan Planner::plan(Target target, double bullet_speed)
 {
   // 0. Check bullet speed
@@ -256,6 +339,8 @@ Plan Planner::plan(
   constexpr double kTxReferenceHorizonMs = 2.0 * DT * 1000.0;
   const double extra_lead_ms =
     std::max(0.0, gimbal_response_delay_ms_ - kTxReferenceHorizonMs);
+  // 当前开火角单独保留；云台响应前推只用于未来发送角。
+  Target fire_target = target;
   target.predict(extra_lead_ms / 1000.0);
 
   const auto armors = target.armor_xyza_list();
@@ -278,10 +363,15 @@ Plan Planner::plan(
   const auto flight = tools::Trajectory(bullet_speed, min_dist, nearest_xyz.z());
   if (flight.unsolvable || !std::isfinite(flight.fly_time)) return {false};
   target.predict(flight.fly_time);
+  fire_target.predict(flight.fly_time);
   const Target reference_now = target;
   const bool reference_mode = preview_aimer != nullptr && armor_id.has_value();
 
   try {
+    Eigen::Vector2d fire_reference = Eigen::Vector2d::Zero();
+    if (armor_id) {
+      fire_reference = aim(fire_target, bullet_speed, armor_id);
+    }
     const double yaw0 = aim(target, bullet_speed, armor_id)(0);
     int preview_switch_step = -1;
     int preview_switch_id = -1;
@@ -327,11 +417,15 @@ Plan Planner::plan(
     Plan plan{};
     plan.gimbal_response_delay_ms = gimbal_response_delay_ms_;
     plan.target_lead_compensation_ms = extra_lead_ms;
-    // 参考轨迹的第 0 列对应规划时刻；反馈状态由调用方估计。
-    // 此误差约束开火请求，但不改变发给下位机的绝对角度指令。
+    // 固定选板入口按当前发射的弹道目标检查反馈；未来 TX 角仍使用响应补偿。
+    // 未指定装甲板的入口保留原判据，避免改变其选板行为。
+    const double fire_yaw =
+      armor_id ? fire_reference(0) : traj(0, 0) + yaw0;
+    const double fire_pitch =
+      armor_id ? fire_reference(1) : traj(2, 0);
     plan.feedback_yaw_error_rad =
-      tools::limit_rad(traj(0, 0) + yaw0 - state.yaw);
-    plan.feedback_pitch_error_rad = traj(2, 0) - state.pitch;
+      tools::limit_rad(fire_yaw - state.yaw);
+    plan.feedback_pitch_error_rad = fire_pitch - state.pitch;
     plan.preview_switch_step = preview_switch_step;
     plan.yaw_solver_status = yaw_status;
     plan.pitch_solver_status = pitch_status;
@@ -354,6 +448,7 @@ Plan Planner::plan(
     plan.target_pitch = traj(2, next_step);
     plan.command_target_yaw = tools::limit_rad(traj(0, 2) + yaw0);
     plan.command_target_pitch = traj(2, 2);
+    plan.command_target_yaw_vel = yaw_x0(1);
     plan.target_yaw_100ms = tools::limit_rad(traj(0, diagnostic_step) + yaw0);
     plan.target_pitch_100ms = traj(2, diagnostic_step);
     plan.yaw = tools::limit_rad(yaw_solver_->work->x(0, next_step) + yaw0);
